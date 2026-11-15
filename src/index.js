@@ -1,18 +1,16 @@
 // ============================================================================
-// TVNOW-CF v1.3 — NTV (primario) + VAVOO (fallback) + MATCHORA/HTSPORT (terzo)
+// TVNOW-CF v1.4 — NTV (primario) + VAVOO (fallback) + MATCHORA/HTSPORT (terzo)
 // Cloudflare Worker — file unico, zero dipendenze.
 //
-// Catena NTV (verificata da egress CF il 2026-11-14):
+// Catena NTV:
 //   GET https://chat.cfbu247.sbs/api/resolve-dlstream/<id>
 //     -> {"m3u8":"https://live.tvnow247.today/live/c<id>/index.m3u8?v=1&e=<exp>&k=<firma>&src=cast"}
-//   Token 24 ORE, niente cookie/referer/Origin. Playlist con segmenti assoluti
-//   via chunk/cdn.tvnow247.today (proxy loro, token interno incluso).
-//   Qualita' misurata: ~1.55MB ogni 4s (~3.1 Mbps).
+//   Token 24 ORE, niente cookie/referer/Origin.
 //
-// Catena VAVOO v2 (verificata da egress CF):
+// Catena VAVOO v2:
 //   GET https://geil.to/live/resolve?url=https://geil.to/live/play/<id>
-//     -> {"url":"http://<host>/<token>"}   (senza firma)
-//   Ricerca id per nome su piu' mirror + failover su 451/5xx.
+//     -> {"url":"http://<host>/<token>"}
+//   Ricerca id per nome su piu' mirror + failover su 404/5xx.
 //
 // Catena MATCHORA (da htsport.info, cookie di sessione richiesti):
 //   htsport.info/<slug>.htm -> iframe matchora.pro/embed/channel/<id>
@@ -26,26 +24,8 @@
 //   /ch                  elenco canali mappati
 //   /probe?ch=<slug>     diagnostica catena completa per un canale
 //   /debug               stato (cache token, versioni)
-//   /rawu?u=&ref=&o=&len=&find=   fetch arbitraria con header custom (diagnostica)
+//   /rawu?u=&ref=&o=&len=&find=   fetch arbitraria con header custom
 //   /ip                  IP egress
-//
-// Rinnovo token NTV: proattivo (rinfresca se manca meno di 1h alla scadenza)
-// + reattivo (403 sulla playlist -> re-resolve e retry immediato).
-// Le URL nel repo /live?ch= non cambiano MAI: il rinnovo e' invisibile al player.
-//
-// TETTO CLOUDFLARE FREE (100.000 richieste/giorno PER ACCOUNT, condivise tra
-// tutti i worker, reset mezzanotte UTC, superato = Error 1027; le fetch verso
-// l'upstream NON contano): strategia anti-tetto di questo file:
-//   1. /live?ch=X&direct=1  -> playlist con segmenti ORIGINALI (il player
-//      scarica i segmenti DIRETTAMENTE da chunk/cdn.tvnow247.today, il token
-//      seg non è IP-bound): il worker vede solo le playlist (~900/h/spettatore
-//      invece di ~1800/h). DA TESTARE col player: se gira, è il default migliore.
-//      Default attuale = segmenti proxati (/seg) finché direct non è verificato.
-//   2. micro-cache playlist 2s: spettatori multipli sullo stesso canale
-//      condividono la stessa risposta upstream (meno carico, non meno richieste).
-//   3. nessun poller/cron: zero richieste quando nessuno guarda.
-//   4. se il tetto si avvicina: seconda copia su Deno Deploy (altri 100k/giorno
-//      e altro egress) e si divide il traffico per canale.
 // ============================================================================
 
 export default {
@@ -59,9 +39,9 @@ export default {
     }
     try {
       if (path === '/live') return await live(u, P, null);
-      if (path === '/ntv') return await live(u, P, 'ntv');       // compat playlist esistenti
-      if (path === '/vavoo') return await live(u, P, 'vavoo');   // compat: vavoo prima
-      if (path === '/htsport') return await live(u, P, 'matchora'); // compat: matchora prima
+      if (path === '/ntv') return await live(u, P, 'ntv');
+      if (path === '/vavoo') return await live(u, P, 'vavoo');
+      if (path === '/htsport') return await live(u, P, 'matchora');
       if (path === '/seg') return await seg(u);
       if (path === '/rawu') return await rawu(u);
       if (path === '/vmap') return R(await vmap(), 200, TXT());
@@ -83,36 +63,48 @@ export default {
 };
 
 // ============================= CANALI ======================================
-// ntv   = ID numerico per chat.cfbu247.sbs/api/resolve-dlstream (tutti OK 14/11)
+// ntv   = ID numerico per chat.cfbu247.sbs/api/resolve-dlstream
 // vavoo = query di ricerca per il fallback Vavoo
 // hts   = pagina htsport.info per il terzo provider (Matchora), vuoto = non mappato
 
 const CHANNELS = [
-  { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1' },
-  { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2' },
+  // --- SOLO VAVOO ---
+  { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        hts: '' },
+  { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        hts: '' },
+  { slug: 'sky-sport-serie-a',   name: 'Sky Sport Serie A', ntv: '',    vavoo: 'sky sport serie a', hts: '' },
+
+  // --- TRIPLETTE COMPLETE (Vavoo + NTV + HTSport) ---
   { slug: 'sky-sport-24',        name: 'Sky Sport 24',      ntv: '869', vavoo: 'sky sport 24',      hts: 'sport24hd' },
   { slug: 'sky-sport-uno',       name: 'Sky Sport Uno',     ntv: '461', vavoo: 'sky sport uno',     hts: 'sport1' },
   { slug: 'sky-sport-calcio',    name: 'Sky Sport Calcio',  ntv: '870', vavoo: 'sky sport calcio',  hts: 'calciohd' },
-  { slug: 'sky-calcio-1',        name: 'Sky Calcio 1',      ntv: '871', vavoo: 'sky sport calcio 1', hts: 'calcio' },
-  { slug: 'sky-calcio-2',        name: 'Sky Calcio 2',      ntv: '872', vavoo: 'sky sport calcio 2' },
-  { slug: 'sky-calcio-3',        name: 'Sky Calcio 3',      ntv: '873', vavoo: 'sky sport calcio 3' },
-  { slug: 'sky-sport-max',       name: 'Sky Sport Max',     ntv: '460', vavoo: 'sky sport max',     hts: 'sportmaxhd' },
-  { slug: 'sky-sport-arena',     name: 'Sky Sport Arena',   ntv: '462', vavoo: 'sky sport arena',   hts: 'sportarenahd' },
   { slug: 'sky-sport-tennis',    name: 'Sky Sport Tennis',  ntv: '576', vavoo: 'sky sport tennis',  hts: 'tennishd' },
+  { slug: 'sky-sport-arena',     name: 'Sky Sport Arena',   ntv: '462', vavoo: 'sky sport arena',   hts: 'sportarenahd' },
+  { slug: 'sky-sport-basket',    name: 'Sky Sport Basket',  ntv: '875', vavoo: 'sky sport basket',  hts: 'baskethd' },
+  { slug: 'sky-sport-max',       name: 'Sky Sport Max',     ntv: '460', vavoo: 'sky sport max',     hts: 'sportmaxhd' },
   { slug: 'sky-sport-f1',        name: 'Sky Sport F1',      ntv: '577', vavoo: 'sky sport f1',      hts: 'f1hd' },
   { slug: 'sky-sport-motogp',    name: 'Sky Sport MotoGP',  ntv: '575', vavoo: 'sky sport motogp',  hts: 'motohd' },
-  { slug: 'sky-sport-basket',    name: 'Sky Sport Basket',  ntv: '875', vavoo: 'sky sport basket',  hts: 'baskethd' },
-  { slug: 'sky-sport-golf',      name: 'Sky Sport Golf',    ntv: '574', vavoo: 'sky sport golf' },
-  { slug: 'sky-serie',           name: 'Sky Sport Serie A', ntv: '880', vavoo: 'sky sport serie a' },
+  { slug: 'sky-sport-golf',      name: 'Sky Sport Golf',    ntv: '574', vavoo: 'sky sport golf',    hts: 'golfhd' },
   { slug: 'dazn-1',              name: 'DAZN 1',            ntv: '877', vavoo: 'dazn 1',            hts: 'dazn1hd', vid: '2745635299' },
-  { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       vid: '3448075317' },
-  { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       vid: '2317684453' },
-  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '860', vavoo: 'sky cinema uno' },
-  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '861', vavoo: 'sky cinema action' },
-  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '862', vavoo: 'sky cinema comedy' },
+  { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       hts: 'eurosport1hd', vid: '3448075317' },
+  { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       hts: 'eurosport2hd', vid: '2317684453' },
+
+  // --- SOLO NTV (Cinema, Calcio 25x, Crime, Serie) ---
+  { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', hts: '' },
+  { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', hts: '' },
+  { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '860', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '861', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '862', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-collection',name:'Sky Cinema Collection',ntv:'859',vavoo:'', hts: '' },
+  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance',ntv: '864', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '867', vavoo: '', hts: '' },
+  { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', hts: '' },
+  { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', hts: '' },
+  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', hts: '' },
+
+  // --- ALTRI CANALI (mantenuti dal file originale) ---
   { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '' },
-  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance', ntv: '864', vavoo: 'sky cinema romance' },
-  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: 'sky cinema family' },
   { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '' },
   { slug: 'sky-uno',             name: 'Sky Uno',           ntv: '881', vavoo: 'sky uno' },
   { slug: 'italia-1',            name: 'Italia 1',          ntv: '854', vavoo: 'italia 1' },
@@ -125,8 +117,8 @@ const CHANNELS = [
 // alias accettati da /live?ch= (normalizzati)
 const ALIASES = {
   'dazn': 'dazn-1', 'dazn-zona': 'dazn-1', 'zona-dazn': 'dazn-1',
-  'sky-sport-serie-a': 'sky-serie', 'sky-sport-serie': 'sky-serie', 'serie-a': 'sky-serie',
-  'sky-sport-calcio-1': 'sky-calcio-1', 'sky-sport-calcio-2': 'sky-calcio-2', 'sky-sport-calcio-3': 'sky-calcio-3',
+  'sky-sport-serie-a': 'sky-sport-serie-a', 'serie-a': 'sky-sport-serie-a',
+  'sky-calcio-1': 'sky-calcio-251', 'sky-calcio-2': 'sky-calcio-252', 'sky-calcio-3': 'sky-calcio-253',
   'sky-cinema-2-24': 'sky-cinema-due-24', 'sky-cinema-unopi24': 'sky-cinema-uno-24',
   'sky-sport-24-ntv': 'sky-sport-24', 'sky-sport-uno-italy': 'sky-sport-uno'
 };
@@ -216,9 +208,6 @@ const VAVOO_MIRRORS = [
   'https://geil.to', 'https://geil.app', 'https://geil.win'
 ];
 
-// ---- mappa nome->ID vavoo: le ricerche HTML dei mirror sono morte (404),
-// quindi ci costruiamo da soli il database ID scaricando una lista M3U
-// mantenuta da terzi (nome canale + /vavoo/<ID>.m3u8). Cache 6h in memoria.
 const VAVOO_SOURCES = [
   'https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u',
   'https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'
@@ -252,7 +241,6 @@ async function ensureVavooMap(force) {
   return cached; // eventualmente scaduta ma meglio di niente
 }
 
-// cerca l'ID vavoo di un canale: nome esatto, poi inclusione, poi senza separatori
 function vavooMapFind(query, m) {
   if (!m || !query) return null;
   const q = norm(query);
@@ -274,7 +262,7 @@ function vavooHeaders(extra) {
 
 async function vavooResolveId(base, id) {
   const play = base + '/live/play/' + id;
-  // via 1: API v2 (GET /live/resolve) — verificata su geil.to
+  // via 1: API v2 (GET /live/resolve)
   try {
     const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play),
       { headers: { 'User-Agent': UA, 'Referer': 'https://vavoo.to/', 'Origin': 'https://vavoo.to' } }, 10000);
@@ -299,7 +287,7 @@ async function vavooResolveId(base, id) {
 }
 
 async function vavooResolve(query, vid) {
-  // 0) ID esplicito nel file (vid) o mappa nome->ID scaricata: niente search
+  // 0) ID esplicito nel file (vid) o mappa nome->ID scaricata
   let id = vid || null;
   if (!id) {
     const m = await ensureVavooMap();
@@ -313,7 +301,7 @@ async function vavooResolve(query, vid) {
     return null;
   }
   if (!query) return null;
-  // fallback: lista mediahubmx per mirror (la search HTML dei mirror è morta: 404)
+  // fallback: lista mediahubmx per mirror
   for (const base of VAVOO_MIRRORS.slice(0, 4)) {
     try {
       let ids = [];
@@ -336,7 +324,7 @@ async function vavooResolve(query, vid) {
         const u = await vavooResolveId(base, id2);
         if (u) return u;
       }
-    } catch (e) {} // mirror morto: prossimo
+    } catch (e) {}
   }
   return null;
 }
@@ -391,11 +379,7 @@ async function live(u, P, legacy) {
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
 
-  // direct=1: playlist con segmenti ORIGINALI (player -> CDN diretto, zero /seg):
-  // dimezza le richieste al worker. Default = proxato, finché non verificato.
   const direct = u.searchParams.get('direct') === '1';
-  // p= override ordine provider (es. &p=vavoo per forzare il piano B);
-  // endpoint legacy: /ntv = ntv prima, /vavoo = vavoo prima, /htsport = matchora prima
   const order = legacy ? [legacy, ...['ntv', 'vavoo', 'matchora'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'ntv,vavoo,matchora')
       .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -404,7 +388,7 @@ async function live(u, P, legacy) {
   if (lastPl.key === ck && Date.now() - lastPl.t < 2000) return R(lastPl.txt, 200, HLS());
 
   const provs = {
-    // 1) NTV — token 24h, cache + rinnovo proattivo/reattivo
+    // 1) NTV
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
@@ -412,8 +396,9 @@ async function live(u, P, legacy) {
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
     },
-    // 2) VAVOO — ID (vid o mappa scaricata) + resolve su mirror
+    // 2) VAVOO
     vavoo: async () => {
+      if (!c.vavoo && !c.vid) return null;
       const vu = await vavooResolve(c.vavoo, c.vid);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/.test(vu)) {
@@ -424,10 +409,9 @@ async function live(u, P, legacy) {
           return R(out, 200, HLS());
         }
       }
-      // stream diretto (ts/hls senza estensione): redirect pulito
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    // 3) MATCHORA — htsport -> embed con cookie -> api/cast -> relay
+    // 3) MATCHORA
     matchora: async () => {
       const mu = await matchoraResolve(c);
       if (!mu) return null;
@@ -501,11 +485,11 @@ async function probe(u) {
   const q = u.searchParams.get('ch') || '';
   const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
-  const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' ntv=' + c.ntv + ')'];
+  const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' ntv=' + c.ntv + ' vavoo=' + (c.vavoo||'-') + ' hts=' + (c.hts||'-') + ')'];
   // NTV
   try {
     if (!c.ntv) {
-      L.push('1) NTV: non mappato su questa rete (solo vavoo)');
+      L.push('1) NTV: non mappato (salto)');
     } else {
       const t0 = Date.now();
       const tk = await ntvToken(c.ntv);
@@ -527,12 +511,12 @@ async function probe(u) {
   try {
     const t0 = Date.now();
     const vu = (c.vavoo || c.vid) ? await vavooResolve(c.vavoo, c.vid) : null;
-    L.push('2) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : 'nessun risultato (query: ' + (c.vavoo || '-') + ' vid: ' + (c.vid || '-') + ')'));
+    L.push('2) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato (query: ' + (c.vavoo || '-') + ' vid: ' + (c.vid || '-') + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('2) VAVOO: ERRORE ' + e.message); }
   // MATCHORA
   try {
     const mu = c.hts ? await matchoraResolve(c) : null;
-    L.push('3) MATCHORA: ' + (mu ? 'OK ' + mu.slice(0, 80) + '...' : (c.hts ? 'nessun risultato (pagina ' + c.hts + ')' : 'non mappato')));
+    L.push('3) MATCHORA: ' + (mu ? 'OK ' + mu.slice(0, 80) + '...' : (c.hts ? 'nessun risultato (pagina ' + c.hts + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('3) MATCHORA: ERRORE ' + e.message); }
   return L.join('\n');
 }
@@ -553,7 +537,7 @@ async function vmap() {
 
 // ============================= UTILS =======================================
 
-const VER = 'TVNOW-CF v1.3';
+const VER = 'TVNOW-CF v1.4';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 
@@ -600,7 +584,6 @@ function R(body, status, headers) {
   return new Response(body, { status: status || 200, headers: h });
 }
 
-// fetch arbitraria con Referer/Origin custom + ricerca nel body (diagnostica)
 async function rawu(u) {
   const t = u.searchParams.get('u');
   if (!t) return R('uso: /rawu?u=<url>&ref=<referer>&o=<origin>&len=N&find=<str>', 200, TXT());
@@ -635,4 +618,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v1.3 (NTV + VAVOO + MATCHORA) ███
+// ███ FINE FILE TVNOW-CF v1.4 ███
