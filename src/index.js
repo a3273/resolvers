@@ -1,27 +1,11 @@
 // ============================================================================
-// TVNOW-CF v1.5 — NTV + VAVOO + DADDYLIVE + MATCHORA/HTSPORT + FREE(IPTV-ORG)
+// TVNOW-CF v1.7 — NTV + VAVOO + DADDYLIVE (Player 2优先) + MATCHORA
 // Cloudflare Worker — file unico, zero dipendenze.
 //
-// Catena NTV:
-//   GET https://chat.cfbu247.sbs/api/resolve-dlstream/<id>
-//     -> {"m3u8":"https://live.tvnow247.today/live/c<id>/index.m3u8?..."}
-//   Token 24 ORE, niente cookie/referer/Origin.
-//
-// Catena VAVOO v2:
-//   GET https://geil.to/live/resolve?url=https://geil.to/live/play/<id>
-//     -> {"url":"http://<host>/<token>"}
-//   Ricerca id per nome su piu' mirror + failover su 404/5xx.
-//
-// Catena DADDYLIVE (canali 24/7):
-//   GET https://dlhd.sx/embed/stream-<id>.php
-//     -> iframe (vidhide/smashystream/lulu/etc.)
-//     -> GET iframe -> estrae .m3u8 finale
-//   Domini ruotati: dlhd.sx, daddylive.mp, dlhd.to, daddylive.live
-//
-// Catena MATCHORA (da htsport.info, cookie di sessione richiesti):
-//   htsport.info/<slug>.htm -> iframe matchora.pro/embed/channel/<id>
-//     -> embed page (Set-Cookie + var CH/FX/PP) -> /api/cast/<CH>?fx=&pp=
-//     -> {"url":...} token 6h -> host rimpiazzato col relay edge.matchora.pro
+// Catena DADDYLIVE ottimizzata:
+//   1. Prova https://dlhd.sx/embed/stream-{id}-2.php (Player 2, più veloce)
+//   2. Se fallisce, prova https://dlhd.sx/embed/stream-{id}.php (Player 1)
+//   3. Estrae iframe annidato o link .m3u8 diretto con helper dedicato.
 //
 // ENDPOINT:
 //   /live?ch=<slug|id>   playlist proxy (riscritta sui segmenti del worker)
@@ -74,12 +58,11 @@ export default {
 // vavoo = query di ricerca per il fallback Vavoo
 // hts   = pagina htsport.info per il terzo provider (Matchora)
 // daddy = ID numerico per DaddyLive (stream-<id>.php)
-// free  = slug per iptv-org (canali free-to-air)
 
 const CHANNELS = [
   // --- SOLO VAVOO ---
-  { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        hts: '', daddy: '', free: 'rsi-la-1' },
-  { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        hts: '', daddy: '', free: 'rsi-la-2' },
+  { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        hts: '', daddy: '' },
+  { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        hts: '', daddy: '' },
   { slug: 'sky-sport-serie-a',   name: 'Sky Sport Serie A', ntv: '',    vavoo: 'sky sport serie a', hts: '', daddy: '880' },
 
   // --- TRIPLETTE COMPLETE (Vavoo + NTV + Daddy + Matchora) ---
@@ -117,7 +100,7 @@ const CHANNELS = [
   { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', hts: '', daddy: '866' },
   { slug: 'sky-uno',             name: 'Sky Uno',           ntv: '881', vavoo: 'sky uno', hts: '', daddy: '881' },
   { slug: 'italia-1',            name: 'Italia 1',          ntv: '854', vavoo: 'italia 1', hts: '', daddy: '854' },
-  { slug: 'la7',                 name: 'La7',               ntv: '855', vavoo: 'la7', hts: '', daddy: '855', free: 'la7', vid: '775530063' },
+  { slug: 'la7',                 name: 'La7',               ntv: '855', vavoo: 'la7', hts: '', daddy: '855', vid: '775530063' },
   { slug: 'la7d',                name: 'LA7d',              ntv: '856', vavoo: 'la7d', hts: '', daddy: '856' },
   { slug: 'rai-premium',         name: 'Rai Premium',       ntv: '858', vavoo: '', hts: '', daddy: '858', vid: '2828455552' },
   { slug: 'rai-sport',           name: 'Rai Sport',         ntv: '882', vavoo: 'rai sport', hts: '', daddy: '882', vid: '551730224' }
@@ -160,7 +143,7 @@ function findCh(q) {
 function elencoCanali() {
   const L = ['CANALI (' + CHANNELS.length + ') — /live?ch=<slug o id>'];
   for (const c of CHANNELS) {
-    L.push('  ' + c.slug.padEnd(22) + ' ntv=' + String(c.ntv).padEnd(4) + ' vavoo=' + (c.vavoo || '-').padEnd(18) + ' daddy=' + (c.daddy || '-').padEnd(4) + (c.hts ? ' [matchora: ' + c.hts + ']' : '') + (c.free ? ' [free: ' + c.free + ']' : ''));
+    L.push('  ' + c.slug.padEnd(22) + ' ntv=' + String(c.ntv).padEnd(4) + ' vavoo=' + (c.vavoo || '-').padEnd(18) + ' daddy=' + (c.daddy || '-').padEnd(4) + (c.hts ? ' [matchora: ' + c.hts + ']' : ''));
   }
   return L.join('\n');
 }
@@ -208,9 +191,7 @@ function reqHeaders(ref) {
   return h;
 }
 
-// ============================= DADDYLIVE (TERZO) ===========================
-// DaddyLive usa iframe annidati: pagina embed -> iframe player -> m3u8.
-// Facciamo una catena di fetch per estrarre l'URL finale.
+// ============================= DADDYLIVE (PLAYER 2 PRIORITARIO) ============
 
 const DADDY_DOMAINS = [
   'https://dlhd.sx',
@@ -219,7 +200,7 @@ const DADDY_DOMAINS = [
   'https://daddylive.live'
 ];
 
-const daddyCache = new Map(); // id -> { url, exp }
+const daddyCache = new Map();
 const DADDY_TTL = 5 * 60 * 1000; // 5 minuti
 
 async function daddyResolve(id) {
@@ -230,58 +211,53 @@ async function daddyResolve(id) {
 
   for (const domain of DADDY_DOMAINS) {
     try {
-      const embedUrl = `${domain}/embed/stream-${id}.php`;
-      const r = await fetchT(embedUrl, {
-        headers: { 'User-Agent': UA, 'Referer': domain + '/' },
-        cf: { cacheTtl: 300, cacheEverything: true }
-      }, 12000);
-      if (!r.ok) continue;
-      const html = await r.text();
-
-      // 1) cerca m3u8 diretto nella pagina embed
-      let m3u8 = html.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
+      // 🔥 PROVA PRIMA IL PLAYER 2 (più veloce e stabile)
+      const embedUrlP2 = `${domain}/embed/stream-${id}-2.php`;
+      let m3u8 = await extractM3u8FromEmbed(embedUrlP2, domain);
       if (m3u8) {
-        daddyCache.set(id, { url: m3u8[1], exp: now + DADDY_TTL });
-        return m3u8[1];
+        daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
+        return m3u8;
       }
 
-      // 2) cerca iframe e scendi di un livello
-      const iframe = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
-      if (iframe) {
-        const iframeUrl = iframe[1];
-        const r2 = await fetchT(iframeUrl, {
-          headers: { 'User-Agent': UA, 'Referer': embedUrl },
-          cf: { cacheTtl: 300, cacheEverything: true }
-        }, 12000);
-        if (!r2.ok) continue;
-        const html2 = await r2.text();
-
-        // 2a) m3u8 diretto nell'iframe
-        m3u8 = html2.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
-        if (m3u8) {
-          daddyCache.set(id, { url: m3u8[1], exp: now + DADDY_TTL });
-          return m3u8[1];
-        }
-
-        // 2b) iframe annidato (player dentro player)
-        const iframe2 = html2.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
-        if (iframe2) {
-          const r3 = await fetchT(iframe2[1], {
-            headers: { 'User-Agent': UA, 'Referer': iframeUrl },
-            cf: { cacheTtl: 300, cacheEverything: true }
-          }, 12000);
-          if (r3.ok) {
-            const html3 = await r3.text();
-            m3u8 = html3.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
-            if (m3u8) {
-              daddyCache.set(id, { url: m3u8[1], exp: now + DADDY_TTL });
-              return m3u8[1];
-            }
-          }
-        }
+      // 🔥 FALLBACK AL PLAYER 1 se il 2 fallisce
+      const embedUrlP1 = `${domain}/embed/stream-${id}.php`;
+      m3u8 = await extractM3u8FromEmbed(embedUrlP1, domain);
+      if (m3u8) {
+        daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
+        return m3u8;
       }
     } catch (e) {
       continue; // prova dominio successivo
+    }
+  }
+  return null;
+}
+
+async function extractM3u8FromEmbed(embedUrl, refererDomain) {
+  const r = await fetchT(embedUrl, {
+    headers: { 'User-Agent': UA, 'Referer': refererDomain + '/' },
+    cf: { cacheTtl: 300, cacheEverything: true }
+  }, 12000);
+
+  if (!r.ok) return null;
+  const html = await r.text();
+
+  // 1) Cerca m3u8 diretto nella pagina
+  let m3u8 = html.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
+  if (m3u8) return m3u8[1];
+
+  // 2) Cerca iframe e scendi di un livello
+  const iframe = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
+  if (iframe) {
+    const r2 = await fetchT(iframe[1], {
+      headers: { 'User-Agent': UA, 'Referer': embedUrl },
+      cf: { cacheTtl: 300, cacheEverything: true }
+    }, 12000);
+
+    if (r2.ok) {
+      const html2 = await r2.text();
+      m3u8 = html2.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
+      if (m3u8) return m3u8[1];
     }
   }
   return null;
@@ -448,24 +424,6 @@ async function matchoraResolve(c) {
   return out;
 }
 
-// ============================= FREE (IPTV-ORG, extra) ======================
-
-async function freeTvResolve(slug) {
-  if (!slug) return null;
-  try {
-    const res = await fetchT('https://raw.githubusercontent.com/iptv-org/iptv/master/countries/it.m3u', {
-      cf: { cacheTtl: 3600, cacheEverything: true }
-    }, 15000);
-    if (!res.ok) return null;
-    const text = await res.text();
-    const regex = new RegExp(`#EXTINF:-1[^\\n]*${slug.replace(/-/g, '[^\\n]*')}[^\\n]*\\n(https?:\\/\\/[^\\s]+\\.m3u8[^\\s]*)`, 'i');
-    const match = text.match(regex);
-    return match ? match[1] : null;
-  } catch (e) {
-    return null;
-  }
-}
-
 // ============================= /live =======================================
 
 let lastPl = { key: '', txt: '', t: 0 };
@@ -508,7 +466,7 @@ async function live(u, P, legacy) {
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    // 3) DADDYLIVE
+    // 3) DADDYLIVE (Player 2 prioritario)
     daddy: async () => {
       if (!c.daddy) return null;
       const du = await daddyResolve(c.daddy);
@@ -540,14 +498,6 @@ async function live(u, P, legacy) {
         }
       }
       return R('redirect matchora', 302, { Location: mu, ...CORS() });
-    },
-    // 5) FREE (IPTV-ORG) - usato solo se esplicitamente richiesto con p=free
-    free: async () => {
-      if (!c.free) return null;
-      const fu = await freeTvResolve(c.free);
-      if (!fu) return null;
-      lastPl = { key: ck, txt: fu, t: Date.now() };
-      return R(fu, 200, HLS());
     }
   };
 
@@ -664,7 +614,7 @@ async function vmap() {
 
 // ============================= UTILS =======================================
 
-const VER = 'TVNOW-CF v1.5';
+const VER = 'TVNOW-CF v1.7';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 
@@ -698,7 +648,7 @@ function uso(P) {
     '  /debug               stato',
     '  /ip                  IP egress',
     '',
-    'provider: 1) NTV tvnow247 (token 24h auto-renew)  2) Vavoo/geil.to  3) DaddyLive  4) Matchora/HTSport'
+    'provider: 1) NTV tvnow247 (token 24h auto-renew)  2) Vavoo/geil.to  3) DaddyLive (Player 2优先)  4) Matchora/HTSport'
   ].join('\n');
 }
 
@@ -746,4 +696,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v1.5 (NTV + VAVOO + DADDYLIVE + MATCHORA + FREE) ███
+// ███ FINE FILE TVNOW-CF v1.7 (NTV + VAVOO + DADDYLIVE Player2 + MATCHORA) ███
