@@ -1,16 +1,13 @@
 // ============================================================================
-// TVNOW-CF v2.1 — VAVOO + NTV + DADDYLIVE (Proxy blindato anti-mosaico)
+// TVNOW-CF v2.2 — VAVOO + NTV + DADDYLIVE (IPTV-Proof & Anti-403)
 // Cloudflare Worker — file unico, zero dipendenze.
 //
-// FIX v2.1 (risolve "si vede solo vavoo" + mosaico/blocchi):
-// - Segmenti PROXYATI via /seg per NTV, Vavoo, DaddyLive: il worker aggiunge
-//   Referer+Origin corretti e risolve gli URL RELATIVI in assoluti.
-//   => Tutti i canali si vedono (DaddyLive non ha più segmenti relativi rotti,
-//      NTV non dà più 403 senza referer).
-// - /seg STREAMA il body (mai await text) + timeout 30s => niente chunk troncati
-//   => niente mosaico verde.
-// - DaddyLive: solo domini stabili, timeout 8s, Player 1 + watch fallback.
-// - &direct=1 opzionale per chi vuole segmenti assoluti senza proxy.
+// FIX v2.2 (Risolve "Browser OK, App IPTV NO"):
+// 1. REWRITEPL BULLETPROOF: Gestisce correttamente URL assoluti, relativi 
+//    e root-relativi, avvolgendo SEMPRE il segmento nel proxy /seg.
+// 2. HEADER FORZATI: Il proxy /seg inoltra SEMPRE Referer e Origin al CDN, 
+//    impedendo il 403 Forbidden delle app IPTV.
+// 3. CORS PERFETTO: Risposte /seg con Access-Control-Allow-Origin: * esplicito.
 // ============================================================================
 
 export default {
@@ -172,7 +169,7 @@ function reqHeaders(ref) {
   return h;
 }
 
-// ============================= DADDYLIVE (v2.1) ============================
+// ============================= DADDYLIVE ===================================
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map();
 const DADDY_TTL = 5 * 60 * 1000;
@@ -323,16 +320,16 @@ let lastPl = { key: '', txt: '', t: 0 };
 
 async function live(u, P, legacy) {
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
-  if (!q) return R('uso: /live?ch=<slug|id>[&direct=1]\n\n' + elencoCanali(), 200, TXT());
+  if (!q) return R('uso: /live?ch=<slug|id>\n\n' + elencoCanali(), 200, TXT());
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
 
-  // direct=1 SOLO se esplicitamente richiesto; di default PROXY /seg (tutti i canali si vedono)
-  const direct = u.searchParams.get('direct') === '1';
+  // FORZIAMO IL PROXY per garantire che le app IPTV ricevano gli header corretti
+  const direct = false; 
   const order = legacy ? [legacy, ...['vavoo', 'ntv', 'daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'vavoo,ntv,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
-  const ck = c.slug + (direct ? ':d' : ':p') + ':' + order.join('.');
+  const ck = c.slug + ':p:' + order.join('.');
   if (lastPl.key === ck && Date.now() - lastPl.t < 2000) return R(lastPl.txt, 200, HLS());
 
   const provs = {
@@ -344,7 +341,7 @@ async function live(u, P, legacy) {
         const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': UA }) }, 12000);
         if (r.ok) {
           const txt = await r.text();
-          const out = direct ? txt : rewritePl(txt, vu, P, 'https://vavoo.to/', 'https://vavoo.to');
+          const out = rewritePl(txt, vu, P, 'https://vavoo.to/', 'https://vavoo.to');
           lastPl = { key: ck, txt: out, t: Date.now() };
           return R(out, 200, HLS());
         }
@@ -354,7 +351,7 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      const out = direct ? pl.txt : rewritePl(pl.txt, pl.base, P, pl.ref, '');
+      const out = rewritePl(pl.txt, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
     },
@@ -366,7 +363,7 @@ async function live(u, P, legacy) {
         const r = await fetchT(du, { headers: { 'User-Agent': UA, 'Referer': 'https://thedaddy.li/', 'Origin': 'https://thedaddy.li' } }, 12000);
         if (r.ok) {
           const txt = await r.text();
-          const out = direct ? txt : rewritePl(txt, du, P, 'https://thedaddy.li/', 'https://thedaddy.li');
+          const out = rewritePl(txt, du, P, 'https://thedaddy.li/', 'https://thedaddy.li');
           lastPl = { key: ck, txt: out, t: Date.now() };
           return R(out, 200, HLS());
         }
@@ -386,7 +383,7 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// Riscrive playlist: relativi->assoluti->/seg con ref+origin (anti-mosaico)
+// ============================= REWRITEPL BULLETPROOF =======================
 function rewritePl(txt, baseUrl, P, ref, origin) {
   const lines = String(txt).split(/\r?\n/);
   const out = [];
@@ -394,35 +391,56 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
     const t = line.trim();
     if (!t) { out.push(''); continue; }
     if (t[0] === '#') { out.push(t); continue; }
+
     let abs = t;
-    if (baseUrl && !/^https?:\/\//i.test(t)) {
-      abs = baseUrl.replace(/[^/]*$/, '') + t.replace(/^\.\//, '');
-      abs = abs.replace(/([^:])\/{2,}/g, '$1/');
+    if (!/^https?:\/\//i.test(t)) {
+      // Gestione URL relativi o root-relativi
+      if (t.startsWith('/')) {
+        const urlObj = new URL(baseUrl);
+        abs = urlObj.origin + t;
+      } else {
+        abs = baseUrl.replace(/[^/]*$/, '') + t.replace(/^\.\//, '');
+      }
+      abs = abs.replace(/([^:])\/{2,}/g, '$1/'); // Pulisce doppi slash
     }
-    let seg = P + '/seg?u=' + encodeURIComponent(abs);
-    if (ref) seg += '&ref=' + encodeURIComponent(ref);
-    if (origin) seg += '&o=' + encodeURIComponent(origin);
-    out.push(seg);
+
+    // Avvolge SEMPRE nel proxy /seg con gli header corretti
+    let segUrl = P + '/seg?u=' + encodeURIComponent(abs);
+    if (ref) segUrl += '&ref=' + encodeURIComponent(ref);
+    if (origin) segUrl += '&o=' + encodeURIComponent(origin);
+    out.push(segUrl);
   }
   return out.join('\n');
 }
 
-// ============================= /seg (BLINDATO ANTI-MOSAICO) ================
+// ============================= /seg (IPTV-PROOF) ===========================
 async function seg(u) {
   const target = u.searchParams.get('u');
   if (!target) return R('uso: /seg?u=<url>', 200, TXT());
+  
   const h = { 'User-Agent': UA, 'Accept': '*/*' };
   if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
+  
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
-  // timeout alto + streaming body = niente chunk troncati = niente mosaico
+
+  // Timeout alto per segmenti grandi, streaming diretto del body
   const r = await fetchT(target, { headers: h }, 30000);
-  const hh = { 'content-type': r.headers.get('content-type') || 'video/mp2t', 'access-control-allow-origin': '*' };
+  
+  const hh = { 
+    'content-type': r.headers.get('content-type') || 'video/mp2t', 
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-headers': 'Range, User-Agent, Referer, Origin'
+  };
+  
   const cl = r.headers.get('content-length');
   const cr = r.headers.get('content-range');
   if (cl) hh['content-length'] = cl;
   if (cr) hh['content-range'] = cr;
+
+  // Streaming diretto del body: niente await text(), niente mosaico
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -432,11 +450,13 @@ async function probe(u) {
   const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
   const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' vavoo=' + (c.vavoo||'-') + ' ntv=' + (c.ntv||'-') + ' daddy=' + (c.daddy||'-') + ')'];
+  
   try {
     const t0 = Date.now();
     const vu = (c.vavoo || c.vid) ? await vavooResolve(c.vavoo, c.vid) : null;
     L.push('1) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato' : 'non mappato (salto)')));
   } catch (e) { L.push('1) VAVOO: ERRORE ' + e.message); }
+
   try {
     if (!c.ntv) L.push('2) NTV: non mappato (salto)');
     else {
@@ -452,11 +472,13 @@ async function probe(u) {
       }
     }
   } catch (e) { L.push('2) NTV: ERRORE ' + e.message); }
+
   try {
     const t0 = Date.now();
     const du = c.daddy ? await daddyResolve(c.daddy) : null;
     L.push('3) DADDYLIVE: ' + (du ? 'OK ' + du.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.daddy ? 'nessun risultato (id: ' + c.daddy + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('3) DADDYLIVE: ERRORE ' + e.message); }
+
   return L.join('\n');
 }
 
@@ -472,7 +494,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v2.1';
+const VER = 'TVNOW-CF v2.2';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11, 19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -487,7 +509,7 @@ function debug() {
 }
 
 function uso(P) {
-  return [VER, '', 'uso:', '  /live?ch=<slug|id>   playlist PROXY (tutti i canali)', '     [&direct=1]      segmenti assoluti (se il token regge)', '  legacy: /vavoo?ch=QUERY  /ntv?ch=ID  /daddy?ch=ID', '  /probe?ch=<slug>     diagnostica', '  /ch                  elenco canali', '  /debug               stato', ''].join('\n');
+  return [VER, '', 'uso:', '  /live?ch=<slug|id>   playlist PROXY (compatibile con tutte le app IPTV)', '  legacy: /vavoo?ch=QUERY  /ntv?ch=ID  /daddy?ch=ID', '  /probe?ch=<slug>     diagnostica', '  /ch                  elenco canali', '  /debug               stato', ''].join('\n');
 }
 
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
@@ -520,4 +542,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v2.1 ███
+// ███ FINE FILE TVNOW-CF v2.2 ███
