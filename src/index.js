@@ -1,12 +1,13 @@
 // ============================================================================
-// TVNOW-CF v1.8 — NTV + VAVOO + DADDYLIVE (Player 2 + Domini 2024/25) + MATCHORA
+// TVNOW-CF v1.9 — VAVOO + NTV + DADDYLIVE (Player 1) + MATCHORA
 // Cloudflare Worker — file unico, zero dipendenze.
 //
-// Catena DADDYLIVE ottimizzata:
-//   1. Prova https://thedaddy.li / daddylivetv.sbs / dlhd.sx (Player 2 prioritario)
-//   2. Fallback al Player 1
-//   3. Fallback estremo a watch.php?id=X
-//   4. Supporto a doppio annidamento iframe per estrarre il .m3u8 finale.
+// Ordine di fallback predefinito: Vavoo → NTV → DaddyLive → Matchora
+//
+// Catena DADDYLIVE ottimizzata (verificata 2024/2025):
+//   1. Prova https://thedaddy.li / daddylivetv.sbs / dlhd.sx (Player 1: stream-{id}.php)
+//   2. Fallback estremo a watch.php?id={id}
+//   3. Supporto a doppio annidamento iframe per estrarre il .m3u8 finale.
 // ============================================================================
 
 export default {
@@ -46,9 +47,12 @@ export default {
 
 // ============================= CANALI ======================================
 const CHANNELS = [
+  // --- SOLO VAVOO ---
   { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        hts: '', daddy: '' },
   { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        hts: '', daddy: '' },
   { slug: 'sky-sport-serie-a',   name: 'Sky Sport Serie A', ntv: '',    vavoo: 'sky sport serie a', hts: '', daddy: '880' },
+
+  // --- TRIPLETTE COMPLETE (Vavoo + NTV + Daddy + Matchora) ---
   { slug: 'sky-sport-24',        name: 'Sky Sport 24',      ntv: '869', vavoo: 'sky sport 24',      hts: 'sport24hd', daddy: '869' },
   { slug: 'sky-sport-uno',       name: 'Sky Sport Uno',     ntv: '461', vavoo: 'sky sport uno',     hts: 'sport1',    daddy: '461' },
   { slug: 'sky-sport-calcio',    name: 'Sky Sport Calcio',  ntv: '870', vavoo: 'sky sport calcio',  hts: 'calciohd',  daddy: '870' },
@@ -62,21 +66,25 @@ const CHANNELS = [
   { slug: 'dazn-1',              name: 'DAZN 1',            ntv: '877', vavoo: 'dazn 1',            hts: 'dazn1hd',   daddy: '877', vid: '2745635299' },
   { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       hts: 'eurosport1hd', daddy: '878', vid: '3448075317' },
   { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       hts: 'eurosport2hd', daddy: '879', vid: '2317684453' },
-  { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', hts: '', daddy: '871' },
-  { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', hts: '', daddy: '872' },
-  { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', hts: '', daddy: '873' },
-  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '860', vavoo: '', hts: '', daddy: '860' },
-  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '861', vavoo: '', hts: '', daddy: '861' },
-  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '862', vavoo: '', hts: '', daddy: '862' },
-  { slug: 'sky-cinema-collection',name:'Sky Cinema Collection',ntv:'859',vavoo:'', hts: '', daddy: '859' },
-  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance',ntv: '864', vavoo: '', hts: '', daddy: '864' },
-  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: '', hts: '', daddy: '865' },
-  { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '867', vavoo: '', hts: '', daddy: '867' },
-  { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', hts: '', daddy: '868' },
-  { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', hts: '', daddy: '863' },
-  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', hts: '', daddy: '880' },
-  { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '', hts: '', daddy: '863' },
-  { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', hts: '', daddy: '866' },
+
+  // --- SOLO NTV (Cinema e Calcio 25x rimossi da Daddy come richiesto) ---
+  { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '860', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '861', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '862', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-collection',name:'Sky Cinema Collection',ntv:'859',vavoo:'', hts: '', daddy: '' },
+  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance',ntv: '864', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '867', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', hts: '', daddy: '' },
+
+  // --- ALTRI CANALI ---
+  { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '', hts: '', daddy: '' },
+  { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', hts: '', daddy: '' },
   { slug: 'sky-uno',             name: 'Sky Uno',           ntv: '881', vavoo: 'sky uno', hts: '', daddy: '881' },
   { slug: 'italia-1',            name: 'Italia 1',          ntv: '854', vavoo: 'italia 1', hts: '', daddy: '854' },
   { slug: 'la7',                 name: 'La7',               ntv: '855', vavoo: 'la7', hts: '', daddy: '855', vid: '775530063' },
@@ -169,7 +177,7 @@ function reqHeaders(ref) {
   return h;
 }
 
-// ============================= DADDYLIVE (DOMINI AGGIORNATI 2024/2025) ====
+// ============================= DADDYLIVE (PLAYER 1 PRIORITARIO) ============
 
 const DADDY_DOMAINS = [
   'https://thedaddy.li',
@@ -190,23 +198,15 @@ async function daddyResolve(id) {
 
   for (const domain of DADDY_DOMAINS) {
     try {
-      // 1. PROVA PRIMA IL PLAYER 2 sui nuovi domini prioritari
-      const embedUrlP2 = `${domain}/embed/stream-${id}-2.php`;
-      let m3u8 = await extractM3u8FromEmbed(embedUrlP2, domain);
-      if (m3u8) {
-        daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
-        return m3u8;
-      }
-
-      // 2. FALLBACK AL PLAYER 1
+      // 1. PROVA PRIMA IL PLAYER 1 (verificato come funzionante, Player 2 è 404)
       const embedUrlP1 = `${domain}/embed/stream-${id}.php`;
-      m3u8 = await extractM3u8FromEmbed(embedUrlP1, domain);
+      let m3u8 = await extractM3u8FromEmbed(embedUrlP1, domain);
       if (m3u8) {
         daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
         return m3u8;
       }
 
-      // 3. FALLBACK ESTREMO: prova la pagina watch.php principale
+      // 2. FALLBACK ESTREMO: prova la pagina watch.php principale
       const watchUrl = `${domain}/watch.php?id=${id}`;
       m3u8 = await extractM3u8FromEmbed(watchUrl, domain);
       if (m3u8) {
@@ -436,26 +436,20 @@ let lastPl = { key: '', txt: '', t: 0 };
 
 async function live(u, P, legacy) {
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
-  if (!q) return R('uso: /live?ch=<slug|id>[&p=ntv,vavoo,daddy,matchora][&direct=1]\n\n' + elencoCanali(), 200, TXT());
+  if (!q) return R('uso: /live?ch=<slug|id>[&p=vavoo,ntv,daddy,matchora][&direct=1]\n\n' + elencoCanali(), 200, TXT());
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
 
   const direct = u.searchParams.get('direct') === '1';
-  const order = legacy ? [legacy, ...['ntv', 'vavoo', 'daddy', 'matchora'].filter(x => x !== legacy)]
-    : (u.searchParams.get('p') || 'ntv,vavoo,daddy,matchora')
+  // ORDINE PREDEFINITO: Vavoo → NTV → DaddyLive → Matchora
+  const order = legacy ? [legacy, ...['vavoo', 'ntv', 'daddy', 'matchora'].filter(x => x !== legacy)]
+    : (u.searchParams.get('p') || 'vavoo,ntv,daddy,matchora')
       .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
   const ck = c.slug + (direct ? ':d' : '') + ':' + order.join('.');
   if (lastPl.key === ck && Date.now() - lastPl.t < 2000) return R(lastPl.txt, 200, HLS());
 
   const provs = {
-    ntv: async () => {
-      if (!c.ntv) return null;
-      const pl = await ntvPlaylist(c.ntv);
-      const out = direct ? pl.txt : rewritePl(pl.txt, null, P, pl.ref);
-      lastPl = { key: ck, txt: out, t: Date.now() };
-      return R(out, 200, HLS());
-    },
     vavoo: async () => {
       if (!c.vavoo && !c.vid) return null;
       const vu = await vavooResolve(c.vavoo, c.vid);
@@ -469,6 +463,13 @@ async function live(u, P, legacy) {
         }
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
+    },
+    ntv: async () => {
+      if (!c.ntv) return null;
+      const pl = await ntvPlaylist(c.ntv);
+      const out = direct ? pl.txt : rewritePl(pl.txt, null, P, pl.ref);
+      lastPl = { key: ck, txt: out, t: Date.now() };
+      return R(out, 200, HLS());
     },
     daddy: async () => {
       if (!c.daddy) return null;
@@ -509,7 +510,7 @@ async function live(u, P, legacy) {
       log(p + ' ko ' + c.slug + ': ' + (e && e.message));
     }
   }
-  return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + ' (ntv=' + (c.ntv || '-') + ' daddy=' + (c.daddy || '-') + '). /probe?ch=' + c.slug + ' per la diagnostica.', 200, TXT());
+  return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + ' (vavoo=' + (c.vavoo || '-') + ' ntv=' + (c.ntv || '-') + ' daddy=' + (c.daddy || '-') + '). /probe?ch=' + c.slug + ' per la diagnostica.', 200, TXT());
 }
 
 function rewritePl(txt, baseUrl, P, ref) {
@@ -552,10 +553,16 @@ async function probe(u) {
   const q = u.searchParams.get('ch') || '';
   const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
-  const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' ntv=' + (c.ntv||'-') + ' vavoo=' + (c.vavoo||'-') + ' daddy=' + (c.daddy||'-') + ' hts=' + (c.hts||'-') + ')'];
+  const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' vavoo=' + (c.vavoo||'-') + ' ntv=' + (c.ntv||'-') + ' daddy=' + (c.daddy||'-') + ' hts=' + (c.hts||'-') + ')'];
   
   try {
-    if (!c.ntv) L.push('1) NTV: non mappato (salto)');
+    const t0 = Date.now();
+    const vu = (c.vavoo || c.vid) ? await vavooResolve(c.vavoo, c.vid) : null;
+    L.push('1) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato' : 'non mappato (salto)')));
+  } catch (e) { L.push('1) VAVOO: ERRORE ' + e.message); }
+
+  try {
+    if (!c.ntv) L.push('2) NTV: non mappato (salto)');
     else {
       const t0 = Date.now();
       const tk = await ntvToken(c.ntv);
@@ -565,20 +572,14 @@ async function probe(u) {
       const txt = r.ok ? await r.text() : '';
       const segs = (txt.match(/#EXTINF/g) || []).length;
       const first = (txt.split(/\r?\n/).find(l => l.trim() && l.trim()[0] !== '#') || '').trim();
-      L.push('1) NTV: API OK, token exp tra ' + ore + 'h | playlist ' + r.status + ' ' + segs + ' segs (' + (Date.now() - t0) + 'ms)');
+      L.push('2) NTV: API OK, token exp tra ' + ore + 'h | playlist ' + r.status + ' ' + segs + ' segs (' + (Date.now() - t0) + 'ms)');
       if (first) {
         const rs = await fetchT(first, { headers: reqHeaders(tk.ref) }, 15000);
         const kb = rs.headers.get('content-length') ? Math.round(+rs.headers.get('content-length') / 1024) + 'KB' : '?';
         L.push('   seg[0]: ' + rs.status + ' ' + (rs.headers.get('content-type') || '') + ' ' + kb);
       }
     }
-  } catch (e) { L.push('1) NTV: ERRORE ' + e.message); }
-
-  try {
-    const t0 = Date.now();
-    const vu = (c.vavoo || c.vid) ? await vavooResolve(c.vavoo, c.vid) : null;
-    L.push('2) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato' : 'non mappato (salto)')));
-  } catch (e) { L.push('2) VAVOO: ERRORE ' + e.message); }
+  } catch (e) { L.push('2) NTV: ERRORE ' + e.message); }
 
   try {
     const t0 = Date.now();
@@ -608,7 +609,7 @@ async function vmap() {
 }
 
 // ============================= UTILS =======================================
-const VER = 'TVNOW-CF v1.8';
+const VER = 'TVNOW-CF v1.9';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 
@@ -630,9 +631,9 @@ function uso(P) {
   return [
     VER, '', 'uso:',
     '  /live?ch=<slug|id>   playlist (es. /live?ch=sky-sport-24 o /live?ch=869)',
-    '     [&p=...]          ordine provider (default ntv,vavoo,daddy,matchora)',
+    '     [&p=...]          ordine provider (default: vavoo,ntv,daddy,matchora)',
     '     [&direct=1]       segmenti DIRETTI dal CDN (anti-tetto richieste)',
-    '  legacy compatibili:  /ntv?ch=ID  /vavoo?ch=QUERY  /daddy?ch=ID  /htsport?ch=QUERY',
+    '  legacy compatibili:  /vavoo?ch=QUERY  /ntv?ch=ID  /daddy?ch=ID  /htsport?ch=QUERY',
     '  /seg?u=<url>         segmenti',
     '  /ch                  elenco canali',
     '  /probe?ch=<slug>     diagnostica 4 provider',
@@ -640,7 +641,7 @@ function uso(P) {
     '  /debug               stato',
     '  /ip                  IP egress',
     '',
-    'provider: 1) NTV tvnow247  2) Vavoo/geil.to  3) DaddyLive (Player 2 prioritario)  4) Matchora/HTSport'
+    'provider: 1) Vavoo/geil.to  2) NTV tvnow247  3) DaddyLive (Player 1)  4) Matchora/HTSport'
   ].join('\n');
 }
 
@@ -687,4 +688,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v1.8 ███
+// ███ FINE FILE TVNOW-CF v1.9 ███
