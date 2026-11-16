@@ -4,3 +4,5 @@ compatibility_date = "2026-11-01"
 
 [vars]
 # Variabili d'ambiente (lascia vuoto per ora)
+[triggers]
+crons = ["*/15 * * * *"]
