@@ -1,8 +1,8 @@
 // ============================================================================
-// TVNOW-CF v2.8 — VAVOO + NTV + DADDYLIVE
-// FIX: Rinnovo token NTV anticipato a 4 ore (14400s). 
-//      Il player cambia URL playlist senza mai vedere il token scadere => ZERO freeze.
-// FIX: Sky Sport Tennis ha vid fisso 2100771782. Match Vavoo rigoroso.
+// TVNOW-CF v2.9 — VAVOO + NTV + DADDYLIVE
+// FIX: Segmenti NO-CACHE (cf: { cacheTtl: 0 }) => riduce delay di 5-10s.
+// FIX: Rinnovo token NTV a 4 ore (zero freeze).
+// FIX: Sky Sport Tennis vid fisso 2100771782.
 // Cron warm attivo.
 // ============================================================================
 
@@ -114,10 +114,7 @@ let ntvStats = { resolve: 0, refresh: 0, err: 0 };
 
 async function ntvToken(id) {
   const now = Date.now()/1000; const c = tokenCache.get(id);
-  // 🔥 FIX v2.8: Rinnova il token quando mancano 4 ore (14400s) invece di 1 ora (3600s).
-  // Il player HLS aggiorna la playlist mentre il vecchio token è ancora validissimo => ZERO freeze.
-  if (c && c.exp - now > 14400) return c; 
-  
+  if (c && c.exp - now > 14400) return c;  // 🔥 Rinnovo a 4 ore (zero freeze)
   ntvStats.resolve++;
   const r = await fetchT(NTV_API + id, { headers: { 'User-Agent': UA, 'Accept': 'application/json' } }, 12000);
   if (!r.ok) { ntvStats.err++; throw new Error('ntv api ' + r.status); }
@@ -311,15 +308,24 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ============================= /seg ========================================
+// ============================= /seg (NO-CACHE per ridurre delay) ===========
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const h = { 'User-Agent': UA, 'Accept': '*/*' };
   if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
   if (u.searchParams.get('range')) h['Range'] = u.searchParams.get('range');
-  const r = await fetchT(target, { headers: h }, 30000);
-  const hh = { 'content-type': r.headers.get('content-type') || 'video/mp2t', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS', 'access-control-allow-headers': 'Range, User-Agent, Referer, Origin' };
+  // 🔥 FIX v2.9: cf: { cacheTtl: 0 } = Cloudflare NON cachea i segmenti => sempre il chunk più fresco
+  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 30000);
+  const hh = {
+    'content-type': r.headers.get('content-type') || 'video/mp2t',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
+    'cache-control': 'no-cache, no-store, must-revalidate',
+    'pragma': 'no-cache',
+    'expires': '0'
+  };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   return new Response(r.body, { status: r.status, headers: hh });
 }
@@ -353,7 +359,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v2.8';
+const VER = 'TVNOW-CF v2.9';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -365,4 +371,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = { 'User-Agent': UA, 'Accept': '*/*' }; if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v2.8 ███
+// ███ FINE TVNOW-CF v2.9 ███
