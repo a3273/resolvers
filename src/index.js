@@ -1,21 +1,12 @@
 // ============================================================================
-// TVNOW-CF v1.7 — NTV + VAVOO + DADDYLIVE (Player 2优先) + MATCHORA
+// TVNOW-CF v1.8 — NTV + VAVOO + DADDYLIVE (Player 2 + Domini 2024/25) + MATCHORA
 // Cloudflare Worker — file unico, zero dipendenze.
 //
 // Catena DADDYLIVE ottimizzata:
-//   1. Prova https://dlhd.sx/embed/stream-{id}-2.php (Player 2, più veloce)
-//   2. Se fallisce, prova https://dlhd.sx/embed/stream-{id}.php (Player 1)
-//   3. Estrae iframe annidato o link .m3u8 diretto con helper dedicato.
-//
-// ENDPOINT:
-//   /live?ch=<slug|id>   playlist proxy (riscritta sui segmenti del worker)
-//   /ntv /vavoo /daddy /htsport  alias legacy con ordine provider forzato
-//   /seg?u=<url>         pass-through segmenti (Range incluso)
-//   /ch                  elenco canali mappati
-//   /probe?ch=<slug>     diagnostica catena completa per un canale
-//   /debug               stato (cache token, versioni)
-//   /rawu?u=&ref=&o=&len=&find=   fetch arbitraria con header custom
-//   /ip                  IP egress
+//   1. Prova https://thedaddy.li / daddylivetv.sbs / dlhd.sx (Player 2 prioritario)
+//   2. Fallback al Player 1
+//   3. Fallback estremo a watch.php?id=X
+//   4. Supporto a doppio annidamento iframe per estrarre il .m3u8 finale.
 // ============================================================================
 
 export default {
@@ -54,18 +45,10 @@ export default {
 };
 
 // ============================= CANALI ======================================
-// ntv   = ID numerico per chat.cfbu247.sbs/api/resolve-dlstream
-// vavoo = query di ricerca per il fallback Vavoo
-// hts   = pagina htsport.info per il terzo provider (Matchora)
-// daddy = ID numerico per DaddyLive (stream-<id>.php)
-
 const CHANNELS = [
-  // --- SOLO VAVOO ---
   { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        hts: '', daddy: '' },
   { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        hts: '', daddy: '' },
   { slug: 'sky-sport-serie-a',   name: 'Sky Sport Serie A', ntv: '',    vavoo: 'sky sport serie a', hts: '', daddy: '880' },
-
-  // --- TRIPLETTE COMPLETE (Vavoo + NTV + Daddy + Matchora) ---
   { slug: 'sky-sport-24',        name: 'Sky Sport 24',      ntv: '869', vavoo: 'sky sport 24',      hts: 'sport24hd', daddy: '869' },
   { slug: 'sky-sport-uno',       name: 'Sky Sport Uno',     ntv: '461', vavoo: 'sky sport uno',     hts: 'sport1',    daddy: '461' },
   { slug: 'sky-sport-calcio',    name: 'Sky Sport Calcio',  ntv: '870', vavoo: 'sky sport calcio',  hts: 'calciohd',  daddy: '870' },
@@ -79,8 +62,6 @@ const CHANNELS = [
   { slug: 'dazn-1',              name: 'DAZN 1',            ntv: '877', vavoo: 'dazn 1',            hts: 'dazn1hd',   daddy: '877', vid: '2745635299' },
   { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       hts: 'eurosport1hd', daddy: '878', vid: '3448075317' },
   { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       hts: 'eurosport2hd', daddy: '879', vid: '2317684453' },
-
-  // --- SOLO NTV + DADDY (Cinema, Calcio 25x, Crime, Serie) ---
   { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', hts: '', daddy: '871' },
   { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', hts: '', daddy: '872' },
   { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', hts: '', daddy: '873' },
@@ -94,8 +75,6 @@ const CHANNELS = [
   { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', hts: '', daddy: '868' },
   { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', hts: '', daddy: '863' },
   { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', hts: '', daddy: '880' },
-
-  // --- ALTRI CANALI ---
   { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '', hts: '', daddy: '863' },
   { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', hts: '', daddy: '866' },
   { slug: 'sky-uno',             name: 'Sky Uno',           ntv: '881', vavoo: 'sky uno', hts: '', daddy: '881' },
@@ -148,8 +127,7 @@ function elencoCanali() {
   return L.join('\n');
 }
 
-// ============================= NTV (PRIMARIO) ==============================
-
+// ============================= NTV =========================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
@@ -163,7 +141,7 @@ async function ntvToken(id) {
   if (!r.ok) { ntvStats.err++; throw new Error('ntv api ' + r.status); }
   const j = await r.json().catch(() => null);
   const m3u8 = j && (j.m3u8 || j.proxyPlaylistUrl || j.proxyPlayerUrl);
-  if (!m3u8) { ntvStats.err++; throw new Error('ntv api senza m3u8 (mode ' + (j && j.mode) + ')'); }
+  if (!m3u8) { ntvStats.err++; throw new Error('ntv api senza m3u8'); }
   const exp = +(String(m3u8).match(/[?&]e=(\d+)/) || [])[1] || (now + 86400);
   const entry = { m3u8: m3u8, exp: exp, ref: (j && j.referer) || '' };
   tokenCache.set(id, entry);
@@ -191,13 +169,14 @@ function reqHeaders(ref) {
   return h;
 }
 
-// ============================= DADDYLIVE (PLAYER 2 PRIORITARIO) ============
+// ============================= DADDYLIVE (DOMINI AGGIORNATI 2024/2025) ====
 
 const DADDY_DOMAINS = [
+  'https://thedaddy.li',
+  'https://daddylivetv.sbs',
   'https://dlhd.sx',
   'https://daddylive.mp',
-  'https://dlhd.to',
-  'https://daddylive.live'
+  'https://dlhd.to'
 ];
 
 const daddyCache = new Map();
@@ -211,7 +190,7 @@ async function daddyResolve(id) {
 
   for (const domain of DADDY_DOMAINS) {
     try {
-      // 🔥 PROVA PRIMA IL PLAYER 2 (più veloce e stabile)
+      // 1. PROVA PRIMA IL PLAYER 2 sui nuovi domini prioritari
       const embedUrlP2 = `${domain}/embed/stream-${id}-2.php`;
       let m3u8 = await extractM3u8FromEmbed(embedUrlP2, domain);
       if (m3u8) {
@@ -219,13 +198,22 @@ async function daddyResolve(id) {
         return m3u8;
       }
 
-      // 🔥 FALLBACK AL PLAYER 1 se il 2 fallisce
+      // 2. FALLBACK AL PLAYER 1
       const embedUrlP1 = `${domain}/embed/stream-${id}.php`;
       m3u8 = await extractM3u8FromEmbed(embedUrlP1, domain);
       if (m3u8) {
         daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
         return m3u8;
       }
+
+      // 3. FALLBACK ESTREMO: prova la pagina watch.php principale
+      const watchUrl = `${domain}/watch.php?id=${id}`;
+      m3u8 = await extractM3u8FromEmbed(watchUrl, domain);
+      if (m3u8) {
+        daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL });
+        return m3u8;
+      }
+
     } catch (e) {
       continue; // prova dominio successivo
     }
@@ -233,9 +221,13 @@ async function daddyResolve(id) {
   return null;
 }
 
-async function extractM3u8FromEmbed(embedUrl, refererDomain) {
-  const r = await fetchT(embedUrl, {
-    headers: { 'User-Agent': UA, 'Referer': refererDomain + '/' },
+async function extractM3u8FromEmbed(url, refererDomain) {
+  const r = await fetchT(url, {
+    headers: { 
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 
+      'Referer': refererDomain + '/',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+    },
     cf: { cacheTtl: 300, cacheEverything: true }
   }, 12000);
 
@@ -250,21 +242,37 @@ async function extractM3u8FromEmbed(embedUrl, refererDomain) {
   const iframe = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
   if (iframe) {
     const r2 = await fetchT(iframe[1], {
-      headers: { 'User-Agent': UA, 'Referer': embedUrl },
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': url 
+      },
       cf: { cacheTtl: 300, cacheEverything: true }
     }, 12000);
-
+    
     if (r2.ok) {
       const html2 = await r2.text();
       m3u8 = html2.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
       if (m3u8) return m3u8[1];
+      
+      // 3) Secondo livello di iframe (alcuni player usano doppio annidamento)
+      const iframe2 = html2.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
+      if (iframe2) {
+        const r3 = await fetchT(iframe2[1], {
+          headers: { 'User-Agent': UA, 'Referer': iframe[1] },
+          cf: { cacheTtl: 300, cacheEverything: true }
+        }, 12000);
+        if (r3.ok) {
+          const html3 = await r3.text();
+          m3u8 = html3.match(/(https?:\/\/[^\s"']+\.m3u8[^\s"']*)/i);
+          if (m3u8) return m3u8[1];
+        }
+      }
     }
   }
   return null;
 }
 
-// ============================= VAVOO (SECONDO) =============================
-
+// ============================= VAVOO =======================================
 const VAVOO_MIRRORS = [
   'https://vavoo.to', 'https://kool.to', 'https://vavoo.net', 'https://kool.ws',
   'https://huhu.to', 'https://oha.to', 'https://voltop.net',
@@ -388,8 +396,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= MATCHORA (QUARTO) ===========================
-
+// ============================= MATCHORA ====================================
 async function matchoraResolve(c) {
   if (!c.hts) return null;
   const r1 = await fetchT('https://htsport.info/' + c.hts + '.htm',
@@ -425,7 +432,6 @@ async function matchoraResolve(c) {
 }
 
 // ============================= /live =======================================
-
 let lastPl = { key: '', txt: '', t: 0 };
 
 async function live(u, P, legacy) {
@@ -443,7 +449,6 @@ async function live(u, P, legacy) {
   if (lastPl.key === ck && Date.now() - lastPl.t < 2000) return R(lastPl.txt, 200, HLS());
 
   const provs = {
-    // 1) NTV
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
@@ -451,7 +456,6 @@ async function live(u, P, legacy) {
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
     },
-    // 2) VAVOO
     vavoo: async () => {
       if (!c.vavoo && !c.vid) return null;
       const vu = await vavooResolve(c.vavoo, c.vid);
@@ -466,31 +470,25 @@ async function live(u, P, legacy) {
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    // 3) DADDYLIVE (Player 2 prioritario)
     daddy: async () => {
       if (!c.daddy) return null;
       const du = await daddyResolve(c.daddy);
       if (!du) return null;
       if (/\.m3u8(\?|$)/.test(du)) {
-        const r = await fetchT(du, {
-          headers: { 'User-Agent': UA, 'Referer': 'https://dlhd.sx/' }
-        }, 12000);
+        const r = await fetchT(du, { headers: { 'User-Agent': UA, 'Referer': 'https://thedaddy.li/' } }, 12000);
         if (r.ok) {
-          const out = rewritePl(await r.text(), du, P, 'https://dlhd.sx/');
+          const out = rewritePl(await r.text(), du, P, 'https://thedaddy.li/');
           lastPl = { key: ck, txt: out, t: Date.now() };
           return R(out, 200, HLS());
         }
       }
       return R('redirect daddy', 302, { Location: du, ...CORS() });
     },
-    // 4) MATCHORA
     matchora: async () => {
       const mu = await matchoraResolve(c);
       if (!mu) return null;
       if (/\.m3u8(\?|$)/.test(mu)) {
-        const r = await fetchT(mu, {
-          headers: { 'User-Agent': UA, 'Referer': 'https://matchora.pro/', 'Origin': 'https://matchora.pro' }
-        }, 12000);
+        const r = await fetchT(mu, { headers: { 'User-Agent': UA, 'Referer': 'https://matchora.pro/', 'Origin': 'https://matchora.pro' } }, 12000);
         if (r.ok) {
           const out = rewritePl(await r.text(), mu, P, 'https://matchora.pro/');
           lastPl = { key: ck, txt: out, t: Date.now() };
@@ -532,7 +530,6 @@ function rewritePl(txt, baseUrl, P, ref) {
 }
 
 // ============================= /seg ========================================
-
 async function seg(u) {
   const target = u.searchParams.get('u');
   if (!target) return R('uso: /seg?u=<url>', 200, TXT());
@@ -551,17 +548,15 @@ async function seg(u) {
 }
 
 // ============================= /probe ======================================
-
 async function probe(u) {
   const q = u.searchParams.get('ch') || '';
   const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
   const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' ntv=' + (c.ntv||'-') + ' vavoo=' + (c.vavoo||'-') + ' daddy=' + (c.daddy||'-') + ' hts=' + (c.hts||'-') + ')'];
-  // NTV
+  
   try {
-    if (!c.ntv) {
-      L.push('1) NTV: non mappato (salto)');
-    } else {
+    if (!c.ntv) L.push('1) NTV: non mappato (salto)');
+    else {
       const t0 = Date.now();
       const tk = await ntvToken(c.ntv);
       const exp = (String(tk.m3u8).match(/[?&]e=(\d+)/) || [])[1];
@@ -578,28 +573,28 @@ async function probe(u) {
       }
     }
   } catch (e) { L.push('1) NTV: ERRORE ' + e.message); }
-  // VAVOO
+
   try {
     const t0 = Date.now();
     const vu = (c.vavoo || c.vid) ? await vavooResolve(c.vavoo, c.vid) : null;
-    L.push('2) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato (query: ' + (c.vavoo || '-') + ' vid: ' + (c.vid || '-') + ')' : 'non mappato (salto)')));
+    L.push('2) VAVOO: ' + (vu ? 'OK ' + vu.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.vavoo || c.vid ? 'nessun risultato' : 'non mappato (salto)')));
   } catch (e) { L.push('2) VAVOO: ERRORE ' + e.message); }
-  // DADDYLIVE
+
   try {
     const t0 = Date.now();
     const du = c.daddy ? await daddyResolve(c.daddy) : null;
     L.push('3) DADDYLIVE: ' + (du ? 'OK ' + du.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.daddy ? 'nessun risultato (id: ' + c.daddy + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('3) DADDYLIVE: ERRORE ' + e.message); }
-  // MATCHORA
+
   try {
     const mu = c.hts ? await matchoraResolve(c) : null;
     L.push('4) MATCHORA: ' + (mu ? 'OK ' + mu.slice(0, 80) + '...' : (c.hts ? 'nessun risultato (pagina ' + c.hts + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('4) MATCHORA: ERRORE ' + e.message); }
+
   return L.join('\n');
 }
 
 // ============================= /vmap ========================================
-
 async function vmap() {
   const t0 = Date.now();
   const m = await ensureVavooMap(true);
@@ -613,8 +608,7 @@ async function vmap() {
 }
 
 // ============================= UTILS =======================================
-
-const VER = 'TVNOW-CF v1.7';
+const VER = 'TVNOW-CF v1.8';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 
@@ -627,16 +621,14 @@ function debug() {
   L.push('stats ntv: ' + JSON.stringify(ntvStats));
   L.push('daddy cache: ' + daddyCache.size + ' url');
   const vm = vavooMapGet();
-  L.push('mappa vavoo: ' + (vm ? vm.size + ' canali (fonte: ' + vavooMap.src + ', eta ' + Math.round((Date.now() - vavooMap.t) / 60000) + 'min)' : 'non caricata (si carica al primo uso vavoo)'));
+  L.push('mappa vavoo: ' + (vm ? vm.size + ' canali (fonte: ' + vavooMap.src + ', eta ' + Math.round((Date.now() - vavooMap.t) / 60000) + 'min)' : 'non caricata'));
   L.push('ultimi log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
 
 function uso(P) {
   return [
-    VER,
-    '',
-    'uso:',
+    VER, '', 'uso:',
     '  /live?ch=<slug|id>   playlist (es. /live?ch=sky-sport-24 o /live?ch=869)',
     '     [&p=...]          ordine provider (default ntv,vavoo,daddy,matchora)',
     '     [&direct=1]       segmenti DIRETTI dal CDN (anti-tetto richieste)',
@@ -648,7 +640,7 @@ function uso(P) {
     '  /debug               stato',
     '  /ip                  IP egress',
     '',
-    'provider: 1) NTV tvnow247 (token 24h auto-renew)  2) Vavoo/geil.to  3) DaddyLive (Player 2优先)  4) Matchora/HTSport'
+    'provider: 1) NTV tvnow247  2) Vavoo/geil.to  3) DaddyLive (Player 2 prioritario)  4) Matchora/HTSport'
   ].join('\n');
 }
 
@@ -672,8 +664,7 @@ async function rawu(u) {
   catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); }
   let body = '';
   try { body = await r.text(); } catch (e) { body = '(body non leggibile: ' + (e && e.message) + ')'; }
-  const head = 'status ' + r.status + ' | ct ' + (r.headers.get('content-type') || '-') +
-    ' | len ' + body.length + ' | final ' + r.url + '\n';
+  const head = 'status ' + r.status + ' | ct ' + (r.headers.get('content-type') || '-') + ' | len ' + body.length + ' | final ' + r.url + '\n';
   const find = u.searchParams.get('find');
   if (find) {
     const hits = [];
@@ -696,4 +687,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v1.7 (NTV + VAVOO + DADDYLIVE Player2 + MATCHORA) ███
+// ███ FINE FILE TVNOW-CF v1.8 ███
