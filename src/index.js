@@ -1,13 +1,12 @@
 // ============================================================================
-// TVNOW-CF v2.2 — VAVOO + NTV + DADDYLIVE (IPTV-Proof & Anti-403)
+// TVNOW-CF v2.3 — VAVOO + NTV + DADDYLIVE (Daddy 302 Bypass Anti-Blocco)
 // Cloudflare Worker — file unico, zero dipendenze.
 //
-// FIX v2.2 (Risolve "Browser OK, App IPTV NO"):
-// 1. REWRITEPL BULLETPROOF: Gestisce correttamente URL assoluti, relativi 
-//    e root-relativi, avvolgendo SEMPRE il segmento nel proxy /seg.
-// 2. HEADER FORZATI: Il proxy /seg inoltra SEMPRE Referer e Origin al CDN, 
-//    impedendo il 403 Forbidden delle app IPTV.
-// 3. CORS PERFETTO: Risposte /seg con Access-Control-Allow-Origin: * esplicito.
+// FIX v2.3 (Risolve "Daddy si blocca in app IPTV"):
+// I CDN di DaddyLive bloccano gli IP dei Cloudflare Workers sui segmenti .ts.
+// Soluzione: DaddyLive usa ora un REDIRECT 302 diretto alla playlist .m3u8.
+// L'app IPTV scaricherà i segmenti direttamente con il tuo IP di casa (non bloccato),
+// bypassando il limite del Worker e risolvendo il problema dello schermo nero.
 // ============================================================================
 
 export default {
@@ -324,7 +323,6 @@ async function live(u, P, legacy) {
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
 
-  // FORZIAMO IL PROXY per garantire che le app IPTV ricevano gli header corretti
   const direct = false; 
   const order = legacy ? [legacy, ...['vavoo', 'ntv', 'daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'vavoo,ntv,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -355,20 +353,15 @@ async function live(u, P, legacy) {
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
     },
+    // 🔥 DADDYLIVE FIX: Redirect 302 diretto per bypassare il blocco IP dei Worker sui segmenti .ts
     daddy: async () => {
       if (!c.daddy) return null;
       const du = await daddyResolve(c.daddy);
       if (!du) return null;
-      if (/\.m3u8(\?|$)/.test(du)) {
-        const r = await fetchT(du, { headers: { 'User-Agent': UA, 'Referer': 'https://thedaddy.li/', 'Origin': 'https://thedaddy.li' } }, 12000);
-        if (r.ok) {
-          const txt = await r.text();
-          const out = rewritePl(txt, du, P, 'https://thedaddy.li/', 'https://thedaddy.li');
-          lastPl = { key: ck, txt: out, t: Date.now() };
-          return R(out, 200, HLS());
-        }
-      }
-      return R('redirect daddy', 302, { Location: du, ...CORS() });
+      // Restituiamo un redirect 302 diretto alla playlist .m3u8 risolta.
+      // L'app IPTV scaricherà i segmenti usando il tuo IP di casa (non bloccato dal CDN),
+      // risolvendo il problema dello schermo nero e risparmiando il limite del Worker.
+      return R('redirect', 302, { Location: du, ...CORS() });
     }
   };
 
@@ -383,7 +376,7 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// ============================= REWRITEPL BULLETPROOF =======================
+// ============================= REWRITEPL ===================================
 function rewritePl(txt, baseUrl, P, ref, origin) {
   const lines = String(txt).split(/\r?\n/);
   const out = [];
@@ -394,17 +387,15 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
 
     let abs = t;
     if (!/^https?:\/\//i.test(t)) {
-      // Gestione URL relativi o root-relativi
       if (t.startsWith('/')) {
         const urlObj = new URL(baseUrl);
         abs = urlObj.origin + t;
       } else {
         abs = baseUrl.replace(/[^/]*$/, '') + t.replace(/^\.\//, '');
       }
-      abs = abs.replace(/([^:])\/{2,}/g, '$1/'); // Pulisce doppi slash
+      abs = abs.replace(/([^:])\/{2,}/g, '$1/');
     }
 
-    // Avvolge SEMPRE nel proxy /seg con gli header corretti
     let segUrl = P + '/seg?u=' + encodeURIComponent(abs);
     if (ref) segUrl += '&ref=' + encodeURIComponent(ref);
     if (origin) segUrl += '&o=' + encodeURIComponent(origin);
@@ -413,7 +404,7 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ============================= /seg (IPTV-PROOF) ===========================
+// ============================= /seg ========================================
 async function seg(u) {
   const target = u.searchParams.get('u');
   if (!target) return R('uso: /seg?u=<url>', 200, TXT());
@@ -425,7 +416,6 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // Timeout alto per segmenti grandi, streaming diretto del body
   const r = await fetchT(target, { headers: h }, 30000);
   
   const hh = { 
@@ -440,7 +430,6 @@ async function seg(u) {
   if (cl) hh['content-length'] = cl;
   if (cr) hh['content-range'] = cr;
 
-  // Streaming diretto del body: niente await text(), niente mosaico
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -476,7 +465,7 @@ async function probe(u) {
   try {
     const t0 = Date.now();
     const du = c.daddy ? await daddyResolve(c.daddy) : null;
-    L.push('3) DADDYLIVE: ' + (du ? 'OK ' + du.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.daddy ? 'nessun risultato (id: ' + c.daddy + ')' : 'non mappato (salto)')));
+    L.push('3) DADDYLIVE: ' + (du ? 'OK (Redirect 302 a) ' + du.slice(0, 80) + '... (' + (Date.now() - t0) + 'ms)' : (c.daddy ? 'nessun risultato (id: ' + c.daddy + ')' : 'non mappato (salto)')));
   } catch (e) { L.push('3) DADDYLIVE: ERRORE ' + e.message); }
 
   return L.join('\n');
@@ -494,7 +483,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v2.2';
+const VER = 'TVNOW-CF v2.3';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11, 19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -509,7 +498,7 @@ function debug() {
 }
 
 function uso(P) {
-  return [VER, '', 'uso:', '  /live?ch=<slug|id>   playlist PROXY (compatibile con tutte le app IPTV)', '  legacy: /vavoo?ch=QUERY  /ntv?ch=ID  /daddy?ch=ID', '  /probe?ch=<slug>     diagnostica', '  /ch                  elenco canali', '  /debug               stato', ''].join('\n');
+  return [VER, '', 'uso:', '  /live?ch=<slug|id>   playlist (Daddy usa redirect 302 diretto)', '  legacy: /vavoo?ch=QUERY  /ntv?ch=ID  /daddy?ch=ID', '  /probe?ch=<slug>     diagnostica', '  /ch                  elenco canali', '  /debug               stato', ''].join('\n');
 }
 
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
@@ -542,4 +531,4 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ███ FINE FILE TVNOW-CF v2.2 ███
+// ███ FINE FILE TVNOW-CF v2.3 ███
