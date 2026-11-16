@@ -1,10 +1,8 @@
 // ============================================================================
-// TVNOW-CF v2.6 — VAVOO (live-site fallback) + NTV + DADDYLIVE
-// FIX tennis: il match lasco agganciava "SKY SPORT"->Supertennis. Ora:
-//  - match a TOKEN rigoroso (sky+sport+tennis tutti presenti)
-//  - se la lista statica non ha il canale, il worker interroga il SITO Vavoo
-//    (mediahubmx-list.json) dove "SKY SPORT TENNIS (6)" esiste con ID giusto.
-// Cron warm: tiene caldi token NTV + mappa Vavoo (~0,5% quota).
+// TVNOW-CF v2.7 — VAVOO + NTV + DADDYLIVE
+// FIX: Sky Sport Tennis ha vid fisso 2100771782 (estratto da channels.json
+//      di geil.to). Il worker NON fa più fuzzy-match per nome => mai più
+//      Supertennis. Cron warm attivo.
 // ============================================================================
 
 export default {
@@ -49,7 +47,7 @@ const CHANNELS = [
   { slug: 'sky-sport-24',        name: 'Sky Sport 24',      ntv: '869', vavoo: 'sky sport 24',      daddy: '869' },
   { slug: 'sky-sport-uno',       name: 'Sky Sport Uno',     ntv: '461', vavoo: 'sky sport uno',     daddy: '461' },
   { slug: 'sky-sport-calcio',    name: 'Sky Sport Calcio',  ntv: '870', vavoo: 'sky sport calcio',  daddy: '870' },
-  { slug: 'sky-sport-tennis',    name: 'Sky Sport Tennis',  ntv: '576', vavoo: 'sky sport tennis',  daddy: '576', vid: '' }, // vid: metti qui l'ID del tile "SKY SPORT TENNIS (6)" se vuoi forzare
+  { slug: 'sky-sport-tennis',    name: 'Sky Sport Tennis',  ntv: '576', vavoo: 'sky sport tennis',  daddy: '576', vid: '2100771782' },
   { slug: 'sky-sport-arena',     name: 'Sky Sport Arena',   ntv: '462', vavoo: 'sky sport arena',   daddy: '462' },
   { slug: 'sky-sport-basket',    name: 'Sky Sport Basket',  ntv: '875', vavoo: 'sky sport basket',  daddy: '875' },
   { slug: 'sky-sport-max',       name: 'Sky Sport Max',     ntv: '460', vavoo: 'sky sport max',     daddy: '460' },
@@ -104,7 +102,7 @@ function norm(s) { return String(s||'').toLowerCase().trim().replace(/[^a-z0-9]+
 function findCh(q) { let k=norm(q); if (BY_KEY.has(k)) return BY_KEY.get(k); k=k.replace(/-ntv$/,'').replace(/-daddy$/,''); return BY_KEY.get(k)||null; }
 function elencoCanali() {
   const L = ['CANALI (' + CHANNELS.length + ') — /live?ch=<slug o id>'];
-  for (const c of CHANNELS) L.push('  ' + c.slug.padEnd(22) + ' ntv=' + String(c.ntv).padEnd(4) + ' vavoo=' + (c.vavoo||'-').padEnd(18) + ' daddy=' + (c.daddy||'-').padEnd(4));
+  for (const c of CHANNELS) L.push('  ' + c.slug.padEnd(22) + ' ntv=' + String(c.ntv).padEnd(4) + ' vavoo=' + (c.vavoo||'-').padEnd(18) + ' daddy=' + (c.daddy||'-').padEnd(4) + (c.vid ? ' vid=' + c.vid : ''));
   return L.join('\n');
 }
 
@@ -177,7 +175,7 @@ async function extractM3u8FromEmbed(url, refererDomain, timeoutMs) {
 }
 
 // ============================= VAVOO =======================================
-const VAVOO_MIRRORS = ['https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net','https://geil.to','https://geil.app','https://geil.win'];
+const VAVOO_MIRRORS = ['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES = ['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap = { map: null, t: 0, src: '' };
 const VAVOO_MAP_TTL = 6*3600*1000;
@@ -200,8 +198,6 @@ async function ensureVavooMap(force) {
   return cached;
 }
 
-// 🔥 match a TOKEN rigoroso: OGNI parola della query deve essere nel nome.
-// "sky sport tennis" NON matcha "SKY SPORT" (manca tennis) => niente Supertennis.
 function vavooMapFind(query, m) {
   if (!m || !query) return null;
   const q = norm(query); if (m.has(q)) return m.get(q);
@@ -220,15 +216,14 @@ function vavooMapFind(query, m) {
 function vavooHeaders(extra) { return Object.assign({ 'User-Agent': 'MediaHubMX/2', 'Accept': 'application/json', 'Origin': 'https://vavoo.to', 'Referer': 'https://vavoo.to/' }, extra || {}); }
 async function vavooResolveId(base, id) {
   const play = base + '/live/play/' + id;
-  try { const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: { 'User-Agent': UA, 'Referer': 'https://vavoo.to/', 'Origin': 'https://vavoo.to' } }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
-  try { const r = await fetchT(base + '/mediahubmx-resolve.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ language: 'de', region: 'DE', url: play, clientVersion: '3.0.2' }) }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
+  try { const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: { 'User-Agent': UA, 'Referer': base + '/', 'Origin': base } }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
+  try { const r = await fetchT(base + '/mediahubmx-resolve.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'de', region: 'DE', url: play, clientVersion: '3.0.2' }) }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
   return null;
 }
 
-// 🔥 fallback: interroga il SITO Vavoo live (dove "SKY SPORT TENNIS (6)" esiste con ID giusto)
 async function vavooLiveFind(base, query) {
   try {
-    const rl = await fetchT(base + '/mediahubmx-list.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ language: 'it', region: 'IT', clientVersion: '3.0.2', url: 'https://vavoo.to/live' }) }, 9000);
+    const rl = await fetchT(base + '/mediahubmx-list.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'it', region: 'IT', clientVersion: '3.0.2', url: base + '/live' }) }, 9000);
     if (!rl.ok) return null;
     const j = await rl.json().catch(()=>null);
     const items = j && (j.items || j.channels || j.entries) || [];
@@ -246,7 +241,6 @@ async function vavooResolve(query, vid) {
   let id = vid || null;
   if (!id) { const m = await ensureVavooMap(); id = vavooMapFind(query, m); }
   if (id) { for (const base of VAVOO_MIRRORS) { const u = await vavooResolveId(base, id); if (u) return u; } return null; }
-  // non in lista statica -> cerca sul sito live (primo mirror che risponde)
   for (const base of VAVOO_MIRRORS.slice(0, 4)) {
     const id2 = await vavooLiveFind(base, query);
     if (id2) { for (const b2 of VAVOO_MIRRORS) { const u = await vavooResolveId(b2, id2); if (u) return u; } }
@@ -340,7 +334,7 @@ async function probe(u) {
   const q = u.searchParams.get('ch') || ''; const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
   const L = ['PROBE ' + c.name + ' (slug=' + c.slug + ' vavoo=' + (c.vavoo||'-') + ' ntv=' + (c.ntv||'-') + ' daddy=' + (c.daddy||'-') + ' vid=' + (c.vid||'-') + ')'];
-  try { const t0 = Date.now(); const vu = (c.vavoo||c.vid) ? await vavooResolve(c.vavoo, c.vid) : null; L.push('1) VAVOO: ' + (vu ? 'OK ' + vu.slice(0,80) + '... (' + (Date.now()-t0) + 'ms)' : (c.vavoo||c.vid ? 'nessun risultato (usera NTV)' : 'non mappato (salto)'))); } catch (e) { L.push('1) VAVOO: ERRORE ' + e.message); }
+  try { const t0 = Date.now(); const vu = (c.vavoo||c.vid) ? await vavooResolve(c.vavoo, c.vid) : null; L.push('1) VAVOO: ' + (vu ? 'OK ' + vu.slice(0,90) + '... (' + (Date.now()-t0) + 'ms)' : (c.vavoo||c.vid ? 'nessun risultato' : 'non mappato (salto)'))); } catch (e) { L.push('1) VAVOO: ERRORE ' + e.message); }
   try { if (!c.ntv) L.push('2) NTV: non mappato (salto)'); else { const t0 = Date.now(); const pl = await ntvPlaylist(c.ntv); const segs = (pl.txt.match(/#EXTINF/g)||[]).length; L.push('2) NTV: API OK | playlist 200 ' + segs + ' segs (' + (Date.now()-t0) + 'ms)'); } } catch (e) { L.push('2) NTV: ERRORE ' + e.message); }
   try { const t0 = Date.now(); const du = c.daddy ? await daddyResolve(c.daddy) : null; L.push('3) DADDYLIVE: ' + (du ? 'OK ' + du.slice(0,80) + '... (' + (Date.now()-t0) + 'ms)' : (c.daddy ? 'nessun risultato (id: '+c.daddy+')' : 'non mappato (salto)'))); } catch (e) { L.push('3) DADDYLIVE: ERRORE ' + e.message); }
   return L.join('\n');
@@ -348,12 +342,12 @@ async function probe(u) {
 
 async function vmap() {
   const m = await ensureVavooMap(true); if (!m) return 'VMAP: nessuna fonte raggiungibile';
-  const L = ['VMAP statica: ' + m.size + ' canali (' + vavooMap.src + ')', '--- verifica tennis (statica) ---'];
-  for (const c of CHANNELS) if (/tennis/.test(c.slug)) { const id = c.vid || vavooMapFind(c.vavoo, m); L.push((id?'OK  ':'--  ') + c.slug + ' -> ' + (id || 'NON in lista statica (il worker cerchera sul sito live)')); }
+  const L = ['VMAP statica: ' + m.size + ' canali (' + vavooMap.src + ')', '--- verifica tennis ---'];
+  for (const c of CHANNELS) if (/tennis/.test(c.slug)) { const id = c.vid || vavooMapFind(c.vavoo, m); L.push((id?'OK  ':'--  ') + c.slug + ' -> ' + (id || 'non trovato') + (c.vid ? ' (PINNATO)' : '')); }
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v2.6';
+const VER = 'TVNOW-CF v2.7';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -365,4 +359,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = { 'User-Agent': UA, 'Accept': '*/*' }; if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v2.6 ███
+// ███ FINE TVNOW-CF v2.7 ███
