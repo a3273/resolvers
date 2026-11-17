@@ -1,9 +1,9 @@
 // ============================================================================
-// TVNOW-CF v3.5 — VAVOO + NTV + DADDYLIVE (ANTI-BLOCK POTENZIATO)
+// TVNOW-CF v3.6 — VAVOO + NTV + DADDYLIVE (FIX Cinema/Calcio su NTV)
 // 
-// FIX CRITICI:
-// - Sky Calcio 251/252/253 e Sky Cinema/Crime/Serie spostati esclusivamente su DaddyLive.
-// - Anti-Block Potenziato: Header "Sec-Fetch-*" e "Accept-Language" per sembrare un browser Chrome reale.
+// FIX: Sky Calcio 251/252/253 e Sky Cinema/Crime/Serie tornano su NTV.
+//      DaddyLive non ha questi canali con gli ID NTV.
+// - Anti-Block Potenziato: Header browser reali.
 // - Playlist troncata agli ultimi 4 segmenti => delay minimo (~25-35s).
 // - Cache segmenti a 0 + timestamp unico => bypass totale cache Cloudflare.
 // - Buffer player consigliato: 3000ms.
@@ -62,22 +62,22 @@ const CHANNELS = [
   { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       daddy: '878', vid: '3448075317' },
   { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       daddy: '879', vid: '2317684453' },
   
-  // 🔥 CANALI ESCLUSIVAMENTE SU DADDYLIVE (ntv: '')
-  { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '', vavoo: '', daddy: '871' },
-  { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '', vavoo: '', daddy: '872' },
-  { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '', vavoo: '', daddy: '873' },
-  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '', vavoo: '', daddy: '860' },
-  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '', vavoo: '', daddy: '861' },
-  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '', vavoo: '', daddy: '862' },
-  { slug: 'sky-cinema-collection',name:'Sky Cinema Collection',ntv:'',vavoo:'', daddy: '859' },
-  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance',ntv: '', vavoo: '', daddy: '864' },
-  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '', vavoo: '', daddy: '865' },
-  { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '', vavoo: '', daddy: '867' },
-  { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'', vavoo: '', daddy: '868' },
-  { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '', vavoo: '', daddy: '863' },
-  { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '', vavoo: '', daddy: '866' },
-  { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '', vavoo: '', daddy: '863' },
-  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '', vavoo: '', daddy: '880' },
+  // 🔥 CANALI SU NTV (DaddyLive non li ha con questi ID)
+  { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', daddy: '' },
+  { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', daddy: '' },
+  { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-uno',      name: 'Sky Cinema Uno',    ntv: '860', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-action',   name: 'Sky Cinema Action', ntv: '861', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-comedy',   name: 'Sky Cinema Comedy', ntv: '862', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-collection',name:'Sky Cinema Collection',ntv:'859',vavoo:'', daddy: '' },
+  { slug: 'sky-cinema-romance',  name: 'Sky Cinema Romance',ntv: '864', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '867', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '', daddy: '' },
+  { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', daddy: '' },
+  { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', daddy: '' },
+  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', daddy: '' },
   
   { slug: 'italia-1',            name: 'Italia 1',          ntv: '854', vavoo: 'italia 1', daddy: '854' },
   { slug: 'la7',                 name: 'La7',               ntv: '855', vavoo: 'la7', daddy: '855', vid: '775530063' },
@@ -161,7 +161,6 @@ async function daddyResolve(id) {
 }
 
 async function extractM3u8FromEmbed(url, refererDomain, timeoutMs) {
-  // 🔥 Anti-Block: Header completi da browser reale
   const r = await fetchT(url, { headers: getBrowserHeaders(refererDomain + '/'), cf: { cacheTtl: 300, cacheEverything: true } }, timeoutMs);
   if (!r.ok) return null;
   const html = await r.text();
@@ -416,7 +415,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v3.5';
+const VER = 'TVNOW-CF v3.6';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -428,4 +427,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v3.5 ███
+// ███ FINE TVNOW-CF v3.6 ███
