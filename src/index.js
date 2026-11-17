@@ -1,17 +1,17 @@
 // ============================================================================
-// TVNOW-CF v5.3 — NTV VIA PROXY /seg (FIX APP IPTV)
+// TVNOW-CF v5.4 — ANTI-SCHERMO-BIANCO (EXT-X-START)
 //
-// FIX v5.3: NTV torna al proxy /seg (come v2.x che funzionava).
-//           Il worker invia SEMPRE il Referer corretto al CDN NTV,
-//           indipendentemente dall'app IPTV usata.
-//           Mantenuta sliding window HLS corretta (niente freeze a 30 min).
+// FIX v5.4: Aggiunti tag HLS ufficiali EXT-X-START e EXT-X-DISCONTINUITY-SEQUENCE
+//           nella sliding window. Il player sa esattamente da dove partire 
+//           e resetta il decoder in modo pulito => ZERO schermo bianco all'avvio.
 //
-// TECNOLOGIA INTATTA:
-// 1. HLS SLIDING WINDOW (v3.9): MEDIA-SEQUENCE corretta.
-// 2. MEMORY LIMITS (v4.1): Cache limitate (50 NTV, 100 Daddy).
-// 3. SUBREQUEST LIMITS (v3.9): Tetto a 6 mirror Vavoo, cron a blocchi di 8.
-// 4. CACHE BYPASS (v4.1): Timestamp _t= sui segmenti.
-// 5. FAST START (v5.1): Salta provider vuoti.
+// TECNOLOGIA INTATTA (identica alla v5.3):
+// 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
+// 2. NTV VIA PROXY /seg: Header Referer inviati dal worker (funziona in app).
+// 3. MEMORY LIMITS: Cache limitate (50 NTV, 100 Daddy) + pulizia auto.
+// 4. SUBREQUEST LIMITS: Tetto a 6 mirror Vavoo, cron a blocchi di 8.
+// 5. CACHE BYPASS: Timestamp _t= sui segmenti.
+// 6. FAST START: Salta provider vuoti.
 // ============================================================================
 
 export default {
@@ -323,13 +323,10 @@ async function live(u, P, legacy) {
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    // 🔥 FIX v5.3: NTV via proxy /seg (come v2.x che funzionava) + sliding window
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      // 1. Sliding window corretta (ultimi 4 segmenti)
       const truncated = truncatePlaylist(pl.txt, 4);
-      // 2. Proxy tramite /seg con timestamp (bypass cache + header corretti)
       const out = rewritePlLowLatency(truncated, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
@@ -352,10 +349,10 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// FIX v3.9: Sliding window HLS matematicamente corretta
+// FIX v5.4: Sliding window HLS + Genialata anti-schermo-bianco
 function truncatePlaylist(txt, lastN) {
   const lines = String(txt).split(/\r?\n/);
-  let upSeq = 0, upTarget = 0;
+  let upSeq = 0, upTarget = 0, upDiscSeq = 0;
   const pending = [];
   const segments = [];
   for (const raw of lines) {
@@ -364,6 +361,7 @@ function truncatePlaylist(txt, lastN) {
     if (line.startsWith('#EXTM3U')) continue;
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 0; continue; }
+    if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) { upDiscSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-PLAYLIST-TYPE') || line.startsWith('#EXT-X-ENDLIST')) continue;
     if (line.startsWith('#EXTINF')) { segments.push({ tags: pending.splice(0), extinf: line, url: '' }); continue; }
     if (line.startsWith('#')) { pending.push(line); continue; }
@@ -377,7 +375,15 @@ function truncatePlaylist(txt, lastN) {
   if (!target) {
     for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
   }
-  const out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:' + (target || 4), '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped)];
+  // 🔥 GENIALATA: tag ufficiali HLS per partenza pulita e decoder resettato
+  const out = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-TARGETDURATION:' + (target || 4),
+    '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
+    '#EXT-X-DISCONTINUITY-SEQUENCE:' + upDiscSeq,
+    '#EXT-X-START:TIME-OFFSET=-3'
+  ];
   for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
   return out.join('\n');
 }
@@ -447,7 +453,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v5.3';
+const VER = 'TVNOW-CF v5.4';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -476,4 +482,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v5.3 ███
+// ███ FINE TVNOW-CF v5.4 ███
