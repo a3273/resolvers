@@ -1,20 +1,20 @@
 // ============================================================================
-// TVNOW-CF v5.8 — CAMBIO CANALE ISTANTANEO + AVVIO 3-4 SECONDI
+// TVNOW-CF v5.9 — DADDY TTL OTTIMIZZATO (3 MINUTI)
 //
-// FIX v5.8:
-// 1. Cache playlist ridotta da 3000ms a 1000ms (cambio canale immediato)
-// 2. Header Cache-Control: no-cache su tutte le playlist HLS
-// 3. Daddy TTL ridotto da 2 min a 1 min (URL sempre freschi)
-// 4. Aggiunto #EXT-X-ALLOW-CACHE:NO nelle playlist NTV
-// 5. Warm pre-riscalda anche i resolve Vavoo dei canali più usati
+// FIX v5.9:
+// - Daddy TTL riportato a 3 minuti (da 1 min della v5.8)
+//   Compromesso ottimale: cache fresca ma senza errori da refresh troppo frequenti
 //
-// TECNOLOGIA INTATTA (identica alla v5.7):
-// 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta.
+// TECNOLOGIA INTATTA (identica alla v5.8):
+// 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
 // 2. NTV VIA PROXY /seg: Header Referer inviati dal worker.
 // 3. MEMORY LIMITS: Cache limitate (50 NTV, 100 Daddy).
 // 4. SUBREQUEST LIMITS: Tetto a 6 mirror Vavoo, cron a blocchi di 8.
 // 5. CACHE BYPASS: Timestamp _t= sui segmenti.
 // 6. FAST START: Salta provider vuoti.
+// 7. CAMBIO CANALE: Cache playlist 1000ms + header no-cache.
+// 8. AVVIO RAPIDO: 6 segmenti + EXT-X-START + EXT-X-DISCONTINUITY.
+// 9. WARM: Pre-riscalda NTV + Vavoo canali più usati.
 // ============================================================================
 
 export default {
@@ -155,7 +155,7 @@ async function ntvPlaylist(id) {
 // ============================= DADDYLIVE (ANTI-BLOCK + LIMITS) =============
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map(); 
-const DADDY_TTL = 1*60*1000; // 🔥 FIX v5.8: da 2 min a 1 min
+const DADDY_TTL = 3*60*1000; // 🔥 FIX v5.9: 3 minuti (compromesso ottimale)
 const MAX_DADDY_CACHE = 100;
 
 async function daddyResolve(id) {
@@ -309,7 +309,6 @@ async function live(u, P, legacy) {
   });
 
   const ck = c.slug + ':' + availableOrder.join('.');
-  // 🔥 FIX v5.8: Cache ridotta da 3000ms a 1000ms per cambio canale immediato
   if (lastPl.key === ck && Date.now() - lastPl.t < 1000) return R(lastPl.txt, 200, HLS_NO_CACHE());
   
   const provs = {
@@ -379,7 +378,6 @@ function truncatePlaylist(txt, lastN) {
   if (!target) {
     for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
   }
-  // 🔥 FIX v5.8: Aggiunto EXT-X-ALLOW-CACHE:NO
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -388,7 +386,7 @@ function truncatePlaylist(txt, lastN) {
     '#EXT-X-DISCONTINUITY-SEQUENCE:' + upDiscSeq,
     '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES',
     '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-ALLOW-CACHE:NO'  // ← "Non cachare questa playlist"
+    '#EXT-X-ALLOW-CACHE:NO'
   ];
   out.push('#EXT-X-DISCONTINUITY');
   for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
@@ -437,7 +435,6 @@ async function warm() {
   for (let i = 0; i < ids.length; i += 8) {
     await Promise.all(ids.slice(i, i + 8).map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   }
-  // 🔥 FIX v5.8: Pre-riscalda anche i resolve Vavoo dei canali più usati
   const vavooChannels = ['sky sport 24', 'sky sport uno', 'sky sport calcio', 'sky sport tennis', 'dazn 1', 'eurosport 1'];
   for (const ch of vavooChannels) {
     try { await vavooResolve(ch, null); } catch (e) {}
@@ -465,7 +462,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v5.8';
+const VER = 'TVNOW-CF v5.9';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -490,7 +487,6 @@ function debug() {
 function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>   playlist','  /warm                (cron) tiene calda la cache','  /vmap                verifica mapping tennis','  legacy: /vavoo?ch=QUERY /ntv?ch=ID /daddy?ch=ID','  /probe?ch=<slug>     diagnostica','  /debug               stato',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS() { return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-store', ...CORS() }; }
-// 🔥 FIX v5.8: Header no-cache per playlist HLS
 function HLS_NO_CACHE() { 
   return { 
     'content-type': 'application/vnd.apple.mpegurl', 
@@ -504,4 +500,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v5.8 ███
+// ███ FINE TVNOW-CF v5.9 ███
