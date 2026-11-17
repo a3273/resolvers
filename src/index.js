@@ -1,18 +1,18 @@
 // ============================================================================
-// TVNOW-CF v5.5 — FIX DECODER MOBILE (schermo grigio/nero)
+// TVNOW-CF v5.6 — NTV FAST START (Playlist Cache + Pre-fetch)
 //
-// FIX v5.5: 
-// - Rimosso EXT-X-START:TIME-OFFSET=-3 (causava schermo grigio su mobile)
-// - Aumentati segmenti da 4 a 6 (più margine per keyframe)
-// - Aggiunto EXT-X-INDEPENDENT-SEGMENTS (ogni segmento decodificabile)
+// FIX v5.6: 
+// - Aggiunta playlistCache NTV (TTL 30s, max 20 entry)
+// - Il cron warm() ora pre-fetcha anche le playlist, non solo i token
+// - NTV parte veloce come DaddyLive (~1s invece di ~3s)
 //
-// TECNOLOGIA INTATTA (identica alla v5.4 tranne truncatePlaylist):
-// 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta.
-// 2. NTV VIA PROXY /seg: Header Referer inviati dal worker.
-// 3. MEMORY LIMITS: Cache limitate (50 NTV, 100 Daddy).
-// 4. SUBREQUEST LIMITS: Tetto a 6 mirror Vavoo, cron a blocchi di 8.
-// 5. CACHE BYPASS: Timestamp _t= sui segmenti.
-// 6. FAST START: Salta provider vuoti.
+// TECNOLOGIA INTATTA (identica alla v5.5):
+// 1. HLS SLIDING WINDOW + EXT-X-INDEPENDENT-SEGMENTS (no schermo grigio)
+// 2. NTV VIA PROXY /seg (funziona in app)
+// 3. MEMORY LIMITS (50 NTV, 100 Daddy, 20 playlist)
+// 4. SUBREQUEST LIMITS (6 mirror Vavoo, cron blocchi 8)
+// 5. CACHE BYPASS (timestamp _t=)
+// 6. FAST START (salta provider vuoti)
 // ============================================================================
 
 export default {
@@ -107,11 +107,14 @@ function elencoCanali() {
   return L.join('\n');
 }
 
-// ============================= NTV (SMART TTL) =============================
+// ============================= NTV (SMART TTL + PLAYLIST CACHE) ============
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
+const playlistCache = new Map(); // 🔥 FIX v5.6: cache playlist per avvio istantaneo
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
 const MAX_TOKEN_CACHE = 50;
+const MAX_PLAYLIST_CACHE = 20;
+const PLAYLIST_TTL = 30000; // 30 secondi
 
 async function ntvToken(id) {
   const now = Date.now()/1000; const c = tokenCache.get(id);
@@ -135,19 +138,32 @@ async function ntvToken(id) {
 }
 
 async function ntvPlaylist(id) {
+  // 🔥 FIX v5.6: cache hit = avvio istantaneo (~10ms invece di ~2s)
+  const now = Date.now(); const cached = playlistCache.get(id);
+  if (cached && cached.exp > now) return cached;
+  
   let tk = await ntvToken(id);
   let r = await fetchT(tk.m3u8, { headers: getBrowserHeaders(tk.ref) }, 8000);
   let txt = r.ok ? await r.text() : '';
   
   const bad = !r.ok || r.status >= 500 || !txt.includes('#EXTM3U');
   if (bad) {
-    tokenCache.delete(id); ntvStats.refresh++;
+    tokenCache.delete(id); playlistCache.delete(id); ntvStats.refresh++;
     tk = await ntvToken(id);
     r = await fetchT(tk.m3u8, { headers: getBrowserHeaders(tk.ref) }, 8000);
     txt = r.ok ? await r.text() : '';
   }
   if (!txt.includes('#EXTM3U')) throw new Error('ntv playlist ' + r.status + ' non-HLS');
-  return { txt, ref: tk.ref, base: tk.m3u8 };
+  
+  // Pulizia cache se troppo grande
+  if (playlistCache.size > MAX_PLAYLIST_CACHE) {
+    const keys = Array.from(playlistCache.keys());
+    for (let i = 0; i < keys.length - MAX_PLAYLIST_CACHE; i++) playlistCache.delete(keys[i]);
+  }
+  
+  const entry = { txt, ref: tk.ref, base: tk.m3u8, exp: now + PLAYLIST_TTL };
+  playlistCache.set(id, entry);
+  return entry;
 }
 
 // ============================= DADDYLIVE (ANTI-BLOCK + LIMITS) =============
@@ -326,8 +342,8 @@ async function live(u, P, legacy) {
     },
     ntv: async () => {
       if (!c.ntv) return null;
-      const pl = await ntvPlaylist(c.ntv);
-      const truncated = truncatePlaylist(pl.txt, 6); // 🔥 FIX v5.5: da 4 a 6 segmenti
+      const pl = await ntvPlaylist(c.ntv); // 🔥 Ora usa playlistCache = avvio ~10ms
+      const truncated = truncatePlaylist(pl.txt, 6);
       const out = rewritePlLowLatency(truncated, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
@@ -350,7 +366,7 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// FIX v5.5: Sliding window HLS + fix decoder mobile
+// FIX v5.5: Sliding window HLS + fix decoder mobile (INTATTO)
 function truncatePlaylist(txt, lastN) {
   const lines = String(txt).split(/\r?\n/);
   let upSeq = 0, upTarget = 0, upDiscSeq = 0;
@@ -376,20 +392,19 @@ function truncatePlaylist(txt, lastN) {
   if (!target) {
     for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
   }
-  // 🔥 FIX v5.5: rimosso EXT-X-START (causava schermo grigio), aggiunto INDEPENDENT-SEGMENTS
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + (target || 4),
     '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
     '#EXT-X-DISCONTINUITY-SEQUENCE:' + upDiscSeq,
-    '#EXT-X-INDEPENDENT-SEGMENTS'  // ← "Ogni segmento è decodificabile da solo"
+    '#EXT-X-INDEPENDENT-SEGMENTS'
   ];
   for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
   return out.join('\n');
 }
 
-// FIX v4.1: Timestamp per bypassare la cache edge di Cloudflare
+// FIX v4.1: Timestamp per bypassare la cache edge di Cloudflare (INTATTO)
 function rewritePlLowLatency(txt, baseUrl, P, ref, origin) {
   const out = [];
   const ts = Date.now();
@@ -423,16 +438,23 @@ async function seg(u) {
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// ============================= WARM (CHUNKED SAFE) =========================
+// ============================= WARM (PRE-FETCH PLAYLIST) ===================
 async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
   let ok = 0, err = 0;
+  // 🔥 FIX v5.6: pre-fetch anche la playlist, non solo il token
   for (let i = 0; i < ids.length; i += 8) {
-    await Promise.all(ids.slice(i, i + 8).map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
+    await Promise.all(ids.slice(i, i + 8).map(async id => {
+      try { 
+        await ntvToken(id); 
+        await ntvPlaylist(id); // ← ora la playlist è in cache
+        ok++; 
+      } catch (e) { err++; }
+    }));
   }
   try { await ensureVavooMap(); } catch (e) {}
-  const msg = 'WARM ok=' + ok + ' err=' + err + ' (' + (Date.now()-t0) + 'ms) ntv=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE;
+  const msg = 'WARM ok=' + ok + ' err=' + err + ' (' + (Date.now()-t0) + 'ms) ntv=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' pl=' + playlistCache.size + '/' + MAX_PLAYLIST_CACHE + ' daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE;
   log(msg); return R(msg, 200, TXT());
 }
 
@@ -454,7 +476,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v5.5';
+const VER = 'TVNOW-CF v5.6';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -468,7 +490,7 @@ function countReq(kind) {
 
 function debug() { 
   const now = Date.now()/1000; 
-  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE]; 
+  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Playlist=' + playlistCache.size + '/' + MAX_PLAYLIST_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE]; 
   const vm = vavooMapGet(); 
   L.push('Mappa Vavoo: ' + (vm ? vm.size + ' canali' : 'non caricata')); 
   L.push('Richieste oggi (UTC, approx): live=' + reqStats.live + ' seg=' + reqStats.seg + ' (Tetto: 100.000/gg)'); 
@@ -483,4 +505,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v5.5 ███
+// ███ FINE TVNOW-CF v5.6 ███
