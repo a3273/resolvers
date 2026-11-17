@@ -1,9 +1,8 @@
 // ============================================================================
-// TVNOW-CF v5.1 — ULTIMATE STABILITY & FAST START (Merge v3.9 + v4.1 + FIX)
+// TVNOW-CF v5.2 — ULTIMATE STABILITY + NTV HEADER FIX
 //
-// FIX v5.1: Avvio istantaneo per canali mono-provider (Cinema/Calcio).
-//           Il worker salta i provider vuoti (es. Vavoo/NTV per Cinema) 
-//           evitando 2-3 secondi di tentativi a vuoto.
+// FIX v5.2: NTV ora invia header #EXTVLCOPT (referrer + user-agent) come DaddyLive.
+//           Il CDN NTV non blocca più i segmenti => NTV torna a funzionare.
 //
 // TECNOLOGIA INTATTA:
 // 1. HLS SLIDING WINDOW (v3.9): MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
@@ -11,6 +10,7 @@
 // 3. SUBREQUEST LIMITS (v3.9): Tetto a 6 mirror Vavoo e cron a blocchi di 8.
 // 4. CACHE BYPASS (v4.1): Timestamp _t= sui segmenti Vavoo e no-cache su /seg.
 // 5. DIRECT NTV (v3.9): Segmenti NTV diretti dal CDN (zero proxy /seg).
+// 6. FAST START (v5.1): Salta provider vuoti per avvio istantaneo.
 // ============================================================================
 
 export default {
@@ -323,12 +323,15 @@ async function live(u, P, legacy) {
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
+    // 🔥 FIX v5.2: NTV ora invia header #EXTVLCOPT come DaddyLive
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
       const out = truncatePlaylist(pl.txt, 4);
-      lastPl = { key: ck, txt: out, t: Date.now() };
-      return R(out, 200, HLS());
+      // Header per il player IPTV (come DaddyLive)
+      const finalTxt = '#EXTVLCOPT:http-referrer=' + pl.ref + '\n#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\n' + out;
+      lastPl = { key: ck, txt: finalTxt, t: Date.now() };
+      return R(finalTxt, 200, HLS());
     },
     daddy: async () => {
       if (!c.daddy) return null;
@@ -444,7 +447,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v5.1';
+const VER = 'TVNOW-CF v5.2';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -473,4 +476,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v5.1 ███
+// ███ FINE TVNOW-CF v5.2 ███
