@@ -1,16 +1,16 @@
 // ============================================================================
-// TVNOW-CF v5.0 — ULTIMATE STABILITY & LOW LATENCY (Merge v3.9 + v4.1)
+// TVNOW-CF v5.1 — ULTIMATE STABILITY & FAST START (Merge v3.9 + v4.1 + FIX)
 //
-// FIX CRITICI COMBINATI:
-// 1. HLS SLIDING WINDOW (v3.9): MEDIA-SEQUENCE corretta. RISOLVE il blocco 
-//    dopo 20-30 min (il player non vede più sequence 0 statica).
-// 2. MEMORY LIMITS (v4.1): Cache limitate a 50 (NTV) e 100 (Daddy) con pulizia 
-//    automatica. RISOLVE i crash da memory leak su sessioni lunghe.
-// 3. SUBREQUEST LIMITS (v3.9): Tetto a 6 mirror Vavoo e cron a blocchi di 8. 
-//    RISOLVE l'errore 1102 di Cloudflare (limite 50 subrequest/invocazione).
+// FIX v5.1: Avvio istantaneo per canali mono-provider (Cinema/Calcio).
+//           Il worker salta i provider vuoti (es. Vavoo/NTV per Cinema) 
+//           evitando 2-3 secondi di tentativi a vuoto.
+//
+// TECNOLOGIA INTATTA:
+// 1. HLS SLIDING WINDOW (v3.9): MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
+// 2. MEMORY LIMITS (v4.1): Cache limitate (50 NTV, 100 Daddy) + pulizia auto.
+// 3. SUBREQUEST LIMITS (v3.9): Tetto a 6 mirror Vavoo e cron a blocchi di 8.
 // 4. CACHE BYPASS (v4.1): Timestamp _t= sui segmenti Vavoo e no-cache su /seg.
-// 5. DIRECT NTV (v3.9): Segmenti NTV diretti dal CDN (niente proxy /seg), 
-//    dimezzando le richieste e abbassando la latenza.
+// 5. DIRECT NTV (v3.9): Segmenti NTV diretti dal CDN (zero proxy /seg).
 // ============================================================================
 
 export default {
@@ -113,10 +113,8 @@ const MAX_TOKEN_CACHE = 50;
 
 async function ntvToken(id) {
   const now = Date.now()/1000; const c = tokenCache.get(id);
-  // Refresh proattivo a 15 min dalla scadenza per transizioni seamless
   if (c && c.exp - now > 900) return c;
   
-  // FIX v4.1: Pulizia memoria per prevenire leak
   if (tokenCache.size > MAX_TOKEN_CACHE) {
     const keys = Array.from(tokenCache.keys());
     for (let i = 0; i < keys.length - MAX_TOKEN_CACHE; i++) tokenCache.delete(keys[i]);
@@ -129,7 +127,6 @@ async function ntvToken(id) {
   const m3u8 = j && (j.m3u8 || j.proxyPlaylistUrl || j.proxyPlayerUrl);
   if (!m3u8) { ntvStats.err++; throw new Error('ntv api senza m3u8'); }
   
-  // FIX v3.9: Se il token è opaco (niente e=), TTL conservativo 1h
   const exp = +(String(m3u8).match(/[?&]e=(\d+)/) || [])[1] || (now + 3600);
   const entry = { m3u8, exp, ref: (j && j.referer) || 'https://tvnow247.today/' };
   tokenCache.set(id, entry); return entry;
@@ -140,7 +137,6 @@ async function ntvPlaylist(id) {
   let r = await fetchT(tk.m3u8, { headers: getBrowserHeaders(tk.ref) }, 8000);
   let txt = r.ok ? await r.text() : '';
   
-  // FIX v3.9: Refresh reattivo se la risposta non è HLS (es. errore 200 con HTML)
   const bad = !r.ok || r.status >= 500 || !txt.includes('#EXTM3U');
   if (bad) {
     tokenCache.delete(id); ntvStats.refresh++;
@@ -155,7 +151,7 @@ async function ntvPlaylist(id) {
 // ============================= DADDYLIVE (ANTI-BLOCK + LIMITS) =============
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map(); 
-const DADDY_TTL = 2*60*1000; // 2 min per URL sempre freschi
+const DADDY_TTL = 2*60*1000;
 const MAX_DADDY_CACHE = 100;
 
 async function daddyResolve(id) {
@@ -163,7 +159,6 @@ async function daddyResolve(id) {
   const now = Date.now(); const cached = daddyCache.get(id);
   if (cached && cached.exp > now) return cached.url;
   
-  // FIX v4.1: Pulizia memoria
   if (daddyCache.size > MAX_DADDY_CACHE) {
     const keys = Array.from(daddyCache.keys());
     for (let i = 0; i < keys.length - MAX_DADDY_CACHE; i++) daddyCache.delete(keys[i]);
@@ -282,7 +277,6 @@ async function vavooLiveFind(base, query) {
 async function vavooResolve(query, vid) {
   let id = vid || null;
   if (!id) { const m = await ensureVavooMap(); id = vavooMapFind(query, m); }
-  // FIX v3.9: Tetto mirror per non esplodere i 50 subrequest/invocazione
   if (id) { for (const base of VAVOO_MIRRORS.slice(0, 6)) { const u = await vavooResolveId(base, id); if (u) return u; } return null; }
   for (const base of VAVOO_MIRRORS.slice(0, 2)) {
     const id2 = await vavooLiveFind(base, query);
@@ -291,7 +285,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= /live (ULTIMATE) ============================
+// ============================= /live (ULTIMATE + FAST START) ===============
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -299,9 +293,19 @@ async function live(u, P, legacy) {
   if (!q) return R('uso: /live?ch=<slug|id>\n\n' + elencoCanali(), 200, TXT());
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
+  
   const order = legacy ? [legacy, ...['vavoo','ntv','daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'vavoo,ntv,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-  const ck = c.slug + ':' + order.join('.');
+
+  // 🔥 FIX v5.1: Salta provider non disponibili per questo canale (avvio immediato)
+  const availableOrder = order.filter(p => {
+    if (p === 'vavoo') return c.vavoo || c.vid;
+    if (p === 'ntv') return c.ntv;
+    if (p === 'daddy') return c.daddy;
+    return true;
+  });
+
+  const ck = c.slug + ':' + availableOrder.join('.');
   if (lastPl.key === ck && Date.now() - lastPl.t < 3000) return R(lastPl.txt, 200, HLS());
   
   const provs = {
@@ -322,7 +326,6 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      // FIX v3.9: Sliding window HLS corretta (previene il freeze a 30 min)
       const out = truncatePlaylist(pl.txt, 4);
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS());
@@ -340,8 +343,10 @@ async function live(u, P, legacy) {
       const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() }; return R(finalTxt, 200, HLS());
     }
   };
-  for (const p of order) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
-  return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
+  
+  // 🔥 FIX v5.1: Loop sui soli provider disponibili
+  for (const p of availableOrder) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
+  return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
 // FIX v3.9: Sliding window HLS matematicamente corretta
@@ -413,7 +418,6 @@ async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
   let ok = 0, err = 0;
-  // FIX v3.9: A blocchi di 8 per non toccare il limite connessioni simultanee
   for (let i = 0; i < ids.length; i += 8) {
     await Promise.all(ids.slice(i, i + 8).map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   }
@@ -440,12 +444,11 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v5.0';
+const VER = 'TVNOW-CF v5.1';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
 
-// FIX v3.9: Contatore richieste per monitorare il tetto di 100k
 let reqStats = { day: new Date().toISOString().slice(0,10), live: 0, seg: 0 };
 function countReq(kind) {
   const d = new Date().toISOString().slice(0,10);
@@ -470,4 +473,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v5.0 ███
+// ███ FINE TVNOW-CF v5.1 ███
