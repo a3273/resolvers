@@ -1,10 +1,11 @@
 // ============================================================================
-// TVNOW-CF v3.2 — VAVOO + NTV + DADDYLIVE (FAST-START + LOW-LATENCY)
+// TVNOW-CF v3.3 — VAVOO + NTV + DADDYLIVE (ULTRA-LOW-LATENCY)
 // 
 // FIX CRITICI:
-// - Start-up 2-3s: cache playlist 3000ms, timeout ridotti a 5s
-// - Delay 30-40s: cache segmenti 5s, buffer player 5000ms
-// - Cron ogni 3 min: tiene caldi token + playlist
+// - Playlist troncata agli ultimi 4 segmenti => player parte dall'ultimo chunk
+// - Timestamp unico sugli URL segmenti => bypass cache Cloudflare
+// - Cache segmenti a 0 => sempre il chunk più fresco
+// - Buffer player consigliato: 3000ms
 // ============================================================================
 
 export default {
@@ -252,7 +253,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= /live (FAST-START) ==========================
+// ============================= /live (ULTRA-LOW-LATENCY) ===================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -262,7 +263,6 @@ async function live(u, P, legacy) {
   const order = legacy ? [legacy, ...['vavoo','ntv','daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'vavoo,ntv,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   const ck = c.slug + ':' + order.join('.');
-  // 🔥 Cache playlist 3000ms (bilanciato velocità/freschezza)
   if (lastPl.key === ck && Date.now() - lastPl.t < 3000) return R(lastPl.txt, 200, HLS());
   const provs = {
     vavoo: async () => {
@@ -271,14 +271,21 @@ async function live(u, P, legacy) {
       if (!vu) return null;
       if (/\.m3u8(\?|$)/.test(vu)) {
         const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': UA }) }, 8000);
-        if (r.ok) { const out = rewritePl(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to'); lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS()); }
+        if (r.ok) { 
+          const out = rewritePlLowLatency(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to'); 
+          lastPl = { key: ck, txt: out, t: Date.now() }; 
+          return R(out, 200, HLS()); 
+        }
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      lastPl = { key: ck, txt: pl.txt, t: Date.now() }; return R(pl.txt, 200, HLS());
+      // 🔥 Tronca la playlist NTV agli ultimi 4 segmenti
+      const out = truncatePlaylist(pl.txt, 4);
+      lastPl = { key: ck, txt: out, t: Date.now() }; 
+      return R(out, 200, HLS());
     },
     daddy: async () => {
       if (!c.daddy) return null;
@@ -297,6 +304,52 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + order.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
+// 🔥 Tronca la playlist HLS agli ultimi N segmenti (riduce delay da 60s a ~30s)
+function truncatePlaylist(txt, lastN) {
+  const lines = txt.split(/\r?\n/);
+  const segments = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].startsWith('#EXTINF')) {
+      const extinf = lines[i];
+      const url = lines[i+1];
+      if (url && !url.startsWith('#')) {
+        segments.push({ extinf, url });
+        i += 2;
+      } else {
+        i++;
+      }
+    } else {
+      i++;
+    }
+  }
+  // Prendi solo gli ultimi N segmenti
+  const lastSegments = segments.slice(-lastN);
+  const out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4', '#EXT-X-MEDIA-SEQUENCE:0', '#EXT-X-PLAYLIST-TYPE:EVENT'];
+  for (const seg of lastSegments) {
+    out.push(seg.extinf);
+    out.push(seg.url);
+  }
+  return out.join('\n');
+}
+
+// 🔥 Rewrite con timestamp unico per bypass cache Cloudflare
+function rewritePlLowLatency(txt, baseUrl, P, ref, origin) {
+  const out = [];
+  const ts = Date.now();
+  for (const line of String(txt).split(/\r?\n/)) {
+    const t = line.trim(); if (!t) { out.push(''); continue; } if (t[0] === '#') { out.push(t); continue; }
+    let abs = t;
+    if (!/^https?:\/\//i.test(t)) { if (t.startsWith('/')) { const o = new URL(baseUrl); abs = o.origin + t; } else abs = baseUrl.replace(/[^/]*$/,'') + t.replace(/^\.\//,''); abs = abs.replace(/([^:])\/{2,}/g,'$1/'); }
+    // 🔥 Aggiungi timestamp unico per bypass cache
+    const sep = abs.includes('?') ? '&' : '?';
+    abs = abs + sep + '_t=' + ts;
+    let seg = P + '/seg?u=' + encodeURIComponent(abs); if (ref) seg += '&ref=' + encodeURIComponent(ref); if (origin) seg += '&o=' + encodeURIComponent(origin);
+    out.push(seg);
+  }
+  return out.join('\n');
+}
+
 function rewritePl(txt, baseUrl, P, ref, origin) {
   const out = [];
   for (const line of String(txt).split(/\r?\n/)) {
@@ -309,30 +362,32 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ============================= /seg (CACHE 5s) =============================
+// ============================= /seg (NO CACHE) =============================
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const h = { 'User-Agent': UA, 'Accept': '*/*' };
   if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
   if (u.searchParams.get('range')) h['Range'] = u.searchParams.get('range');
-  // 🔥 Cache segmenti 5s (bilanciato freschezza/velocità)
-  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 5 } }, 15000);
+  // 🔥 Cache 0 = sempre il chunk più fresco dalla fonte
+  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 15000);
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'public, max-age=5'
+    'cache-control': 'no-cache, no-store, must-revalidate',
+    'pragma': 'no-cache',
+    'expires': '0'
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// ============================= WARM (CRON OGNI 3 MIN) ======================
+// ============================= WARM (CRON OGNI 5 MIN) ======================
 async function warm() {
   const t0 = Date.now();
-  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','860','861','862','859','864','865','867','868','863','880','863','866','881','854','855','856','858','882'];
+  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','860','861','862','859','864','865','867','868','863','880','866','881','854','855','856','858','882'];
   let ok = 0, err = 0;
   await Promise.all(ids.map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   try { await ensureVavooMap(); } catch (e) {}
@@ -358,7 +413,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v3.2';
+const VER = 'TVNOW-CF v3.3';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -370,4 +425,5 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = { 'User-Agent': UA, 'Accept': '*/*' }; if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v3.2 ███
+// ███ FINE TVNOW-CF v3.3 ███
+ 
