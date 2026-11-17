@@ -1,10 +1,10 @@
 // ============================================================================
-// TVNOW-CF v3.1 — VAVOO + NTV + DADDYLIVE (LOW-LATENCY + FAST-SWITCH)
+// TVNOW-CF v3.2 — VAVOO + NTV + DADDYLIVE (FAST-START + LOW-LATENCY)
 // 
 // FIX CRITICI:
-// - Delay 1 minuto → Cache segmenti ridotta a 10s (da 60s)
-// - Cambio canale bloccato → Cache playlist ridotta a 500ms (da 2000ms)
-// - Cron aumentato a ogni 5 minuti (da 10 min)
+// - Start-up 2-3s: cache playlist 3000ms, timeout ridotti a 5s
+// - Delay 30-40s: cache segmenti 5s, buffer player 5000ms
+// - Cron ogni 3 min: tiene caldi token + playlist
 // ============================================================================
 
 export default {
@@ -117,7 +117,7 @@ async function ntvToken(id) {
   const now = Date.now()/1000; const c = tokenCache.get(id);
   if (c && c.exp - now > 14400) return c;
   ntvStats.resolve++;
-  const r = await fetchT(NTV_API + id, { headers: { 'User-Agent': UA, 'Accept': 'application/json' } }, 12000);
+  const r = await fetchT(NTV_API + id, { headers: { 'User-Agent': UA, 'Accept': 'application/json' } }, 8000);
   if (!r.ok) { ntvStats.err++; throw new Error('ntv api ' + r.status); }
   const j = await r.json().catch(() => null);
   const m3u8 = j && (j.m3u8 || j.proxyPlaylistUrl || j.proxyPlayerUrl);
@@ -129,8 +129,8 @@ async function ntvToken(id) {
 
 async function ntvPlaylist(id) {
   let tk = await ntvToken(id);
-  let r = await fetchT(tk.m3u8, { headers: reqHeaders(tk.ref) }, 12000);
-  if (r.status === 403 || r.status === 401) { tokenCache.delete(id); ntvStats.refresh++; tk = await ntvToken(id); r = await fetchT(tk.m3u8, { headers: reqHeaders(tk.ref) }, 12000); }
+  let r = await fetchT(tk.m3u8, { headers: reqHeaders(tk.ref) }, 8000);
+  if (r.status === 403 || r.status === 401) { tokenCache.delete(id); ntvStats.refresh++; tk = await ntvToken(id); r = await fetchT(tk.m3u8, { headers: reqHeaders(tk.ref) }, 8000); }
   if (!r.ok) throw new Error('ntv playlist ' + r.status);
   const txt = await r.text();
   if (!txt.includes('#EXTM3U')) throw new Error('ntv playlist non-HLS');
@@ -147,9 +147,9 @@ async function daddyResolve(id) {
   if (cached && cached.exp > now) return cached.url;
   for (const domain of DADDY_DOMAINS) {
     try {
-      let m3u8 = await extractM3u8FromEmbed(`${domain}/embed/stream-${id}.php`, domain, 8000);
+      let m3u8 = await extractM3u8FromEmbed(`${domain}/embed/stream-${id}.php`, domain, 5000);
       if (m3u8) { daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL }); return m3u8; }
-      m3u8 = await extractM3u8FromEmbed(`${domain}/watch.php?id=${id}`, domain, 8000);
+      m3u8 = await extractM3u8FromEmbed(`${domain}/watch.php?id=${id}`, domain, 5000);
       if (m3u8) { daddyCache.set(id, { url: m3u8, exp: now + DADDY_TTL }); return m3u8; }
     } catch (e) { continue; }
   }
@@ -189,7 +189,7 @@ async function ensureVavooMap(force) {
   const cached = vavooMapGet(); if (cached && !force) return cached;
   for (const src of VAVOO_SOURCES) {
     try {
-      const r = await fetchT(src, { headers: { 'User-Agent': UA } }, 15000); if (!r.ok) continue;
+      const r = await fetchT(src, { headers: { 'User-Agent': UA } }, 10000); if (!r.ok) continue;
       const t = await r.text(); const m = new Map();
       for (const b of t.split('#EXTINF')) {
         const nm = (b.match(/tvg-name="([^"]+)"/) || [])[1];
@@ -220,14 +220,14 @@ function vavooMapFind(query, m) {
 function vavooHeaders(extra) { return Object.assign({ 'User-Agent': 'MediaHubMX/2', 'Accept': 'application/json', 'Origin': 'https://vavoo.to', 'Referer': 'https://vavoo.to/' }, extra || {}); }
 async function vavooResolveId(base, id) {
   const play = base + '/live/play/' + id;
-  try { const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: { 'User-Agent': UA, 'Referer': base + '/', 'Origin': base } }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
-  try { const r = await fetchT(base + '/mediahubmx-resolve.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'de', region: 'DE', url: play, clientVersion: '3.0.2' }) }, 10000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
+  try { const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: { 'User-Agent': UA, 'Referer': base + '/', 'Origin': base } }, 5000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
+  try { const r = await fetchT(base + '/mediahubmx-resolve.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'de', region: 'DE', url: play, clientVersion: '3.0.2' }) }, 5000); if (r.ok) { const j = await r.json().catch(()=>null); if (j && j.url) return j.url; } } catch (e) {}
   return null;
 }
 
 async function vavooLiveFind(base, query) {
   try {
-    const rl = await fetchT(base + '/mediahubmx-list.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'it', region: 'IT', clientVersion: '3.0.2', url: base + '/live' }) }, 9000);
+    const rl = await fetchT(base + '/mediahubmx-list.json', { method: 'POST', headers: vavooHeaders({ 'Content-Type': 'application/json', 'Origin': base, 'Referer': base + '/' }), body: JSON.stringify({ language: 'it', region: 'IT', clientVersion: '3.0.2', url: base + '/live' }) }, 5000);
     if (!rl.ok) return null;
     const j = await rl.json().catch(()=>null);
     const items = j && (j.items || j.channels || j.entries) || [];
@@ -252,7 +252,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= /live (FAST-SWITCH) =========================
+// ============================= /live (FAST-START) ==========================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -262,15 +262,15 @@ async function live(u, P, legacy) {
   const order = legacy ? [legacy, ...['vavoo','ntv','daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'vavoo,ntv,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   const ck = c.slug + ':' + order.join('.');
-  // 🔥 Cache playlist ridotta a 500ms (da 2000ms) => cambio canale immediato
-  if (lastPl.key === ck && Date.now() - lastPl.t < 500) return R(lastPl.txt, 200, HLS());
+  // 🔥 Cache playlist 3000ms (bilanciato velocità/freschezza)
+  if (lastPl.key === ck && Date.now() - lastPl.t < 3000) return R(lastPl.txt, 200, HLS());
   const provs = {
     vavoo: async () => {
       if (!c.vavoo && !c.vid) return null;
       const vu = await vavooResolve(c.vavoo, c.vid);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/.test(vu)) {
-        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': UA }) }, 12000);
+        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': UA }) }, 8000);
         if (r.ok) { const out = rewritePl(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to'); lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS()); }
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
@@ -284,7 +284,7 @@ async function live(u, P, legacy) {
       if (!c.daddy) return null;
       const du = await daddyResolve(c.daddy);
       if (!du || !/\.m3u8/i.test(du)) return null;
-      const r = await fetchT(du, { headers: { 'User-Agent': UA, 'Referer': 'https://thedaddy.li/', 'Origin': 'https://thedaddy.li' } }, 10000);
+      const r = await fetchT(du, { headers: { 'User-Agent': UA, 'Referer': 'https://thedaddy.li/', 'Origin': 'https://thedaddy.li' } }, 8000);
       if (!r.ok) return null;
       const baseUrl = du.substring(0, du.lastIndexOf('/') + 1);
       const txt = await r.text();
@@ -309,30 +309,30 @@ function rewritePl(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ============================= /seg (CACHE 10s) ============================
+// ============================= /seg (CACHE 5s) =============================
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const h = { 'User-Agent': UA, 'Accept': '*/*' };
   if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
   if (u.searchParams.get('range')) h['Range'] = u.searchParams.get('range');
-  // 🔥 Cache segmenti ridotta a 10s (da 60s) => delay minimo
-  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 10 } }, 30000);
+  // 🔥 Cache segmenti 5s (bilanciato freschezza/velocità)
+  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 5 } }, 15000);
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'public, max-age=10'
+    'cache-control': 'public, max-age=5'
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// ============================= WARM (CRON OGNI 5 MIN) ======================
+// ============================= WARM (CRON OGNI 3 MIN) ======================
 async function warm() {
   const t0 = Date.now();
-  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','860','861','862','859','864','865','867','868','863','880'];
+  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','860','861','862','859','864','865','867','868','863','880','863','866','881','854','855','856','858','882'];
   let ok = 0, err = 0;
   await Promise.all(ids.map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   try { await ensureVavooMap(); } catch (e) {}
@@ -358,7 +358,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v3.1';
+const VER = 'TVNOW-CF v3.2';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -370,4 +370,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = { 'User-Agent': UA, 'Accept': '*/*' }; if (u.searchParams.get('ref')) h['Referer'] = u.searchParams.get('ref'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v3.1 ███
+// ███ FINE TVNOW-CF v3.2 ███
