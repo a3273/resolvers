@@ -1,12 +1,12 @@
 // ============================================================================
-// TVNOW-CF v3.6 — VAVOO + NTV + DADDYLIVE (FIX Cinema/Calcio su NTV)
+// TVNOW-CF v3.7 — VAVOO + NTV + DADDYLIVE (SOLO CANALI ORIGINALI)
 // 
-// FIX: Sky Calcio 251/252/253 e Sky Cinema/Crime/Serie tornano su NTV.
-//      DaddyLive non ha questi canali con gli ID NTV.
-// - Anti-Block Potenziato: Header browser reali.
-// - Playlist troncata agli ultimi 4 segmenti => delay minimo (~25-35s).
-// - Cache segmenti a 0 + timestamp unico => bypass totale cache Cloudflare.
-// - Buffer player consigliato: 3000ms.
+// CANALI:
+// - Sport: Vavoo → NTV → DaddyLive
+// - Cinema/Calcio 25x/Crime/Serie: SOLO NTV (DaddyLive non li ha)
+// - RSI: SOLO Vavoo
+// 
+// FIX: Anti-Block potenziato, playlist troncata, cache 0, buffer 3000ms.
 // ============================================================================
 
 export default {
@@ -43,11 +43,14 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ============================= CANALI ======================================
+// ============================= CANALI (SOLO ORIGINALI) =====================
 const CHANNELS = [
+  // --- SOLO VAVOO ---
   { slug: 'rsi-la-1',            name: 'RSI La 1',          ntv: '',    vavoo: 'rsi la 1',        daddy: '' },
   { slug: 'rsi-la-2',            name: 'RSI La 2',          ntv: '',    vavoo: 'rsi la 2',        daddy: '' },
   { slug: 'sky-sport-serie-a',   name: 'Sky Sport Serie A', ntv: '',    vavoo: 'sky sport serie a', daddy: '880' },
+  
+  // --- SPORT (Vavoo + NTV + Daddy) ---
   { slug: 'sky-sport-24',        name: 'Sky Sport 24',      ntv: '869', vavoo: 'sky sport 24',      daddy: '869' },
   { slug: 'sky-sport-uno',       name: 'Sky Sport Uno',     ntv: '461', vavoo: 'sky sport uno',     daddy: '461' },
   { slug: 'sky-sport-calcio',    name: 'Sky Sport Calcio',  ntv: '870', vavoo: 'sky sport calcio',  daddy: '870' },
@@ -62,7 +65,7 @@ const CHANNELS = [
   { slug: 'eurosport-1',         name: 'Eurosport 1',       ntv: '878', vavoo: 'eurosport 1',       daddy: '878', vid: '3448075317' },
   { slug: 'eurosport-2',         name: 'Eurosport 2',       ntv: '879', vavoo: 'eurosport 2',       daddy: '879', vid: '2317684453' },
   
-  // 🔥 CANALI SU NTV (DaddyLive non li ha con questi ID)
+  // --- SOLO NTV (Cinema, Calcio 25x, Crime, Serie) ---
   { slug: 'sky-calcio-251',      name: 'Sky Calcio 251',    ntv: '871', vavoo: '', daddy: '' },
   { slug: 'sky-calcio-252',      name: 'Sky Calcio 252',    ntv: '872', vavoo: '', daddy: '' },
   { slug: 'sky-calcio-253',      name: 'Sky Calcio 253',    ntv: '873', vavoo: '', daddy: '' },
@@ -74,23 +77,14 @@ const CHANNELS = [
   { slug: 'sky-cinema-family',   name: 'Sky Cinema Family', ntv: '865', vavoo: '', daddy: '' },
   { slug: 'sky-cinema-drama',    name: 'Sky Cinema Drama',  ntv: '867', vavoo: '', daddy: '' },
   { slug: 'sky-cinema-suspense', name: 'Sky Cinema Suspense',ntv:'868', vavoo: '', daddy: '' },
-  { slug: 'sky-cinema-uno-24',   name: 'Sky Cinema Uno +24', ntv: '863', vavoo: '', daddy: '' },
-  { slug: 'sky-cinema-due-24',   name: 'Sky Cinema Due +24', ntv: '866', vavoo: '', daddy: '' },
   { slug: 'sky-crime',           name: 'Sky Crime',         ntv: '863', vavoo: '', daddy: '' },
-  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', daddy: '' },
-  
-  { slug: 'italia-1',            name: 'Italia 1',          ntv: '854', vavoo: 'italia 1', daddy: '854' },
-  { slug: 'la7',                 name: 'La7',               ntv: '855', vavoo: 'la7', daddy: '855', vid: '775530063' },
-  { slug: 'la7d',                name: 'LA7d',              ntv: '856', vavoo: 'la7d', daddy: '856' },
-  { slug: 'rai-premium',         name: 'Rai Premium',       ntv: '858', vavoo: '', daddy: '858', vid: '2828455552' },
-  { slug: 'rai-sport',           name: 'Rai Sport',         ntv: '882', vavoo: 'rai sport', daddy: '882', vid: '551730224' }
+  { slug: 'sky-serie',           name: 'Sky Serie',         ntv: '880', vavoo: '', daddy: '' }
 ];
 
 const ALIASES = {
   'dazn': 'dazn-1', 'dazn-zona': 'dazn-1', 'zona-dazn': 'dazn-1',
   'sky-sport-serie-a': 'sky-sport-serie-a', 'serie-a': 'sky-sport-serie-a',
   'sky-calcio-1': 'sky-calcio-251', 'sky-calcio-2': 'sky-calcio-252', 'sky-calcio-3': 'sky-calcio-253',
-  'sky-cinema-2-24': 'sky-cinema-due-24', 'sky-cinema-unopi24': 'sky-cinema-uno-24',
   'sky-sport-24-ntv': 'sky-sport-24', 'sky-sport-uno-italy': 'sky-sport-uno'
 };
 
@@ -334,19 +328,12 @@ function truncatePlaylist(txt, lastN) {
       if (url && !url.startsWith('#')) {
         segments.push({ extinf, url });
         i += 2;
-      } else {
-        i++;
-      }
-    } else {
-      i++;
-    }
+      } else { i++; }
+    } else { i++; }
   }
   const lastSegments = segments.slice(-lastN);
   const out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4', '#EXT-X-MEDIA-SEQUENCE:0', '#EXT-X-PLAYLIST-TYPE:EVENT'];
-  for (const seg of lastSegments) {
-    out.push(seg.extinf);
-    out.push(seg.url);
-  }
+  for (const seg of lastSegments) { out.push(seg.extinf); out.push(seg.url); }
   return out.join('\n');
 }
 
@@ -371,7 +358,6 @@ async function seg(u) {
   const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
   if (u.searchParams.get('range')) h['Range'] = u.searchParams.get('range');
-  
   const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 15000);
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
@@ -389,7 +375,7 @@ async function seg(u) {
 // ============================= WARM (CRON OGNI 5 MIN) ======================
 async function warm() {
   const t0 = Date.now();
-  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','866','880','854','855','856','858','882'];
+  const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
   let ok = 0, err = 0;
   await Promise.all(ids.map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   try { await ensureVavooMap(); } catch (e) {}
@@ -415,7 +401,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v3.6';
+const VER = 'TVNOW-CF v3.7';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -427,4 +413,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v3.6 ███
+// ███ FINE TVNOW-CF v3.7 ███
