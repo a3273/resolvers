@@ -1,25 +1,19 @@
 // ============================================================================
-// TVNOW-CF v6.1 — DELAY REALE 20-30 SECONDI
+// TVNOW-CF v6.2 — DELAY REALE 20-30s (FIX DEFINITIVO)
 //
-// FIX v6.1:
-// - Playlist NTV completa (8 segmenti invece di 2)
-// - Rimosso EXT-X-DISCONTINUITY iniziale (causava reset decoder = +3s delay)
-// - EXT-X-START:TIME-OFFSET=0,PRECISE=YES (partenza immediata dall'ultimo segmento)
-// - Buffer player consigliato: 2000ms (1000ms era troppo basso)
+// FIX CRITICO v6.2:
+// - RIMOSSA la funzione truncatePlaylist. I player si confondono con le 
+//   playlist troncate e i tag forzati, creando buffer di 60+ secondi per difesa.
+// - La playlist NTV viene servita COMPLETA e ORIGINALE, riscrivendo solo gli URL
+//   per passare dal proxy /seg (così il worker gestisce gli header anti-block).
+// - Il player gestirà naturalmente il buffer minimo (20-30s) come faceva prima.
 //
-// PERCHÉ PRIMA ANDAVA A 20-30s:
-// - v2.x: proxy di tutti i segmenti, playlist completa, player parte subito
-// - v3.9-v6.0: playlist troncata a 2 segmenti, player aspetta di scaricarli tutti
-// - v6.1: playlist completa (8 segmenti) + EXT-X-START = player parte subito
-//
-// TECNOLOGIA INTATTA:
-// 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
-// 2. NTV VIA PROXY /seg: Header Referer inviati dal worker.
-// 3. MEMORY LIMITS: Cache limitate (50 NTV, 100 Daddy).
-// 4. SUBREQUEST LIMITS: Tetto a 6 mirror Vavoo, cron a blocchi di 8.
-// 5. CACHE BYPASS: Timestamp _t= sui segmenti.
-// 6. FAST START: Salta provider vuoti.
-// 7. WARM: Pre-riscalda NTV + Vavoo canali più usati.
+// TECNOLOGIA INTATTA E STABILIZZATA:
+// 1. NTV VIA PROXY /seg: Header Referer inviati dal worker (funziona in app).
+// 2. MEMORY LIMITS: Cache limitate (50 NTV, 100 Daddy) + pulizia automatica.
+// 3. SUBREQUEST LIMITS: Tetto a 6 mirror Vavoo, cron a blocchi di 8.
+// 4. CACHE BYPASS: Timestamp _t= sui segmenti + header no-cache assoluti.
+// 5. FAST START: Salta provider vuoti, cache risposta worker a 500ms.
 // ============================================================================
 
 export default {
@@ -294,7 +288,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= /live (DELAY REALE) =========================
+// ============================= /live (SEMPLIFICATO E STABILE) ==============
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -334,9 +328,9 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      // 🔥 FIX v6.1: 8 segmenti (playlist completa, player parte subito)
-      const truncated = truncatePlaylist(pl.txt, 8);
-      const out = rewritePlLowLatency(truncated, pl.base, P, pl.ref, '');
+      // 🔥 FIX v6.2: NIENTE truncatePlaylist. Usiamo la playlist originale completa.
+      // Il player sa già come gestirla. Riscriviamo solo gli URL per il proxy.
+      const out = rewritePlLowLatency(pl.txt, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS_NO_CACHE());
     },
@@ -356,48 +350,6 @@ async function live(u, P, legacy) {
   
   for (const p of availableOrder) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
-}
-
-// FIX v6.1: Sliding window HLS con playlist completa (8 segmenti)
-function truncatePlaylist(txt, lastN) {
-  const lines = String(txt).split(/\r?\n/);
-  let upSeq = 0, upTarget = 0, upDiscSeq = 0;
-  const pending = [];
-  const segments = [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith('#EXTM3U')) continue;
-    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) { upDiscSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-PLAYLIST-TYPE') || line.startsWith('#EXT-X-ENDLIST')) continue;
-    if (line.startsWith('#EXTINF')) { segments.push({ tags: pending.splice(0), extinf: line, url: '' }); continue; }
-    if (line.startsWith('#')) { pending.push(line); continue; }
-    const s = segments[segments.length - 1];
-    if (s && !s.url) s.url = line; else pending.splice(0);
-  }
-  const valid = segments.filter(s => s.url);
-  const kept = valid.slice(-lastN);
-  const dropped = valid.length - kept.length;
-  let target = upTarget;
-  if (!target) {
-    for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
-  }
-  // 🔥 FIX v6.1: Rimosso EXT-X-DISCONTINUITY iniziale (causava reset decoder)
-  const out = [
-    '#EXTM3U',
-    '#EXT-X-VERSION:3',
-    '#EXT-X-TARGETDURATION:' + (target || 4),
-    '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
-    '#EXT-X-DISCONTINUITY-SEQUENCE:' + upDiscSeq,
-    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES',
-    '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-ALLOW-CACHE:NO'
-  ];
-  // 🔥 FIX v6.1: Niente EXT-X-DISCONTINUITY prima del primo segmento
-  for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
-  return out.join('\n');
 }
 
 // FIX v4.1: Timestamp per bypassare la cache edge di Cloudflare
@@ -469,7 +421,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v6.1';
+const VER = 'TVNOW-CF v6.2';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -507,4 +459,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v6.1 ███
+// ███ FINE TVNOW-CF v6.2 ███
