@@ -1,13 +1,16 @@
 // ============================================================================
-// TVNOW-CF v6.0 "SOTTOZERO" — DELAY MINIMO TEORICO
+// TVNOW-CF v6.1 — DELAY REALE 20-30 SECONDI
 //
-// FIX v6.0:
-// - Segmenti NTV ridotti da 6 a 2 (da ~24s a ~8s di contenuto)
-// - Cache playlist ridotta da 1000ms a 500ms (cambio canale fulmineo)
-// - EXT-X-START:TIME-OFFSET=0,PRECISE=YES (forza partenza dall'ultimo segmento)
-// - Buffer player consigliato: 1000ms (da impostare nel M3U)
+// FIX v6.1:
+// - Playlist NTV completa (8 segmenti invece di 2)
+// - Rimosso EXT-X-DISCONTINUITY iniziale (causava reset decoder = +3s delay)
+// - EXT-X-START:TIME-OFFSET=0,PRECISE=YES (partenza immediata dall'ultimo segmento)
+// - Buffer player consigliato: 2000ms (1000ms era troppo basso)
 //
-// DELAY TOTALE ATTESO: ~20-28s (minimo teorico, la fonte ha ~15-20s fissi)
+// PERCHÉ PRIMA ANDAVA A 20-30s:
+// - v2.x: proxy di tutti i segmenti, playlist completa, player parte subito
+// - v3.9-v6.0: playlist troncata a 2 segmenti, player aspetta di scaricarli tutti
+// - v6.1: playlist completa (8 segmenti) + EXT-X-START = player parte subito
 //
 // TECNOLOGIA INTATTA:
 // 1. HLS SLIDING WINDOW: MEDIA-SEQUENCE corretta. NIENTE freeze a 30 min.
@@ -291,7 +294,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
-// ============================= /live (SOTTOZERO) ===========================
+// ============================= /live (DELAY REALE) =========================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -311,7 +314,6 @@ async function live(u, P, legacy) {
   });
 
   const ck = c.slug + ':' + availableOrder.join('.');
-  // 🔥 FIX v6.0: Cache ridotta a 500ms per cambio canale fulmineo
   if (lastPl.key === ck && Date.now() - lastPl.t < 500) return R(lastPl.txt, 200, HLS_NO_CACHE());
   
   const provs = {
@@ -332,8 +334,8 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      // 🔥 FIX v6.0: Solo 2 segmenti per delay minimo
-      const truncated = truncatePlaylist(pl.txt, 2);
+      // 🔥 FIX v6.1: 8 segmenti (playlist completa, player parte subito)
+      const truncated = truncatePlaylist(pl.txt, 8);
       const out = rewritePlLowLatency(truncated, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS_NO_CACHE());
@@ -356,7 +358,7 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// FIX v6.0: Sliding window HLS con 2 segmenti per delay minimo
+// FIX v6.1: Sliding window HLS con playlist completa (8 segmenti)
 function truncatePlaylist(txt, lastN) {
   const lines = String(txt).split(/\r?\n/);
   let upSeq = 0, upTarget = 0, upDiscSeq = 0;
@@ -382,6 +384,7 @@ function truncatePlaylist(txt, lastN) {
   if (!target) {
     for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
   }
+  // 🔥 FIX v6.1: Rimosso EXT-X-DISCONTINUITY iniziale (causava reset decoder)
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -392,7 +395,7 @@ function truncatePlaylist(txt, lastN) {
     '#EXT-X-INDEPENDENT-SEGMENTS',
     '#EXT-X-ALLOW-CACHE:NO'
   ];
-  out.push('#EXT-X-DISCONTINUITY');
+  // 🔥 FIX v6.1: Niente EXT-X-DISCONTINUITY prima del primo segmento
   for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
   return out.join('\n');
 }
@@ -466,7 +469,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v6.0 SOTTOZERO';
+const VER = 'TVNOW-CF v6.1';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -504,4 +507,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>&ref=&o=&len=', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('status ERR | ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + ' | final ' + r.url + '\n' + body.slice(0, +(u.searchParams.get('len')||2000)||2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v6.0 SOTTOZERO ███
+// ███ FINE TVNOW-CF v6.1 ███
