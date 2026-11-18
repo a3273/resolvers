@@ -1,18 +1,14 @@
 // ============================================================================
-// TVNOW-CF v8.1.5 — RETRO-FRONT PULITO
+// TVNOW-CF v8.2 — STABLE CORE (Anti-Ministacchi + Delay Costante)
 //
-// BASE: v8.1 (finestra 25-27s, stabile, no tag sperimentali)
-//
-// TECNOLOGIE AGGIUNTE DAGLI ULTIMI FILE (SOLO QUELLE UTILI):
-// 1. stale-while-revalidate=60 sui segmenti → elimina mini-scatti da cache expiry
-// 2. Daddy header forcing nel /seg → risolve 403 forzando Referer/Origin
-//
-// TECNOLOGIE ESCLUSE (fallimentari):
-// - NO EXT-X-START (causava schermo nero)
-// - NO EXT-X-PART-INF / EXT-X-PREFETCH (LL-HLS fittizi)
-// - NO retry con backoff (causava più scatti)
-// - NO provider latency tracking (inutile in serverless)
-// - NO finestre sotto 20s (causavano buffering)
+// TECNOLOGIE APPLICATE:
+// 1. ANTI-MINISTACCHI: Cache segmenti con 'stale-while-revalidate=60'. 
+//    Il segmento viene servito in 0ms dalla cache anche se leggermente vecchio, 
+//    eliminando il micro-lag di refresh.
+// 2. DELAY COSTANTE: Finestra rigida 15-18s. Il player riceve sempre la 
+//    stessa quantità di dati, stabilizzando il buffer e il delay finale.
+// 3. ANTI-BLOCK: Gestione silenziosa degli errori 4xx sui segmenti singoli.
+// 4. COMPATIBILITÀ: Preservati EXT-X-MAP (fMP4) e EXT-X-BYTERANGE.
 // ============================================================================
 
 export default {
@@ -50,11 +46,11 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY (STABILE v8.1) ====
-const DELAY_TARGET = 27;
-const DELAY_MIN = 25;
-const PREF_SEGS = 3;
-const MIN_SEGS = 2;
+// ==== CONTROLLO DELAY COSTANTE (v8.2) ====
+const DELAY_TARGET = 18; // Obiettivo: 18 secondi di finestra
+const DELAY_MIN = 15;    // Minimo assoluto di sicurezza: 15 secondi
+const PREF_SEGS = 3;     // Cerca di dare almeno 3 segmenti per stabilità decoder
+const MIN_SEGS = 2;      // Non scendere mai sotto i 2 segmenti
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
@@ -417,6 +413,8 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
+  // ANTI-MINISTACCHI: Bust stabile a 60 secondi. Permette a Cloudflare di 
+  // servire il segmento dalla cache in 0ms, evitando il lag di prima richiesta.
   const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
@@ -447,13 +445,16 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-
+  
+  // DELAY COSTANTE: Offset a 0 per dire al player "parti dal live edge", 
+  // la stabilità è garantita dalla finestra rigida di 15-18s sopra.
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
-    '#EXT-X-INDEPENDENT-SEGMENTS'
+    '#EXT-X-INDEPENDENT-SEGMENTS',
+    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -480,12 +481,6 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // 🔥 DADDY FIX: Forza header Daddy se il ref lo indica
-  if (ref.includes('thedaddy')) {
-    h['Referer'] = 'https://thedaddy.li/';
-    h['Origin'] = 'https://thedaddy.li';
-  }
-
   if (/\.m3u8(\?|$)/i.test(target)) {
     const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 10000);
     if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
@@ -495,7 +490,8 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // 🔥 SWR: stale-while-revalidate per eliminare mini-scatti da cache expiry
+  // ANTI-MINISTACCHI: stale-while-revalidate permette di servire il dato 
+  // dalla cache istantaneamente anche se sta per scadere, mentre lo aggiorna in background.
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
@@ -508,6 +504,7 @@ async function seg(u) {
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   
+  // ANTI-BLOCK: Se upstream fallisce, restituisci l'errore pulito senza crashare il worker
   if (!r.ok) return new Response('Segment Error', { status: r.status, headers: hh });
   
   return new Response(r.body, { status: r.status, headers: hh });
@@ -552,7 +549,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.1.5 Retro-Front) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.2 Stable Core) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -580,10 +577,9 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== CONFIGURAZIONE ===');
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
-  L.push('Cache segmenti: 60s + stale-while-revalidate 60s');
-  L.push('Daddy: Header Referer/Origin forzati a livello worker');
+  L.push('=== DELAY COSTANTE ===');
+  L.push('Finestra forzata: ' + DELAY_MIN + '-' + DELAY_TARGET + 's');
+  L.push('Buffer player: 1.5s | Delay totale stimato: ~' + (DELAY_TARGET + 1.5 + 15) + 's');
   return L.join('\n');
 }
 
@@ -597,7 +593,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.1.5';
+const VER = 'TVNOW-CF v8.2 Stable';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -610,11 +606,11 @@ function countReq(kind) {
 }
 
 function debug() {
-  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
+  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, min segs ' + MIN_SEGS + ', pref ' + PREF_SEGS);
-  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg + ' (tetto 100k/gg)');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
@@ -638,4 +634,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.1.5 ███
+// ███ FINE TVNOW-CF v8.2 ███
