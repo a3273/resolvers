@@ -1,17 +1,5 @@
 // ============================================================================
-// TVNOW-CF v8.1 — MAX STABILITÀ + ANTI-BLOCK POTENZIATO
-//
-// BASE: v8.0 (tecnologia superiore: fMP4, byte-range, cache 60s, timeout separati)
-//
-// POTENZIAMENTI v8.1:
-// 1. Token NTV: refresh proattivo ogni 15 min (invece di 24h) → mai scaduti
-// 2. Cache DaddyLive: TTL 2 min (invece di 3) → URL sempre freschi
-// 3. Pulizia cache automatica: max 50 token NTV, 100 Daddy → no memory leak
-// 4. Cron warm ogni 3 min (configurare in wrangler.toml) → cache sempre calda
-// 5. Buffer player consigliato: 1500ms (compromesso ottimale)
-//
-// DELAY ATTESO: ~45s (27s finestra + 1.5s buffer + 15-20s fonte)
-// Questo è il minimo fisico raggiungibile con queste fonti.
+// TVNOW-CF v8.0 — DELAY 25-30s ADATTIVO (durata REALE) + MAX STABILITA'
 // ============================================================================
 
 export default {
@@ -49,11 +37,10 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY (v8.1) =====================================
-const DELAY_TARGET  = 27;  // s: obiettivo di delay dalla live edge
-const DELAY_MIN     = 25;  // s: sotto questa soglia non si taglia più
-const PREF_SEGS     = 3;   // segmenti minimi preferiti (stabilità decoder)
-const MIN_SEGS      = 2;   // segmenti minimi assoluti
+const DELAY_TARGET  = 27;
+const DELAY_MIN     = 25;
+const PREF_SEGS     = 3;
+const MIN_SEGS      = 2;
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
@@ -115,19 +102,15 @@ function elencoCanali() {
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
-const MAX_TOKEN_CACHE = 50;  // 🔥 v8.1: limite cache per no memory leak
+const MAX_TOKEN_CACHE = 50;
 
 async function ntvToken(id) {
   const now = Date.now() / 1000; const c = tokenCache.get(id);
-  // 🔥 v8.1: refresh proattivo ogni 15 min (invece di 24h)
   if (c && c.exp - now > 900) return c;
-  
-  // 🔥 v8.1: pulizia cache se troppo grande
-  if (tokenCache.size > MAX_TOKEN_CACHE) {
+  if (tokenCache.size >= MAX_TOKEN_CACHE) {
     const keys = Array.from(tokenCache.keys());
-    for (let i = 0; i < keys.length - MAX_TOKEN_CACHE; i++) tokenCache.delete(keys[i]);
+    for (let i = 0; i < 10; i++) tokenCache.delete(keys[i]);
   }
-  
   ntvStats.resolve++;
   const r = await fetchT(NTV_API + id, { headers: getBrowserHeaders('https://tvnow247.today/') }, 8000);
   if (!r.ok) { ntvStats.err++; throw new Error('ntv api ' + r.status); }
@@ -156,20 +139,17 @@ async function ntvPlaylist(id) {
 
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map();
-const DADDY_TTL = 2 * 60 * 1000;  // 🔥 v8.1: 2 min (invece di 3) per URL sempre freschi
-const MAX_DADDY_CACHE = 100;  // 🔥 v8.1: limite cache
+const DADDY_TTL = 2 * 60 * 1000;
+const MAX_DADDY_CACHE = 100;
 
 async function daddyResolve(id) {
   if (!id) return null;
   const now = Date.now(); const cached = daddyCache.get(id);
   if (cached && cached.exp > now) return cached.url;
-  
-  // 🔥 v8.1: pulizia cache se troppo grande
-  if (daddyCache.size > MAX_DADDY_CACHE) {
+  if (daddyCache.size >= MAX_DADDY_CACHE) {
     const keys = Array.from(daddyCache.keys());
-    for (let i = 0; i < keys.length - MAX_DADDY_CACHE; i++) daddyCache.delete(keys[i]);
+    for (let i = 0; i < 10; i++) daddyCache.delete(keys[i]);
   }
-  
   for (const domain of DADDY_DOMAINS) {
     try {
       let m3u8 = await extractM3u8FromEmbed(`${domain}/embed/stream-${id}.php`, domain, 5000);
@@ -306,6 +286,7 @@ async function vavooResolveRaw(query, vid) {
 }
 
 let lastPl = { key: '', txt: '', t: 0 };
+
 async function live(u, P, legacy) {
   countReq('live');
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -394,7 +375,6 @@ function parseMediaPl(txt) {
       disc = false; brange = null;
       continue;
     }
-    if (line.startsWith('#')) continue;
     if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
   return { upSeq, upTarget, map, segs, isMaster };
@@ -503,7 +483,8 @@ async function seg(u) {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0'
+    'cache-control': range ? 'no-cache' : 'public, max-age=300',
+    'pragma': range ? 'no-cache' : ''
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   return new Response(r.body, { status: r.status, headers: hh });
@@ -548,7 +529,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.1, delay target ' + DELAY_TARGET + 's) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.0) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -576,24 +557,22 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== DELAY ATTESO ===');
-  L.push('Finestra: ' + DELAY_MIN + '-' + DELAY_TARGET + 's + buffer player 1.5s + delay fonte 15-20s');
-  L.push('Totale: ~' + (DELAY_TARGET + 1.5 + 17) + 's');
+  L.push('=== CONFIGURAZIONE ===');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
   return L.join('\n');
 }
 
 function playlistStats(txt) {
   const p = parseMediaPl(txt);
-  if (p.isMaster) return 'master playlist (variant instradate via /seg)';
+  if (p.isMaster) return 'master playlist';
   const durs = p.segs.map(s => s.dur || p.upTarget);
   const plan = pickWindow(durs);
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
-    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's'
-    + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
+    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.1';
+const VER = 'TVNOW-CF v8.0';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -609,13 +588,13 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, min segs ' + MIN_SEGS + ', pref ' + PREF_SEGS);
-  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg + ' (tetto 100k/gg)');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 25-30s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-24         diagnostica + finestra scelta','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /diag?ch=sky-sport-24','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -634,4 +613,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.1 ███
+// ███ FINE TVNOW-CF v8.0 ███
