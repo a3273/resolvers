@@ -2,11 +2,13 @@
 // TVNOW-CF v8.7 — ANTI-LOOP + ANTI-SCHERMO GRIGIO
 //
 // MODIFICHE RAGIONATE:
-// 1. Cache e Bust a 15s: Impedisce al player di ricevere gli stessi 3 segmenti
-//    cached all'infinito (causa del loop delle scene ferme).
-// 2. Playlist HLS Pulita: Rimossi tag falsi (INDEPENDENT-SEGMENTS, EVENT, START)
-//    che causavano schermi grigi/statici su alcuni decoder.
-// 3. RSI ID hardcodati + Header Vavoo/Daddy dinamici (mantenuti).
+// 1. Fix Schermo Grigio: Aggiunto il supporto per #EXT-X-KEY e #EXT-X-VERSION.
+//    Prima venivano ignorati, impedendo la decifratura AES e causando schermate
+//    grigie con artefatti verdi.
+// 2. Fix Loop (Scene Ferme): Rimossa la finestra forzata a 3 segmenti. Ora la
+//    playlist viene passata interamente, lasciando al player la gestione del buffer.
+// 3. Fix Cache Loop: Rimossi il cache-buster (_t=) e la cache forzata a 15s sui
+//    segmenti, che costringevano il player a ricevere sempre gli stessi dati.
 // ============================================================================
 
 export default {
@@ -364,8 +366,10 @@ function rewriteAny(txt, baseUrl, P, ref, origin) {
   return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
+// FIX: Aggiunto supporto per #EXT-X-KEY e #EXT-X-VERSION
 function parseMediaPl(txt) {
-  let upSeq = 0, upTarget = 4, map = null, isMaster = false;
+  let upSeq = 0, upTarget = 4, map = null, isMaster = false, version = 3;
+  const keys = [];
   const segs = [];
   let pending = null, disc = false, brange = null;
   for (const raw of String(txt).split(/\r?\n/)) {
@@ -373,9 +377,11 @@ function parseMediaPl(txt) {
     if (!line) continue;
     if (line.startsWith('#EXT-X-STREAM-INF')) { isMaster = true; break; }
     if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXT-X-VERSION:')) { version = parseInt(line.split(':')[1]) || 3; continue; }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
+    if (line.startsWith('#EXT-X-KEY')) { keys.push(line); continue; } // FIX: Cattura le chiavi AES
     if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
     if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
     if (line.startsWith('#EXTINF')) {
@@ -390,7 +396,7 @@ function parseMediaPl(txt) {
     if (line.startsWith('#')) continue;
     if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
-  return { upSeq, upTarget, map, segs, isMaster };
+  return { upSeq, upTarget, map, keys, segs, isMaster, version };
 }
 
 function pickWindow(durs) {
@@ -413,11 +419,9 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// 🔥 Bust a 15s: Forza il player a richiedere nuovi segmenti, rompendo il loop
+// FIX: Rimosso il cache bust (_t=) che causava il loop infinito degli stessi segmenti
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 15000) * 15000;
-  const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
-  let u = P + '/seg?u=' + encodeURIComponent(withBust);
+  let u = P + '/seg?u=' + encodeURIComponent(abs);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
   if (origin) u += '&o=' + encodeURIComponent(origin);
   return u;
@@ -437,25 +441,33 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// 🔥 Playlist HLS pulita: Niente tag falsi che bloccano il decoder
+// FIX: Inserisce #EXT-X-KEY e non taglia più i segmenti a 3 (causa del loop)
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
-  const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
-  const kept = p.segs.slice(-plan.count);
-  const dropped = p.segs.length - kept.length;
+  // FIX LOOP: Manteniamo tutti i segmenti della playlist sorgente
+  const kept = p.segs; 
+  const dropped = 0; 
 
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:3',
+    '#EXT-X-VERSION:' + (p.version || 3),
     '#EXT-X-TARGETDURATION:' + p.upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
+    '#EXT-X-MEDIA-SEQUENCE:' + p.upSeq // FIX: Non sottraiamo più i segmenti scartati
   ];
+  
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
+  }
+
+  // FIX SCHERMO GRIGIO: Riscrive le chiavi AES
+  for (const k of p.keys) {
+    const rewrittenK = k.replace(/URI="([^"]+)"/g, (m, uri) => {
+      return 'URI="' + proxUrl(absSegUrl(uri, baseUrl), P, ref, origin) + '"';
+    });
+    out.push(rewrittenK);
   }
 
   kept.forEach((s, idx) => {
@@ -492,8 +504,8 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // 🔥 Cache a 15s: Bilanciamento perfetto tra anti-loop e anti-rate-limit
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 15, cacheEverything: true };
+  // FIX LOOP: Rimosso cacheTtl: 15. I segmenti devono essere presi freschi per non bloccarsi.
+  const cfOpt = { cacheTtl: 0 };
   
   try {
     const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
@@ -502,8 +514,7 @@ async function seg(u) {
       'access-control-allow-origin': '*', 
       'access-control-allow-methods': 'GET, HEAD, OPTIONS',
       'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-      'cache-control': range ? 'no-cache' : 'public, max-age=15',
-      'pragma': range ? 'no-cache' : ''
+      'cache-control': 'no-cache'
     };
     const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
     const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
@@ -553,7 +564,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.7 Anti-Loop) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.7 Fix) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -582,9 +593,9 @@ async function diag(u) {
     return await r.text();
   });
   L.push('=== CONFIGURAZIONE ===');
-  L.push('Segmenti: sempre 3 (stabilità decoder)');
+  L.push('Segmenti: FULL (nessun taglio)');
   L.push('Partenza: standard HLS (no tag falsi)');
-  L.push('Cache segmenti: 15s (anti-loop e anti-rate-limit)');
+  L.push('Cache segmenti: 0s (freschi per evitare loop)');
   L.push('RSI: ID Vavoo hardcodati');
   return L.join('\n');
 }
@@ -615,7 +626,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Cache segmenti: 15s | Partenza: standard HLS');
+  L.push('Cache segmenti: 0s | Partenza: FULL');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
