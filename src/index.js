@@ -1,16 +1,16 @@
 // ============================================================================
-// TVNOW-CF v7.5 — SEGMENTI ADATTIVI + ORDINE OTTIMIZZATO
+// TVNOW-CF v7.6 — EXT-X-START PER DELAY MINIMO
 //
-// BASATO SUI DATI REALI DELLA DIAGNOSTICA:
-// - NTV: TARGETDURATION 5s → 3 segmenti = 15s delay
-// - Vavoo: TARGETDURATION 17s → 2 segmenti = 34s delay (limite fonte)
-// - Daddy: TARGETDURATION 4s → 3 segmenti = 12s delay
+// BASATO SUI DATI REALI:
+// - NTV: TARGETDURATION 7s → 2 segmenti = 14s, ma EXT-X-START riduce a ~7s
+// - Vavoo: TARGETDURATION 17s → 2 segmenti = 34s (limite fonte)
+// - Daddy: 403 (da investigare)
 //
 // MODIFICHE:
-// 1. Ordine di default cambiato a ntv,vavoo,daddy (NTV prima = delay minore)
-// 2. rewritePlLive adattivo: sceglie 2 o 3 segmenti in base al TARGETDURATION
-// 3. Mantenuti fix schermo bianco (EXT-X-INDEPENDENT-SEGMENTS)
-// 4. Mantenuta diagnostica multi-fonte
+// 1. Aggiunto EXT-X-START:TIME-OFFSET=0,PRECISE=YES (forza partenza dall'ultimo)
+// 2. Mantenuti 2 segmenti per TARGETDURATION > 6s
+// 3. Mantenuto EXT-X-INDEPENDENT-SEGMENTS (stabilità decoder)
+// 4. Ordine: ntv,vavoo,daddy
 // ============================================================================
 
 export default {
@@ -284,7 +284,6 @@ async function live(u, P, legacy) {
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
   
-  // 🔥 v7.5: Ordine ottimizzato - NTV prima (delay minore), poi Vavoo, poi Daddy
   const order = legacy ? [legacy, ...['ntv','vavoo','daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'ntv,vavoo,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
@@ -338,7 +337,7 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// 🔥 v7.5: Segmenti adattivi in base al TARGETDURATION
+// 🔥 v7.6: 2 segmenti + EXT-X-START per delay minimo
 function rewritePlLive(txt, baseUrl, P, ref, origin) {
   const lines = String(txt).split(/\r?\n/);
   let upSeq = 0, upTarget = 4;
@@ -370,7 +369,8 @@ function rewritePlLive(txt, baseUrl, P, ref, origin) {
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
-    '#EXT-X-INDEPENDENT-SEGMENTS'
+    '#EXT-X-INDEPENDENT-SEGMENTS',
+    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'  // 🔥 Forza partenza dall'ultimo segmento
   ];
   
   const now = Date.now();
@@ -559,9 +559,8 @@ async function diag(u) {
   results.push('ntv,vavoo,daddy (NTV prima = delay minore)');
   results.push('');
   results.push('=== NOTA ===');
-  results.push('Vavoo ha TARGETDURATION alto (17s) = delay minimo 34s anche con 2 segmenti.');
-  results.push('Per canali con solo Vavoo (RSI), il delay sara ~34s (limite fonte).');
-  results.push('Per canali con NTV o Daddy, il delay sara ~12-17s.');
+  results.push('EXT-X-START forza il player a partire dall\'ultimo segmento.');
+  results.push('Delay reale = (segmenti × TARGETDURATION) + buffer + delay fonte.');
   
   return results.join('\n');
 }
@@ -597,7 +596,7 @@ function analyzePlaylist(txt) {
   return { totalSegs, upTarget, totalDuration, upSeq };
 }
 
-const VER = 'TVNOW-CF v7.5';
+const VER = 'TVNOW-CF v7.6';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -627,4 +626,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v7.5 ███
+// ███ FINE TVNOW-CF v7.6 ███
