@@ -1,10 +1,12 @@
 // ============================================================================
-// TVNOW-CF v8.2 — AVVIO UNIVERSALE + RSI FIX
+// TVNOW-CF v8.2.1 — RSI VAVOO MIRROR FIX
 //
-// MODIFICHE (senza cambiare tecnologia):
-// 1. Sempre 3 segmenti (anche Vavoo) → più stabilità decoder
-// 2. EXT-X-PLAYLIST-TYPE:EVENT → player capisce che è live
-// 3. Diagnostica RSI → vediamo se Vavoo trova il canale
+// FIX APPLICATO:
+// 1. vavooStreamHeaders(): Origin e Referer ora derivano dall'URL risolto 
+//    invece di essere fissi su vavoo.to. Questo sblocca i canali RSI (e altri)
+//    che Vavoo sposta su CDN/mirror diversi che rifiutano il referer generico.
+// 2. Mantenute tutte le tecnologie v8.2: 3 segmenti, EXT-X-START, SWR, 
+//    EXT-X-PLAYLIST-TYPE:EVENT, Anti-block Daddy.
 // ============================================================================
 
 export default {
@@ -236,6 +238,18 @@ function vavooMapFind(query, m) {
 
 function vavooHeaders(extra) { return Object.assign({ 'User-Agent': 'MediaHubMX/2', 'Accept': 'application/json', 'Origin': 'https://vavoo.to', 'Referer': 'https://vavoo.to/' }, extra || {}); }
 
+// 🔥 v8.2.1: Origin/Referer derivati dall'URL risolto (fix 403 RSI su mirror Vavoo)
+function vavooStreamHeaders(vu) {
+  let o = 'https://vavoo.to';
+  try { o = new URL(vu).origin; } catch (e) {}
+  return Object.assign({
+    'User-Agent': 'VAVOO/1.0',
+    'Accept': 'application/vnd.apple.mpegurl, application/x-mpegURL, */*',
+    'Origin': o,
+    'Referer': o + '/'
+  });
+}
+
 async function vavooResolveId(base, id) {
   const play = base + '/live/play/' + id;
   try { const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: getBrowserHeaders(base + '/') }, 5000); if (r.ok) { const j = await r.json().catch(() => null); if (j && j.url) return j.url; } } catch (e) {}
@@ -313,7 +327,8 @@ async function live(u, P, legacy) {
       const vu = await vavooResolve(c.vavoo, c.vid);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+        // 🔥 FIX v8.2.1: usa vavooStreamHeaders per adattarsi al mirror
+        const r = await fetchT(vu, { headers: vavooStreamHeaders(vu) }, 8000);
         if (!r.ok) { vavooDrop(c.vavoo, c.vid); return null; }
         const out = rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
         lastPl = { key: ck, txt: out, t: Date.now() };
@@ -380,7 +395,6 @@ function parseMediaPl(txt) {
   return { upSeq, upTarget, map, segs, isMaster };
 }
 
-// 🔥 SEMPRE 3 SEGMENTI (stabilità decoder)
 function pickWindow(durs) {
   const n = durs.length;
   if (!n) return { count: 0, sum: 0 };
@@ -537,7 +551,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.2 Avvio Universale) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.2.1 RSI Fix) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -553,7 +567,8 @@ async function diag(u) {
   if (c.vavoo || c.vid) await tryP('VAVOO', async () => {
     const vu = await vavooResolve(c.vavoo, c.vid);
     if (!vu) throw new Error('non risolto');
-    const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+    // 🔥 FIX v8.2.1: usa vavooStreamHeaders per adattarsi al mirror
+    const r = await fetchT(vu, { headers: vavooStreamHeaders(vu) }, 8000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -571,6 +586,7 @@ async function diag(u) {
   L.push('Tipo: EXT-X-PLAYLIST-TYPE:EVENT (live in corso)');
   L.push('Anti-scatti: stale-while-revalidate=60');
   L.push('Anti-block Daddy: Header Referer/Origin forzati');
+  L.push('Vavoo Mirror Fix: Origin/Referer dinamici su URL risolto');
   return L.join('\n');
 }
 
@@ -584,7 +600,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.2';
+const VER = 'TVNOW-CF v8.2.1';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -625,4 +641,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.2 ███
+// ███ FINE TVNOW-CF v8.2.1 ███
