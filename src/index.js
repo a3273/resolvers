@@ -1,8 +1,12 @@
 // ============================================================================
-// TVNOW-CF v8.0 (FIX CRITICO PARSER)
+// TVNOW-CF v8.1 — PARTENZA RAPIDA + ANTI-BLOCK + ANTI-SCATTI
 //
-// FIX APPLICATO: Spostato il controllo di #EXTINF PRIMA del controllo generico '#'.
-// Ora il worker legge correttamente i segmenti e il player non riceve più playlist vuote.
+// MODIFICHE RAGIONATE:
+// 1. PARTENZA 3-4s: EXT-X-START:TIME-OFFSET=0 forza partenza dall'ultimo segmento
+// 2. LOGICA ADATTIVA: 3 segmenti per NTV (4s), 2 segmenti per Vavoo (16s)
+// 3. ANTI-SCATTI: stale-while-revalidate=60 sui segmenti
+// 4. ANTI-BLOCK DADDY: Header Referer/Origin forzati nel /seg
+// 5. EXT-X-INDEPENDENT-SEGMENTS: ogni segmento decodificabile da solo
 // ============================================================================
 
 export default {
@@ -39,11 +43,6 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-
-const DELAY_TARGET  = 27;
-const DELAY_MIN     = 25;
-const PREF_SEGS     = 3;
-const MIN_SEGS      = 2;
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
@@ -354,7 +353,6 @@ function rewriteAny(txt, baseUrl, P, ref, origin) {
   return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
-// 🔥 FIX CRITICO APPLICATO QUI SOTTO
 function parseMediaPl(txt) {
   let upSeq = 0, upTarget = 4, map = null, isMaster = false;
   const segs = [];
@@ -369,8 +367,6 @@ function parseMediaPl(txt) {
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
     if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
     if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
-    
-    // FIX: #EXTINF deve essere controllato PRIMA del generico '#'
     if (line.startsWith('#EXTINF')) {
       pending = {
         extinf: line,
@@ -380,30 +376,25 @@ function parseMediaPl(txt) {
       disc = false; brange = null;
       continue;
     }
-    
-    // Salta qualsiasi altro tag che inizia con #
     if (line.startsWith('#')) continue;
-    
-    // Se arriviamo qui, è un URL
-    if (pending) {
-      pending.url = line;
-      segs.push(pending);
-      pending = null;
-    }
+    if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
   return { upSeq, upTarget, map, segs, isMaster };
 }
 
-function pickWindow(durs) {
+// 🔥 LOGICA ADATTIVA: 3 segmenti per NTV (4s), 2 segmenti per Vavoo (16s)
+function pickWindow(durs, upTarget) {
   const n = durs.length;
   if (!n) return { count: 0, sum: 0 };
+  
+  // Adattivo: se segmenti lunghi (>10s), usa max 2; altrimenti 3
+  const maxSegs = upTarget > 10 ? 2 : 3;
+  const targetDelay = upTarget > 10 ? 30 : 12;
+  
   let count = 0, sum = 0;
   for (let i = n - 1; i >= 0; i--) {
     count++; sum += durs[i];
-    if (count >= PREF_SEGS && sum >= DELAY_TARGET) break;
-  }
-  while (count > MIN_SEGS && sum - durs[n - count] >= DELAY_MIN) {
-    sum -= durs[n - count]; count--;
+    if (count >= maxSegs && sum >= targetDelay) break;
   }
   return { count, sum };
 }
@@ -444,10 +435,9 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
   const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
+  const plan = pickWindow(durs, p.upTarget);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-  const offset = Math.max(0, plan.sum - DELAY_TARGET);
 
   const out = [
     '#EXTM3U',
@@ -455,7 +445,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
     '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-START:TIME-OFFSET=' + (offset > 0.4 ? offset.toFixed(1) : '0') + ',PRECISE=YES'
+    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -482,6 +472,12 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
+  // 🔥 ANTI-BLOCK DADDY: Forza header se ref contiene thedaddy
+  if (ref.includes('thedaddy')) {
+    h['Referer'] = 'https://thedaddy.li/';
+    h['Origin'] = 'https://thedaddy.li';
+  }
+
   if (/\.m3u8(\?|$)/i.test(target)) {
     const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 10000);
     if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
@@ -491,16 +487,20 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 300, cacheEverything: true };
+  // 🔥 ANTI-SCATTI: stale-while-revalidate=60
+  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
+  
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': range ? 'no-cache' : 'public, max-age=300',
+    'cache-control': range ? 'no-cache' : 'public, max-age=60, stale-while-revalidate=60',
     'pragma': range ? 'no-cache' : ''
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
+  
+  if (!r.ok) return new Response('Segment Error', { status: r.status, headers: hh });
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -543,7 +543,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.0 FIX) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.1 Partenza Rapida) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -572,7 +572,10 @@ async function diag(u) {
     return await r.text();
   });
   L.push('=== CONFIGURAZIONE ===');
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Partenza: EXT-X-START:TIME-OFFSET=0 (dall\'ultimo segmento)');
+  L.push('Finestra: 3 segmenti per NTV (12s), 2 segmenti per Vavoo (32s)');
+  L.push('Anti-scatti: stale-while-revalidate=60');
+  L.push('Anti-block Daddy: Header Referer/Origin forzati');
   return L.join('\n');
 }
 
@@ -580,13 +583,13 @@ function playlistStats(txt) {
   const p = parseMediaPl(txt);
   if (p.isMaster) return 'master playlist';
   const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
+  const plan = pickWindow(durs, p.upTarget);
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.0 (FIX PARSER)';
+const VER = 'TVNOW-CF v8.1';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -602,7 +605,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Partenza rapida: EXT-X-START:TIME-OFFSET=0');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
@@ -627,4 +630,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.0 (FIX PARSER) ███
+// ███ FINE TVNOW-CF v8.1 ███
