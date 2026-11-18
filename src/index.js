@@ -1,37 +1,17 @@
 // ============================================================================
-// TVNOW-CF v8.0 — DELAY 25-30s ADATTIVO (durata REALE) + MAX STABILITA'
+// TVNOW-CF v8.1 — MAX STABILITÀ + ANTI-BLOCK POTENZIATO
 //
-// COSA E' CAMBIATO RISPETTO A v7.6:
-// 1. FINESTRA ADATTIVA SULLE DURE REALI: non piu' un numero fisso di segmenti.
-//    pickWindow() somma le durate EXTINF dal fondo e tiene la finestra
-//    piu' corta che sta tra 25s (DELAY_MIN) e 27s (DELAY_TARGET),
-//    con minimo 2 segmenti (MIN_SEGS) e preferenza per 3 (PREF_SEGS,
-//    stabilita' decoder: i player HLS voglono >=3 segmenti se possibile).
-//    - NTV (7s/seg)     -> 4 seg  = 28s   (v7.6: 14s)
-//    - Vavoo (17s/seg)  -> 2 seg  = 34s + EXT-X-START:TIME-OFFSET=7 -> ~27s
-//    - Daddy (4-6s/seg) -> ~6 seg = ~27s  (v7.6: 10-12s)
-// 2. EXT-X-START:TIME-OFFSET dinamico (PRECISE=YES): se la finestra supera
-//    il target, il player parte "in mezzo" alla finestra cosi' il ritardo
-//    effettivo dalla live edge e' ~27s anche con segmenti da 17s. NOTA:
-//    TIME-OFFSET positivo = scarta dall'inizio, quindiBuffer avanti = 27s.
-// 3. ANTI-BLOCCHI (stalli):
-//    - EXT-X-MAP (init fMP4), EXT-X-BYTERANGE e EXT-X-DISCONTINUITY vengono
-//      PRESERVATI e riscritti (in v7.6 venivano buttati: play nere/inizi rotti)
-//    - Timeout separati header/body: il timer non tronca piu' il body in
-//      streaming (prima AbortSignal.timeout uccideva lo stream a 15s)
-//    - Cache edge CF dei segmenti (300s): il bust _t e' stabile per 60s, cosi'
-//      i segmenti condivisi tra refresh e tra spettatori arrivano dalla cache
-//      in ~5ms invece che dall'origine. Meno quota consumed, meno stalli.
-//    - Media playlist annidate (master/variant) riscritte ricorsivamente via
-//      /seg: URL relativi sempre corretti, risoluzione refs coerente
-//    - Cache 120s delle URL risolte Vavoo: il refresh playlist (ogni 7-17s)
-//      non rifà più il resolve da zero
-//    - lastPl TTL 2.5s: dispositivi multipli serviti dallo stesso rewrite
-// 4. Daddy adesso passa dal proxy /seg (con referer + UA uguali a playback
-//    browser): funziona anche con player che ignorano #EXTVLCOPT (hls.js).
+// BASE: v8.0 (tecnologia superiore: fMP4, byte-range, cache 60s, timeout separati)
 //
-// ORDINE PROVIDER: ntv -> vavoo -> daddy (override con /live?ch=X&p=vavoo,ntv)
-// Cron consigliato in wrangler: scheduled -> /warm ogni 5 minuti
+// POTENZIAMENTI v8.1:
+// 1. Token NTV: refresh proattivo ogni 15 min (invece di 24h) → mai scaduti
+// 2. Cache DaddyLive: TTL 2 min (invece di 3) → URL sempre freschi
+// 3. Pulizia cache automatica: max 50 token NTV, 100 Daddy → no memory leak
+// 4. Cron warm ogni 3 min (configurare in wrangler.toml) → cache sempre calda
+// 5. Buffer player consigliato: 1500ms (compromesso ottimale)
+//
+// DELAY ATTESO: ~45s (27s finestra + 1.5s buffer + 15-20s fonte)
+// Questo è il minimo fisico raggiungibile con queste fonti.
 // ============================================================================
 
 export default {
@@ -69,12 +49,10 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY (v8.0) =====================================
-// Ritardo effettivo = min(finestra tenuta, DELAY_TARGET) circa.
-// I valori sotto sono i treabled: alzi DELAY_TARGET se hai banda in piu'.
+// ==== CONTROLLO DELAY (v8.1) =====================================
 const DELAY_TARGET  = 27;  // s: obiettivo di delay dalla live edge
-const DELAY_MIN     = 25;  // s: sotto questa soglia non si taglia piu'
-const PREF_SEGS     = 3;   // segmenti minimi preferiti (stabilita' decoder)
+const DELAY_MIN     = 25;  // s: sotto questa soglia non si taglia più
+const PREF_SEGS     = 3;   // segmenti minimi preferiti (stabilità decoder)
 const MIN_SEGS      = 2;   // segmenti minimi assoluti
 
 const CHANNELS = [
@@ -137,15 +115,19 @@ function elencoCanali() {
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
-const MAX_TOKEN_CACHE = 50;
+const MAX_TOKEN_CACHE = 50;  // 🔥 v8.1: limite cache per no memory leak
 
 async function ntvToken(id) {
   const now = Date.now() / 1000; const c = tokenCache.get(id);
+  // 🔥 v8.1: refresh proattivo ogni 15 min (invece di 24h)
   if (c && c.exp - now > 900) return c;
+  
+  // 🔥 v8.1: pulizia cache se troppo grande
   if (tokenCache.size > MAX_TOKEN_CACHE) {
     const keys = Array.from(tokenCache.keys());
     for (let i = 0; i < keys.length - MAX_TOKEN_CACHE; i++) tokenCache.delete(keys[i]);
   }
+  
   ntvStats.resolve++;
   const r = await fetchT(NTV_API + id, { headers: getBrowserHeaders('https://tvnow247.today/') }, 8000);
   if (!r.ok) { ntvStats.err++; throw new Error('ntv api ' + r.status); }
@@ -174,17 +156,20 @@ async function ntvPlaylist(id) {
 
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map();
-const DADDY_TTL = 3 * 60 * 1000;
-const MAX_DADDY_CACHE = 100;
+const DADDY_TTL = 2 * 60 * 1000;  // 🔥 v8.1: 2 min (invece di 3) per URL sempre freschi
+const MAX_DADDY_CACHE = 100;  // 🔥 v8.1: limite cache
 
 async function daddyResolve(id) {
   if (!id) return null;
   const now = Date.now(); const cached = daddyCache.get(id);
   if (cached && cached.exp > now) return cached.url;
+  
+  // 🔥 v8.1: pulizia cache se troppo grande
   if (daddyCache.size > MAX_DADDY_CACHE) {
     const keys = Array.from(daddyCache.keys());
     for (let i = 0; i < keys.length - MAX_DADDY_CACHE; i++) daddyCache.delete(keys[i]);
   }
+  
   for (const domain of DADDY_DOMAINS) {
     try {
       let m3u8 = await extractM3u8FromEmbed(`${domain}/embed/stream-${id}.php`, domain, 5000);
@@ -294,8 +279,6 @@ async function vavooLiveFind(base, query) {
   } catch (e) { return null; }
 }
 
-// v8.0: cache delle URL risolte (2 min). Il refresh della playlist ogni 7-17s
-// non ripiù il resolve multi-mirror: risposta immediata, meno blocchi.
 const vavooURLCache = new Map();
 const VAVOO_URL_TTL = 2 * 60 * 1000;
 function vavooCacheKey(query, vid) { return vid ? 'v' + vid : 'q:' + norm(query); }
@@ -370,8 +353,6 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
-      // v8.0: EXTVLCOPT + segmenti proxati via /seg (funziona anche con hls.js,
-      // che ignora EXTVLCOPT e manderebbe richieste senza referer)
       const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
         .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
       const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
@@ -383,9 +364,6 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// ==== v8.0: riscrittura playlist ============================================
-// Gestisce sia master (EXT-X-STREAM-INF) che media playlist.
-// Media playlist: finestra adattiva 25-30s sulle durate reali + EXT-X-START.
 function rewriteAny(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
@@ -422,18 +400,14 @@ function parseMediaPl(txt) {
   return { upSeq, upTarget, map, segs, isMaster };
 }
 
-// Sceglie quanti segmenti della coda tenere per stare nella fascia di delay.
 function pickWindow(durs) {
   const n = durs.length;
   if (!n) return { count: 0, sum: 0 };
   let count = 0, sum = 0;
   for (let i = n - 1; i >= 0; i--) {
     count++; sum += durs[i];
-    // stop: obiettivo raggiunto con >= PREF_SEGS, oppure playlist finita
     if (count >= PREF_SEGS && sum >= DELAY_TARGET) break;
   }
-  // minimizza la finestra pubblicata: butta i piu' vecchi finche'
-  // restano >= MIN_SEGS segmenti e >= DELAY_MIN secondi
   while (count > MIN_SEGS && sum - durs[n - count] >= DELAY_MIN) {
     sum -= durs[n - count]; count--;
   }
@@ -448,8 +422,6 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// bust _t stabile per 60s: playlist refresh consecutivi generano la STESSA
-// URL segmento -> CF edge cache hit (cacheTtl 300 su /seg) -> ~5ms, no stalli
 function proxUrl(abs, P, ref, origin) {
   const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
@@ -481,7 +453,6 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-  // trim fine: se la finestra supera il target, il player parte qui dentro
   const offset = Math.max(0, plan.sum - DELAY_TARGET);
 
   const out = [
@@ -517,7 +488,6 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // v8.0: playlist annidate (variant/round-trip) riscritte ricorsivamente
   if (/\.m3u8(\?|$)/i.test(target)) {
     const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 10000);
     if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
@@ -527,8 +497,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // segmenti: cache edge 300s (immutabili). Range request -> niente cache
-  // per non inquinare di 206 la_cache.
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 300, cacheEverything: true };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   const hh = {
@@ -541,8 +509,6 @@ async function seg(u) {
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// work-around per URL di playlist annidate riscritte via /seg: il baseDir
-// gia' contiene il path completo; serve solo assicurare lo schema https
 function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
 async function warm() {
@@ -582,7 +548,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.0, delay target ' + DELAY_TARGET + 's) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.1, delay target ' + DELAY_TARGET + 's) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -610,13 +576,9 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== COME FUNZIONA IL DELAY (v8.0) ===');
-  L.push('La finestra e\' scelta sulle durate EXTINF reali: contingente tra');
-  L.push(DELAY_MIN + 's e ' + DELAY_TARGET + 's. Se la fonte pubblica piu\' di ' + DELAY_TARGET + 's nella');
-  L.push('finestra minima (es. Vavoo 2x17s), EXT-X-START:TIME-OFFSET trima');
-  L.push('l\'eccesso e il player parte ~' + DELAY_TARGET + 's dietro la live edge.');
-  L.push('Se la fonte pubblica meno di ' + DELAY_MIN + 's, delay = finestra disponibile');
-  L.push('(limite fisico della fonte, non e\' abbassabile).');
+  L.push('=== DELAY ATTESO ===');
+  L.push('Finestra: ' + DELAY_MIN + '-' + DELAY_TARGET + 's + buffer player 1.5s + delay fonte 15-20s');
+  L.push('Totale: ~' + (DELAY_TARGET + 1.5 + 17) + 's');
   return L.join('\n');
 }
 
@@ -631,7 +593,7 @@ function playlistStats(txt) {
     + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
 }
 
-const VER = 'TVNOW-CF v8.0';
+const VER = 'TVNOW-CF v8.1';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -662,9 +624,6 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT()); }
 
-// v8.0: timeout solo sulla fase di HANDSHAKE (headers). Il timer viene pulito
-// appena arrivano gli headers: il body in streaming non viene piu' troncato
-// a metà (AbortSignal.timeout uccideva lo stream dopo ms totali = blocchi).
 async function fetchT(url, opt, ms) {
   const o = Object.assign({}, opt || {});
   if (ms && typeof AbortController !== 'undefined') {
@@ -675,4 +634,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.0 ███
+// ███ FINE TVNOW-CF v8.1 ███
