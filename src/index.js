@@ -1,5 +1,8 @@
 // ============================================================================
-// TVNOW-CF v8.0 — DELAY 25-30s ADATTIVO (durata REALE) + MAX STABILITA'
+// TVNOW-CF v8.0 (FIX CRITICO PARSER)
+//
+// FIX APPLICATO: Spostato il controllo di #EXTINF PRIMA del controllo generico '#'.
+// Ora il worker legge correttamente i segmenti e il player non riceve più playlist vuote.
 // ============================================================================
 
 export default {
@@ -351,6 +354,7 @@ function rewriteAny(txt, baseUrl, P, ref, origin) {
   return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
+// 🔥 FIX CRITICO APPLICATO QUI SOTTO
 function parseMediaPl(txt) {
   let upSeq = 0, upTarget = 4, map = null, isMaster = false;
   const segs = [];
@@ -365,7 +369,8 @@ function parseMediaPl(txt) {
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
     if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
     if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
-    if (line.startsWith('#')) continue;
+    
+    // FIX: #EXTINF deve essere controllato PRIMA del generico '#'
     if (line.startsWith('#EXTINF')) {
       pending = {
         extinf: line,
@@ -375,7 +380,16 @@ function parseMediaPl(txt) {
       disc = false; brange = null;
       continue;
     }
-    if (pending) { pending.url = line; segs.push(pending); pending = null; }
+    
+    // Salta qualsiasi altro tag che inizia con #
+    if (line.startsWith('#')) continue;
+    
+    // Se arriviamo qui, è un URL
+    if (pending) {
+      pending.url = line;
+      segs.push(pending);
+      pending = null;
+    }
   }
   return { upSeq, upTarget, map, segs, isMaster };
 }
@@ -529,7 +543,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.0) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.0 FIX) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -572,7 +586,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.0';
+const VER = 'TVNOW-CF v8.0 (FIX PARSER)';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -613,4 +627,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.0 ███
+// ███ FINE TVNOW-CF v8.0 (FIX PARSER) ███
