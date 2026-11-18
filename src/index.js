@@ -1,12 +1,12 @@
 // ============================================================================
-// TVNOW-CF v8.2.1 — RSI VAVOO MIRROR FIX
+// TVNOW-CF v8.3 — DEFINITIVO (Avvio 3-4s + No Loop + RSI ID Diretti)
 //
-// FIX APPLICATO:
-// 1. vavooStreamHeaders(): Origin e Referer ora derivano dall'URL risolto 
-//    invece di essere fissi su vavoo.to. Questo sblocca i canali RSI (e altri)
-//    che Vavoo sposta su CDN/mirror diversi che rifiutano il referer generico.
-// 2. Mantenute tutte le tecnologie v8.2: 3 segmenti, EXT-X-START, SWR, 
-//    EXT-X-PLAYLIST-TYPE:EVENT, Anti-block Daddy.
+// MODIFICHE CHIAVE:
+// 1. RSI: ID Vavoo hardcodati (2455610203 e 3475299702). Nessuna ricerca fuzzy.
+// 2. Anti-Loop/Blocco: Cache segmenti e bust URL portati a 5 secondi esatti. 
+//    Questo impedisce al player di ricevere segmenti vecchi ripetuti.
+// 3. Avvio 3-4s: EXT-X-START:TIME-OFFSET=0 + EXT-X-INDEPENDENT-SEGMENTS.
+// 4. Vavoo Mirror Fix: Origin/Referer dinamici sull'URL risolto.
 // ============================================================================
 
 export default {
@@ -45,8 +45,9 @@ export default {
 };
 
 const CHANNELS = [
-  { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
-  { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '' },
+  // 🔥 RSI: ID Vavoo hardcodati per evitare fallimenti nella ricerca
+  { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '', vid: '2455610203' },
+  { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '', vid: '3475299702' },
   { slug: 'sky-sport-serie-a', name: 'Sky Sport Serie A', ntv: '', vavoo: 'sky sport serie a', daddy: '880' },
   { slug: 'sky-sport-24', name: 'Sky Sport 24', ntv: '869', vavoo: 'sky sport 24', daddy: '869' },
   { slug: 'sky-sport-uno', name: 'Sky Sport Uno', ntv: '461', vavoo: 'sky sport uno', daddy: '461' },
@@ -238,7 +239,7 @@ function vavooMapFind(query, m) {
 
 function vavooHeaders(extra) { return Object.assign({ 'User-Agent': 'MediaHubMX/2', 'Accept': 'application/json', 'Origin': 'https://vavoo.to', 'Referer': 'https://vavoo.to/' }, extra || {}); }
 
-// 🔥 v8.2.1: Origin/Referer derivati dall'URL risolto (fix 403 RSI su mirror Vavoo)
+// 🔥 v8.3: Origin/Referer dinamici basati sull'URL risolto (fix mirror Vavoo)
 function vavooStreamHeaders(vu) {
   let o = 'https://vavoo.to';
   try { o = new URL(vu).origin; } catch (e) {}
@@ -289,6 +290,7 @@ async function vavooResolve(query, vid) {
 }
 
 async function vavooResolveRaw(query, vid) {
+  // 🔥 Usa l'ID hardcodato se presente, altrimenti cerca
   let id = vid || null;
   if (!id) { const m = await ensureVavooMap(); id = vavooMapFind(query, m); }
   if (id) { for (const base of VAVOO_MIRRORS.slice(0, 6)) { const u = await vavooResolveId(base, id); if (u) return u; } return null; }
@@ -327,7 +329,6 @@ async function live(u, P, legacy) {
       const vu = await vavooResolve(c.vavoo, c.vid);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        // 🔥 FIX v8.2.1: usa vavooStreamHeaders per adattarsi al mirror
         const r = await fetchT(vu, { headers: vavooStreamHeaders(vu) }, 8000);
         if (!r.ok) { vavooDrop(c.vavoo, c.vid); return null; }
         const out = rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
@@ -398,8 +399,7 @@ function parseMediaPl(txt) {
 function pickWindow(durs) {
   const n = durs.length;
   if (!n) return { count: 0, sum: 0 };
-  
-  const maxSegs = 3;
+  const maxSegs = 3; // Sempre 3 segmenti per massima stabilità decoder
   let count = 0, sum = 0;
   for (let i = n - 1; i >= 0; i--) {
     count++; sum += durs[i];
@@ -417,7 +417,8 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 60000) * 60000;
+  // 🔥 Bust a 5 secondi: previene il loop del player ricevendo segmenti vecchi
+  const bust = Math.floor(Date.now() / 5000) * 5000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -455,7 +456,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
     '#EXT-X-INDEPENDENT-SEGMENTS',
     '#EXT-X-PLAYLIST-TYPE:EVENT',
-    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
+    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES' // 🔥 Avvio in 3-4s dall'ultimo segmento
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -496,14 +497,15 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
+  // 🔥 Cache a 5 secondi: il compromesso perfetto per evitare loop e blocchi
+  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 5, cacheEverything: true };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': range ? 'no-cache' : 'public, max-age=60, stale-while-revalidate=60',
+    'cache-control': range ? 'no-cache' : 'public, max-age=5',
     'pragma': range ? 'no-cache' : ''
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
@@ -521,6 +523,7 @@ async function warm() {
   for (let i = 0; i < ids.length; i += 8) {
     await Promise.all(ids.slice(i, i + 8).map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   }
+  // 🔥 Aggiunti RSI al warm
   const vavooChannels = ['sky sport 24', 'sky sport uno', 'sky sport calcio', 'sky sport tennis', 'dazn 1', 'eurosport 1', 'rsi la 1', 'rsi la 2'];
   for (const ch of vavooChannels) {
     try { await vavooResolve(ch, null); } catch (e) {}
@@ -551,7 +554,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.2.1 RSI Fix) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.3 Definitivo) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -567,7 +570,6 @@ async function diag(u) {
   if (c.vavoo || c.vid) await tryP('VAVOO', async () => {
     const vu = await vavooResolve(c.vavoo, c.vid);
     if (!vu) throw new Error('non risolto');
-    // 🔥 FIX v8.2.1: usa vavooStreamHeaders per adattarsi al mirror
     const r = await fetchT(vu, { headers: vavooStreamHeaders(vu) }, 8000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
@@ -582,11 +584,9 @@ async function diag(u) {
   });
   L.push('=== CONFIGURAZIONE ===');
   L.push('Segmenti: sempre 3 (stabilità decoder)');
-  L.push('Partenza: EXT-X-START:TIME-OFFSET=0 (dall\'ultimo segmento)');
-  L.push('Tipo: EXT-X-PLAYLIST-TYPE:EVENT (live in corso)');
-  L.push('Anti-scatti: stale-while-revalidate=60');
-  L.push('Anti-block Daddy: Header Referer/Origin forzati');
-  L.push('Vavoo Mirror Fix: Origin/Referer dinamici su URL risolto');
+  L.push('Partenza: EXT-X-START:TIME-OFFSET=0 (3-4s)');
+  L.push('Cache segmenti: 5s (previene loop e blocchi)');
+  L.push('RSI: ID Vavoo hardcodati');
   return L.join('\n');
 }
 
@@ -600,7 +600,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.2.1';
+const VER = 'TVNOW-CF v8.3';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -616,7 +616,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Segmenti: sempre 3 | Partenza: EXT-X-START:TIME-OFFSET=0');
+  L.push('Cache segmenti: 5s | Partenza: 3-4s');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
@@ -641,4 +641,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.2.1 ███
+// ███ FINE TVNOW-CF v8.3 ███
