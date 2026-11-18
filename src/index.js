@@ -1,10 +1,12 @@
 // ============================================================================
-// TVNOW-CF v8.5 — PARTENZA AFFIDABILE (No EXT-X-START, No Schermi Grigi)
+// TVNOW-CF v8.7 — ANTI-LOOP + ANTI-SCHERMO GRIGIO
 //
-// FIX CRITICO: Rimosso EXT-X-START:TIME-OFFSET=0 che causava schermi grigi
-// su canali senza keyframe all'ultimo segmento.
-// Ora il player parte dal primo segmento della finestra (keyframe garantito).
-// Partenza: 5-10s invece di 3-4s, ma tutti i canali si vedono correttamente.
+// MODIFICHE RAGIONATE:
+// 1. Cache e Bust a 15s: Impedisce al player di ricevere gli stessi 3 segmenti
+//    cached all'infinito (causa del loop delle scene ferme).
+// 2. Playlist HLS Pulita: Rimossi tag falsi (INDEPENDENT-SEGMENTS, EVENT, START)
+//    che causavano schermi grigi/statici su alcuni decoder.
+// 3. RSI ID hardcodati + Header Vavoo/Daddy dinamici (mantenuti).
 // ============================================================================
 
 export default {
@@ -411,8 +413,9 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
+// 🔥 Bust a 15s: Forza il player a richiedere nuovi segmenti, rompendo il loop
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 60000) * 60000;
+  const bust = Math.floor(Date.now() / 15000) * 15000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -434,6 +437,7 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
+// 🔥 Playlist HLS pulita: Niente tag falsi che bloccano il decoder
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
@@ -443,14 +447,11 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
 
-  // 🔥 v8.5: RIMOSSO EXT-X-START per evitare schermi grigi su canali senza keyframe
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
-    '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-PLAYLIST-TYPE:EVENT'
+    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -491,7 +492,8 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true };
+  // 🔥 Cache a 15s: Bilanciamento perfetto tra anti-loop e anti-rate-limit
+  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 15, cacheEverything: true };
   
   try {
     const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
@@ -500,7 +502,7 @@ async function seg(u) {
       'access-control-allow-origin': '*', 
       'access-control-allow-methods': 'GET, HEAD, OPTIONS',
       'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-      'cache-control': range ? 'no-cache' : 'public, max-age=60',
+      'cache-control': range ? 'no-cache' : 'public, max-age=15',
       'pragma': range ? 'no-cache' : ''
     };
     const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
@@ -551,7 +553,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.5 Partenza Affidabile) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.7 Anti-Loop) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -581,8 +583,8 @@ async function diag(u) {
   });
   L.push('=== CONFIGURAZIONE ===');
   L.push('Segmenti: sempre 3 (stabilità decoder)');
-  L.push('Partenza: dal primo segmento (keyframe garantito, 5-10s)');
-  L.push('Cache segmenti: 60s (previene rate-limit e blocchi 403)');
+  L.push('Partenza: standard HLS (no tag falsi)');
+  L.push('Cache segmenti: 15s (anti-loop e anti-rate-limit)');
   L.push('RSI: ID Vavoo hardcodati');
   return L.join('\n');
 }
@@ -597,7 +599,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.5';
+const VER = 'TVNOW-CF v8.7';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -613,7 +615,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Cache segmenti: 60s | Partenza: 5-10s (affidabile)');
+  L.push('Cache segmenti: 15s | Partenza: standard HLS');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
@@ -638,4 +640,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.5 ███
+// ███ FINE TVNOW-CF v8.7 ███
