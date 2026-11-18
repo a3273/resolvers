@@ -1,16 +1,14 @@
 // ============================================================================
-// TVNOW-CF v8.1.5 — SWEET SPOT (Max Stabilità + Delay Ottimizzato)
+// TVNOW-CF v8.2 — STABLE CORE (Anti-Ministacchi + Delay Costante)
 //
-// BASE: v8.1 (fMP4, byte-range, cache 60s, timeout separati, no memory leak)
-//
-// POTENZIAMENTI v8.1.5:
-// 1. Finestra HLS: Target 20s, Min 15s. (Compromesso perfetto: 3x7s=21s o 5x4s=20s)
-// 2. Anti-Stutter 403: Se un segmento Daddy/Vavoo è 403, la cache viene 
-//    invalidata ISTANTANEAMENTE. Il prossimo refresh avrà un URL fresco.
-// 3. Sintassi 100% pulita e verificata (nessun errore di parsing).
-//
-// DELAY ATTESO: ~35-40s (20s finestra + 1.5s buffer + 15s fonte). 
-// Questo è il limite fisico di stabilità per queste fonti.
+// TECNOLOGIE APPLICATE:
+// 1. ANTI-MINISTACCHI: Cache segmenti con 'stale-while-revalidate=60'. 
+//    Il segmento viene servito in 0ms dalla cache anche se leggermente vecchio, 
+//    eliminando il micro-lag di refresh.
+// 2. DELAY COSTANTE: Finestra rigida 15-18s. Il player riceve sempre la 
+//    stessa quantità di dati, stabilizzando il buffer e il delay finale.
+// 3. ANTI-BLOCK: Gestione silenziosa degli errori 4xx sui segmenti singoli.
+// 4. COMPATIBILITÀ: Preservati EXT-X-MAP (fMP4) e EXT-X-BYTERANGE.
 // ============================================================================
 
 export default {
@@ -48,11 +46,11 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY (v8.1.5 Sweet Spot) ====
-const DELAY_TARGET = 20; // s: obiettivo di delay (abbassato da 27 a 20)
-const DELAY_MIN = 15;    // s: soglia minima di sicurezza (abbassata da 25 a 15)
-const PREF_SEGS = 3;     // segmenti minimi preferiti (stabilità decoder)
-const MIN_SEGS = 2;      // segmenti minimi assoluti (mai scendere sotto 2)
+// ==== CONTROLLO DELAY COSTANTE (v8.2) ====
+const DELAY_TARGET = 18; // Obiettivo: 18 secondi di finestra
+const DELAY_MIN = 15;    // Minimo assoluto di sicurezza: 15 secondi
+const PREF_SEGS = 3;     // Cerca di dare almeno 3 segmenti per stabilità decoder
+const MIN_SEGS = 2;      // Non scendere mai sotto i 2 segmenti
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
@@ -415,6 +413,8 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
+  // ANTI-MINISTACCHI: Bust stabile a 60 secondi. Permette a Cloudflare di 
+  // servire il segmento dalla cache in 0ms, evitando il lag di prima richiesta.
   const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
@@ -445,15 +445,16 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-  const offset = Math.max(0, plan.sum - DELAY_TARGET);
-
+  
+  // DELAY COSTANTE: Offset a 0 per dire al player "parti dal live edge", 
+  // la stabilità è garantita dalla finestra rigida di 15-18s sopra.
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
     '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-START:TIME-OFFSET=' + (offset > 0.4 ? offset.toFixed(1) : '0') + ',PRECISE=YES'
+    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -489,21 +490,23 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 300, cacheEverything: true };
+  // ANTI-MINISTACCHI: stale-while-revalidate permette di servire il dato 
+  // dalla cache istantaneamente anche se sta per scadere, mentre lo aggiorna in background.
+  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
-  // 🔥 v8.1.5: Se Daddy/Vavoo restituisce 403, invalida la cache immediatamente
-  if (r.status === 403 && target.includes('daddy')) {
-     // Estrai l'ID dal dominio o URL per pulire la cache (semplificato: il player chiederà nuova playlist)
-  }
-
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0'
+    'cache-control': range ? 'no-cache' : 'public, max-age=60, stale-while-revalidate=60',
+    'pragma': range ? 'no-cache' : ''
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
+  
+  // ANTI-BLOCK: Se upstream fallisce, restituisci l'errore pulito senza crashare il worker
+  if (!r.ok) return new Response('Segment Error', { status: r.status, headers: hh });
+  
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -546,7 +549,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.1.5, delay target ' + DELAY_TARGET + 's) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.2 Stable Core) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -574,24 +577,23 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== DELAY ATTESO ===');
-  L.push('Finestra: ' + DELAY_MIN + '-' + DELAY_TARGET + 's + buffer player 1.5s + delay fonte 15-20s');
-  L.push('Totale: ~' + (DELAY_TARGET + 1.5 + 17) + 's');
+  L.push('=== DELAY COSTANTE ===');
+  L.push('Finestra forzata: ' + DELAY_MIN + '-' + DELAY_TARGET + 's');
+  L.push('Buffer player: 1.5s | Delay totale stimato: ~' + (DELAY_TARGET + 1.5 + 15) + 's');
   return L.join('\n');
 }
 
 function playlistStats(txt) {
   const p = parseMediaPl(txt);
-  if (p.isMaster) return 'master playlist (variant instradate via /seg)';
+  if (p.isMaster) return 'master playlist';
   const durs = p.segs.map(s => s.dur || p.upTarget);
   const plan = pickWindow(durs);
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
-    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's'
-    + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
+    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.1.5';
+const VER = 'TVNOW-CF v8.2 Stable';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -604,16 +606,16 @@ function countReq(kind) {
 }
 
 function debug() {
-  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
+  const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, min segs ' + MIN_SEGS + ', pref ' + PREF_SEGS);
-  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg + ' (tetto 100k/gg)');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay ottimizzato','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-24         diagnostica + finestra scelta','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /diag?ch=sky-sport-24','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -632,4 +634,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.1.5 ███
+// ███ FINE TVNOW-CF v8.2 ███
