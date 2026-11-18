@@ -1,15 +1,18 @@
 // ============================================================================
-// TVNOW-CF v7.1 — LIVE CORRETTA (3 segmenti, no VOD)
+// TVNOW-CF v7.3 — DIAGNOSTICA + FIX SCHERMO BIANCO NTV
 //
-// FIX: Il player vedeva VOD perché la playlist era completa (20+ segmenti).
-// Ora tronco a 3 segmenti con tag live corretti:
-// - EXT-X-MEDIA-SEQUENCE corretto (sliding window)
-// - EXT-X-TARGETDURATION corretto
-// - NO EXT-X-PLAYLIST-TYPE (live pura)
-// - NO EXT-X-ENDLIST (non è VOD)
-// - NO EXT-X-START, NO DISCONTINUITY
+// FIX SCHERMO BIANCO:
+// - Mantenuti 3 segmenti (v7.1 funzionava)
+// - Aggiunto EXT-X-INDEPENDENT-SEGMENTS (aiuta decoder mobile)
+// - NO EXT-X-START (causa schermo bianco)
+// - NO EXT-X-DISCONTINUITY (causa schermo bianco)
+// - NO EXT-X-ALLOW-CACHE:NO (causa confusione)
 //
-// Delay: 3×4s + 15s fonte + 1.5s buffer = ~28s
+// DIAGNOSTICA:
+// - Endpoint /diag?ch=sky-sport-24 misura tutto automaticamente
+// - Calcola delay minimo teorico e segmenti ottimali
+//
+// Delay atteso: ~25-30s (3 segmenti × 4s + 15s fonte + 1.5s buffer)
 // ============================================================================
 
 export default {
@@ -30,6 +33,7 @@ export default {
       if (path === '/vmap') return R(await vmap(), 200, TXT());
       if (path === '/ch') return R(elencoCanali(), 200, TXT());
       if (path === '/probe') return R(await probe(u), 200, TXT());
+      if (path === '/diag') return R(await diag(u), 200, TXT());
       if (path === '/debug') return R(debug(), 200, TXT());
       if (path === '/ip') {
         const ip = req.headers.get('cf-connecting-ip') || '';
@@ -335,43 +339,39 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// 🔥 v7.1: Troncamento a 3 segmenti con tag live corretti
+// 🔥 v7.3: 3 segmenti + EXT-X-INDEPENDENT-SEGMENTS (fix schermo bianco)
 function rewritePlLive(txt, baseUrl, P, ref, origin) {
   const lines = String(txt).split(/\r?\n/);
   let upSeq = 0, upTarget = 4;
   const segments = [];
   let pending = [];
   
-  // Prima passata: estrai info e segmenti
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith('#EXTM3U')) continue;
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-')) continue;  // Salta altri tag
+    if (line.startsWith('#EXT-X-')) continue;
     if (line.startsWith('#EXTINF')) { pending = [line]; continue; }
     if (line.startsWith('#')) continue;
-    // URL segmento
     if (pending.length > 0) {
       segments.push({ extinf: pending[0], url: line });
       pending = [];
     }
   }
   
-  // Tronca agli ultimi 3 segmenti
   const kept = segments.slice(-3);
   const dropped = segments.length - kept.length;
   
-  // Costruisci playlist live corretta
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped)
+    '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
+    '#EXT-X-INDEPENDENT-SEGMENTS'
   ];
   
-  // Aggiungi segmenti con URL riscritti
   const now = Date.now();
   for (const seg of kept) {
     out.push(seg.extinf);
@@ -387,6 +387,84 @@ function rewritePlLive(txt, baseUrl, P, ref, origin) {
     if (ref) segUrl += '&ref=' + encodeURIComponent(ref);
     if (origin) segUrl += '&o=' + encodeURIComponent(origin);
     out.push(segUrl);
+  }
+  
+  return out.join('\n');
+}
+
+// 🔥 DIAGNOSTICA AUTOMATICA
+async function diag(u) {
+  const q = u.searchParams.get('ch') || 'sky-sport-24';
+  const c = findCh(q);
+  if (!c || !c.ntv) return 'Canale non valido o senza NTV. Prova: /diag?ch=sky-sport-24';
+  
+  const t0 = Date.now();
+  let pl;
+  try { pl = await ntvPlaylist(c.ntv); } catch (e) { return 'Errore NTV: ' + e.message; }
+  const fetchTime = Date.now() - t0;
+  
+  const lines = pl.txt.split(/\r?\n/);
+  let upSeq = 0, upTarget = 4;
+  const segments = [];
+  let pending = [];
+  
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
+    if (line.startsWith('#EXT-X-')) continue;
+    if (line.startsWith('#EXTINF')) { 
+      const dur = parseFloat((line.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0;
+      pending = [{ extinf: line, dur }]; 
+      continue; 
+    }
+    if (line.startsWith('#')) continue;
+    if (pending.length > 0) {
+      segments.push({ ...pending[0], url: line });
+      pending = [];
+    }
+  }
+  
+  const totalSegs = segments.length;
+  const totalDuration = segments.reduce((sum, s) => sum + s.dur, 0);
+  const avgDur = totalSegs > 0 ? (totalDuration / totalSegs).toFixed(2) : 0;
+  
+  const recommendedSegs = Math.max(2, Math.min(4, Math.ceil(8 / upTarget)));
+  const recommendedDelay = (recommendedSegs * upTarget) + 1.5;
+  
+  const out = [
+    '=== DIAGNOSTICA NTV ===',
+    'Canale: ' + c.name + ' (ID: ' + c.ntv + ')',
+    '',
+    '--- Playlist originale ---',
+    'Segmenti totali: ' + totalSegs,
+    'TARGETDURATION: ' + upTarget + 's',
+    'Durata media segmento: ' + avgDur + 's',
+    'Durata totale playlist: ' + totalDuration.toFixed(1) + 's',
+    'MEDIA-SEQUENCE: ' + upSeq,
+    '',
+    '--- Performance ---',
+    'Tempo fetch playlist: ' + fetchTime + 'ms',
+    '',
+    '--- Raccomandazione ---',
+    'Segmenti consigliati: ' + recommendedSegs,
+    'Delay atteso con ' + recommendedSegs + ' seg: ~' + recommendedDelay.toFixed(0) + 's',
+    '(fonte ' + totalDuration.toFixed(0) + 's + buffer 1.5s)',
+    '',
+    '--- Primi 3 segmenti ---'
+  ];
+  
+  for (let i = 0; i < Math.min(3, segments.length); i++) {
+    out.push((i+1) + ') ' + segments[i].dur + 's - ' + segments[i].url.substring(0, 80) + '...');
+  }
+  
+  out.push('');
+  out.push('--- Ultimi 3 segmenti ---');
+  const last3 = segments.slice(-3);
+  for (let i = 0; i < last3.length; i++) {
+    out.push((segments.length - 2 + i) + ') ' + last3[i].dur + 's - ' + last3[i].url.substring(0, 80) + '...');
   }
   
   return out.join('\n');
@@ -442,7 +520,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v7.1';
+const VER = 'TVNOW-CF v7.3';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -463,7 +541,7 @@ function debug() {
   return L.join('\n'); 
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /diag?ch=sky-sport-24  (diagnostica)','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() { 
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() }; 
@@ -472,4 +550,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v7.1 ███
+// ███ FINE TVNOW-CF v7.3 ███
