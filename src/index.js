@@ -1,10 +1,5 @@
 // ============================================================================
-// TVNOW-CF v8.0 — DELAY 25-30s ADATTIVO + MAX STABILITA' (CON FIX RSI E DADDY)
-//
-// BASE: Il tuo codice v8.0 originale funzionante.
-// UNICHE 2 MODIFICHE APPLICATE:
-// 1. RSI: Aggiunti ID vid hardcodati ('2455610203' e '3475299702') per fixare RSI.
-// 2. DADDY: Aggiunto forcing header Referer/Origin in seg() per evitare 403.
+// TVNOW-CF v8.0 — BASE STABILE + FIX RSI E DADDY
 // ============================================================================
 
 export default {
@@ -49,7 +44,7 @@ const PREF_SEGS     = 3;
 const MIN_SEGS      = 2;
 
 const CHANNELS = [
-  // 🔥 FIX 1: ID Vavoo hardcodati per RSI per evitare fallimenti nella ricerca
+  // FIX 1: ID Vavoo hardcodati per RSI
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '', vid: '2455610203' },
   { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '', vid: '3475299702' },
   { slug: 'sky-sport-serie-a', name: 'Sky Sport Serie A', ntv: '', vavoo: 'sky sport serie a', daddy: '880' },
@@ -474,7 +469,7 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // 🔥 FIX 2: Forziamo gli header di Daddy se il ref li contiene, per aggirare i blocchi 403
+  // FIX 2: Forziamo gli header di Daddy per evitare i blocchi 403
   if (ref.includes('thedaddy')) {
     h['Referer'] = 'https://thedaddy.li/';
     h['Origin'] = 'https://thedaddy.li';
