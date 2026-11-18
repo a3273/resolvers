@@ -1,14 +1,10 @@
 // ============================================================================
-// TVNOW-CF v8.7 — ANTI-LOOP + ANTI-SCHERMO GRIGIO
-//
-// MODIFICHE RAGIONATE:
-// 1. Fix Schermo Grigio: Aggiunto il supporto per #EXT-X-KEY e #EXT-X-VERSION.
-//    Prima venivano ignorati, impedendo la decifratura AES e causando schermate
-//    grigie con artefatti verdi.
-// 2. Fix Loop (Scene Ferme): Rimossa la finestra forzata a 3 segmenti. Ora la
-//    playlist viene passata interamente, lasciando al player la gestione del buffer.
-// 3. Fix Cache Loop: Rimossi il cache-buster (_t=) e la cache forzata a 15s sui
-//    segmenti, che costringevano il player a ricevere sempre gli stessi dati.
+// TVNOW-CF v8.8 — FIX LOOP E SCHERMO GRIGIO
+// 1. Rimosso il blocco della cache sul manifest (lastPl).
+// 2. Sostituita la ricostruzione dei tag con una semplice riga per riga,
+//    per non perdere i tag #EXT-X-KEY (chiavi AES) e #EXT-X-MAP.
+// 3. Rimossa la cache forzata sui segmenti.
+// 4. Rimossi i tag #EXTVLCOPT da Daddy che bloccano alcuni player.
 // ============================================================================
 
 export default {
@@ -300,8 +296,6 @@ async function vavooResolveRaw(query, vid) {
   return null;
 }
 
-let lastPl = { key: '', txt: '', t: 0 };
-
 async function live(u, P, legacy) {
   countReq('live');
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -319,9 +313,6 @@ async function live(u, P, legacy) {
     return true;
   });
 
-  const ck = c.slug + ':' + availableOrder.join('.');
-  if (lastPl.key === ck && Date.now() - lastPl.t < 2500) return R(lastPl.txt, 200, HLS_NO_CACHE());
-
   const provs = {
     vavoo: async () => {
       if (!c.vavoo && !c.vid) return null;
@@ -331,7 +322,6 @@ async function live(u, P, legacy) {
         const r = await fetchT(vu, { headers: vavooStreamHeaders(vu) }, 8000);
         if (!r.ok) { vavooDrop(c.vavoo, c.vid); return null; }
         const out = rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
-        lastPl = { key: ck, txt: out, t: Date.now() };
         return R(out, 200, HLS_NO_CACHE());
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
@@ -340,7 +330,6 @@ async function live(u, P, legacy) {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
       const out = rewriteAny(pl.txt, pl.base, P, pl.ref, '');
-      lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS_NO_CACHE());
     },
     daddy: async () => {
@@ -349,66 +338,13 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
-      const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
-        .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
-      const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
-      return R(finalTxt, 200, HLS_NO_CACHE());
+      const out = rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '');
+      return R(out, 200, HLS_NO_CACHE());
     }
   };
 
   for (const p of availableOrder) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
-}
-
-function rewriteAny(txt, baseUrl, P, ref, origin) {
-  txt = String(txt);
-  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
-  return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin);
-}
-
-// FIX: Aggiunto supporto per #EXT-X-KEY e #EXT-X-VERSION
-function parseMediaPl(txt) {
-  let upSeq = 0, upTarget = 4, map = null, isMaster = false, version = 3;
-  const keys = [];
-  const segs = [];
-  let pending = null, disc = false, brange = null;
-  for (const raw of String(txt).split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith('#EXT-X-STREAM-INF')) { isMaster = true; break; }
-    if (line.startsWith('#EXTM3U')) continue;
-    if (line.startsWith('#EXT-X-VERSION:')) { version = parseInt(line.split(':')[1]) || 3; continue; }
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
-    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
-    if (line.startsWith('#EXT-X-KEY')) { keys.push(line); continue; } // FIX: Cattura le chiavi AES
-    if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
-    if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
-    if (line.startsWith('#EXTINF')) {
-      pending = {
-        extinf: line,
-        dur: parseFloat((line.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0,
-        disc, brange
-      };
-      disc = false; brange = null;
-      continue;
-    }
-    if (line.startsWith('#')) continue;
-    if (pending) { pending.url = line; segs.push(pending); pending = null; }
-  }
-  return { upSeq, upTarget, map, keys, segs, isMaster, version };
-}
-
-function pickWindow(durs) {
-  const n = durs.length;
-  if (!n) return { count: 0, sum: 0 };
-  const maxSegs = 3;
-  let count = 0, sum = 0;
-  for (let i = n - 1; i >= 0; i--) {
-    count++; sum += durs[i];
-    if (count >= maxSegs) break;
-  }
-  return { count, sum };
 }
 
 function absSegUrl(url, baseUrl) {
@@ -419,7 +355,6 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// FIX: Rimosso il cache bust (_t=) che causava il loop infinito degli stessi segmenti
 function proxUrl(abs, P, ref, origin) {
   let u = P + '/seg?u=' + encodeURIComponent(abs);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -427,56 +362,31 @@ function proxUrl(abs, P, ref, origin) {
   return u;
 }
 
-function rewriteMaster(txt, baseUrl, P, ref, origin) {
-  const out = [];
-  for (const raw of String(txt).split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith('#')) { out.push(line); continue; }
-    let u = P + '/seg?u=' + encodeURIComponent(absSegUrl(line, baseUrl));
-    if (ref) u += '&ref=' + encodeURIComponent(ref);
-    if (origin) u += '&o=' + encodeURIComponent(origin);
-    out.push(u);
-  }
-  return out.join('\n');
-}
-
-// FIX: Inserisce #EXT-X-KEY e non taglia più i segmenti a 3 (causa del loop)
-function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
-  const p = parseMediaPl(txt);
-  if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
-
-  // FIX LOOP: Manteniamo tutti i segmenti della playlist sorgente
-  const kept = p.segs; 
-  const dropped = 0; 
-
-  const out = [
-    '#EXTM3U',
-    '#EXT-X-VERSION:' + (p.version || 3),
-    '#EXT-X-TARGETDURATION:' + p.upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + p.upSeq // FIX: Non sottraiamo più i segmenti scartati
-  ];
+// Sostituzione lineare: mantiene intatti i tag (#EXT-X-KEY, #EXT-X-MAP, ecc.)
+function rewriteAny(txt, baseUrl, P, ref, origin) {
+  txt = String(txt);
+  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
   
-  if (p.map) {
-    const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
-    if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
+  const lines = txt.split(/\r?\n/);
+  const out = [];
+  
+  for (let line of lines) {
+    const t = line.trim();
+    if (!t) { out.push(''); continue; }
+    
+    if (t.startsWith('#')) {
+      if (line.includes('URI="')) {
+        line = line.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return 'URI="' + proxUrl(absSegUrl(uri, baseUrl), P, ref, origin) + '"';
+        });
+      }
+      out.push(line);
+      continue;
+    }
+    
+    out.push(proxUrl(absSegUrl(t, baseUrl), P, ref, origin));
   }
-
-  // FIX SCHERMO GRIGIO: Riscrive le chiavi AES
-  for (const k of p.keys) {
-    const rewrittenK = k.replace(/URI="([^"]+)"/g, (m, uri) => {
-      return 'URI="' + proxUrl(absSegUrl(uri, baseUrl), P, ref, origin) + '"';
-    });
-    out.push(rewrittenK);
-  }
-
-  kept.forEach((s, idx) => {
-    if (s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
-    out.push(s.extinf);
-    if (s.brange) out.push(s.brange);
-    out.push(proxUrl(absSegUrl(s.url, baseUrl), P, ref, origin));
-  });
-
+  
   return out.join('\n');
 }
 
@@ -504,7 +414,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // FIX LOOP: Rimosso cacheTtl: 15. I segmenti devono essere presi freschi per non bloccarsi.
   const cfOpt = { cacheTtl: 0 };
   
   try {
@@ -564,7 +473,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.7 Fix) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.8 Fix) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -601,16 +510,13 @@ async function diag(u) {
 }
 
 function playlistStats(txt) {
-  const p = parseMediaPl(txt);
-  if (p.isMaster) return 'master playlist';
-  const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
-  const total = durs.reduce((a, b) => a + b, 0);
-  return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
-    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
+  const lines = String(txt).split(/\r?\n/);
+  let segs = 0;
+  for (const l of lines) if (l.trim() && l.trim()[0] !== '#') segs++;
+  return 'fonte ' + segs + ' segmenti totali';
 }
 
-const VER = 'TVNOW-CF v8.7';
+const VER = 'TVNOW-CF v8.8';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -651,4 +557,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.7 ███
+// ███ FINE TVNOW-CF v8.8 ███
