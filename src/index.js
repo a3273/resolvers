@@ -1,14 +1,10 @@
 // ============================================================================
-// TVNOW-CF v8.2 — STABLE CORE (Anti-Ministacchi + Delay Costante)
+// TVNOW-CF v8.3 — DIAGNOSTICA AVANZATA + DADDY SMART FALLBACK
 //
-// TECNOLOGIE APPLICATE:
-// 1. ANTI-MINISTACCHI: Cache segmenti con 'stale-while-revalidate=60'. 
-//    Il segmento viene servito in 0ms dalla cache anche se leggermente vecchio, 
-//    eliminando il micro-lag di refresh.
-// 2. DELAY COSTANTE: Finestra rigida 15-18s. Il player riceve sempre la 
-//    stessa quantità di dati, stabilizzando il buffer e il delay finale.
-// 3. ANTI-BLOCK: Gestione silenziosa degli errori 4xx sui segmenti singoli.
-// 4. COMPATIBILITÀ: Preservati EXT-X-MAP (fMP4) e EXT-X-BYTERANGE.
+// NOVITÀ:
+// 1. Diagnostica mostra se playlist è master o media
+// 2. Daddy: se 403 o player non supporta EXTVLCOPT, fallback automatico
+// 3. Rilevamento player da User-Agent (VLC/TiviMate vs altri)
 // ============================================================================
 
 export default {
@@ -46,11 +42,10 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY COSTANTE (v8.2) ====
-const DELAY_TARGET = 18; // Obiettivo: 18 secondi di finestra
-const DELAY_MIN = 15;    // Minimo assoluto di sicurezza: 15 secondi
-const PREF_SEGS = 3;     // Cerca di dare almeno 3 segmenti per stabilità decoder
-const MIN_SEGS = 2;      // Non scendere mai sotto i 2 segmenti
+const DELAY_TARGET = 18;
+const DELAY_MIN = 15;
+const PREF_SEGS = 3;
+const MIN_SEGS = 2;
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
@@ -297,6 +292,17 @@ async function vavooResolveRaw(query, vid) {
 
 let lastPl = { key: '', txt: '', t: 0 };
 
+// 🔥 v8.3: Rilevamento player da User-Agent
+function detectPlayer(req) {
+  const ua = req.headers.get('user-agent') || '';
+  if (/vlc/i.test(ua)) return 'vlc';
+  if (/tivimate/i.test(ua)) return 'tivimate';
+  if (/televizo/i.test(ua)) return 'televizo';
+  if (/iptv\s*smarters/i.test(ua)) return 'smarters';
+  if (/kodi/i.test(ua)) return 'kodi';
+  return 'unknown';
+}
+
 async function live(u, P, legacy) {
   countReq('live');
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -344,14 +350,35 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
-      const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
-        .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
-      const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
+      
+      // 🔥 v8.3: Se il player non supporta EXTVLCOPT, non aggiungerli
+      const player = detectPlayer(req);
+      const supportsExtvlcopt = ['vlc', 'tivimate', 'kodi'].includes(player);
+      
+      let out;
+      if (supportsExtvlcopt) {
+        out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
+          .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
+      } else {
+        out = rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n');
+      }
+      
+      const finalTxt = out.join('\n'); 
+      lastPl = { key: ck, txt: finalTxt, t: Date.now() };
       return R(finalTxt, 200, HLS_NO_CACHE());
     }
   };
 
-  for (const p of availableOrder) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
+  for (const p of availableOrder) { 
+    const fn = provs[p]; 
+    if (!fn) continue; 
+    try { 
+      const res = await fn(); 
+      if (res) return res; 
+    } catch (e) { 
+      log(p + ' ko ' + c.slug + ': ' + (e && e.message)); 
+    } 
+  }
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
@@ -413,8 +440,6 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
-  // ANTI-MINISTACCHI: Bust stabile a 60 secondi. Permette a Cloudflare di 
-  // servire il segmento dalla cache in 0ms, evitando il lag di prima richiesta.
   const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
@@ -445,9 +470,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-  
-  // DELAY COSTANTE: Offset a 0 per dire al player "parti dal live edge", 
-  // la stabilità è garantita dalla finestra rigida di 15-18s sopra.
+
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -490,8 +513,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // ANTI-MINISTACCHI: stale-while-revalidate permette di servire il dato 
-  // dalla cache istantaneamente anche se sta per scadere, mentre lo aggiorna in background.
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
@@ -504,7 +525,6 @@ async function seg(u) {
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
   
-  // ANTI-BLOCK: Se upstream fallisce, restituisci l'errore pulito senza crashare il worker
   if (!r.ok) return new Response('Segment Error', { status: r.status, headers: hh });
   
   return new Response(r.body, { status: r.status, headers: hh });
@@ -549,19 +569,33 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.2 Stable Core) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA AVANZATA (v8.3) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
       const txt = await fn();
+      const p = parseMediaPl(txt);
       L.push('-- ' + label + ' (' + (Date.now() - t0) + 'ms) --');
-      L.push('OK | ' + playlistStats(txt));
+      if (p.isMaster) {
+        L.push('⚠ MASTER PLAYLIST (contiene varianti, non segmenti)');
+        L.push('Il worker seguirà automaticamente la prima variante');
+      } else {
+        L.push('✓ MEDIA PLAYLIST (contiene segmenti)');
+        L.push('Segmenti: ' + p.segs.length + ' | TARGETDURATION: ' + p.upTarget + 's');
+        const durs = p.segs.map(s => s.dur || p.upTarget);
+        const plan = pickWindow(durs);
+        const total = durs.reduce((a, b) => a + b, 0);
+        L.push('Durata totale: ' + total.toFixed(1) + 's');
+        L.push('Finestra selezionata: ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's');
+      }
     } catch (e) {
       L.push('-- ' + label + ' (' + (Date.now() - t0) + 'ms) --');
-      L.push('ERRORE: ' + (e && e.message));
+      L.push('✗ ERRORE: ' + (e && e.message));
     }
     L.push('');
   };
+  
   if (c.vavoo || c.vid) await tryP('VAVOO', async () => {
     const vu = await vavooResolve(c.vavoo, c.vid);
     if (!vu) throw new Error('non risolto');
@@ -577,23 +611,16 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== DELAY COSTANTE ===');
-  L.push('Finestra forzata: ' + DELAY_MIN + '-' + DELAY_TARGET + 's');
-  L.push('Buffer player: 1.5s | Delay totale stimato: ~' + (DELAY_TARGET + 1.5 + 15) + 's');
+  
+  L.push('=== NOTE ===');
+  L.push('Se vedi "MASTER PLAYLIST", il worker gestisce automaticamente le varianti');
+  L.push('Se Daddy dà 403, il worker passerà al provider successivo');
+  L.push('Se il player non supporta EXTVLCOPT, i tag vengono omessi');
+  
   return L.join('\n');
 }
 
-function playlistStats(txt) {
-  const p = parseMediaPl(txt);
-  if (p.isMaster) return 'master playlist';
-  const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
-  const total = durs.reduce((a, b) => a + b, 0);
-  return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
-    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
-}
-
-const VER = 'TVNOW-CF v8.2 Stable';
+const VER = 'TVNOW-CF v8.3';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -634,4 +661,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.2 ███
+// ███ FINE TVNOW-CF v8.3 ███
