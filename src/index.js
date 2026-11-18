@@ -1,18 +1,16 @@
 // ============================================================================
-// TVNOW-CF v7.3 — DIAGNOSTICA + FIX SCHERMO BIANCO NTV
+// TVNOW-CF v7.4 — DIAGNOSTICA MULTI-FONTE (NTV + VAVOO + DADDY)
 //
-// FIX SCHERMO BIANCO:
-// - Mantenuti 3 segmenti (v7.1 funzionava)
-// - Aggiunto EXT-X-INDEPENDENT-SEGMENTS (aiuta decoder mobile)
-// - NO EXT-X-START (causa schermo bianco)
-// - NO EXT-X-DISCONTINUITY (causa schermo bianco)
-// - NO EXT-X-ALLOW-CACHE:NO (causa confusione)
+// BASE: v7.3 (schermo bianco NTV risolto)
+// NOVITÀ: Endpoint /diag?ch=<slug> che analizza TUTTE le fonti disponibili
+//         per un canale e calcola il delay ottimale di ciascuna.
 //
-// DIAGNOSTICA:
-// - Endpoint /diag?ch=sky-sport-24 misura tutto automaticamente
-// - Calcola delay minimo teorico e segmenti ottimali
-//
-// Delay atteso: ~25-30s (3 segmenti × 4s + 15s fonte + 1.5s buffer)
+// TECNOLOGIA INTATTA:
+// - 3 segmenti + EXT-X-INDEPENDENT-SEGMENTS (no schermo bianco)
+// - NO EXT-X-START, NO DISCONTINUITY, NO ALLOW-CACHE
+// - Proxy /seg con header anti-block
+// - Cache limits (50 NTV, 100 Daddy)
+// - Subrequest limits (6 mirror Vavoo, cron a blocchi di 8)
 // ============================================================================
 
 export default {
@@ -50,6 +48,7 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
+// ============================= CANALI ======================================
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
   { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '' },
@@ -107,6 +106,7 @@ function elencoCanali() {
   return L.join('\n');
 }
 
+// ============================= NTV =========================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
@@ -145,6 +145,7 @@ async function ntvPlaylist(id) {
   return { txt, ref: tk.ref, base: tk.m3u8 };
 }
 
+// ============================= DADDYLIVE ===================================
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map(); 
 const DADDY_TTL = 3*60*1000;
@@ -204,6 +205,7 @@ function getBrowserHeaders(referer) {
   };
 }
 
+// ============================= VAVOO =======================================
 const VAVOO_MIRRORS = ['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES = ['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap = { map: null, t: 0, src: '' };
@@ -278,6 +280,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
+// ============================= /live =======================================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -392,84 +395,7 @@ function rewritePlLive(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// 🔥 DIAGNOSTICA AUTOMATICA
-async function diag(u) {
-  const q = u.searchParams.get('ch') || 'sky-sport-24';
-  const c = findCh(q);
-  if (!c || !c.ntv) return 'Canale non valido o senza NTV. Prova: /diag?ch=sky-sport-24';
-  
-  const t0 = Date.now();
-  let pl;
-  try { pl = await ntvPlaylist(c.ntv); } catch (e) { return 'Errore NTV: ' + e.message; }
-  const fetchTime = Date.now() - t0;
-  
-  const lines = pl.txt.split(/\r?\n/);
-  let upSeq = 0, upTarget = 4;
-  const segments = [];
-  let pending = [];
-  
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith('#EXTM3U')) continue;
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
-    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-')) continue;
-    if (line.startsWith('#EXTINF')) { 
-      const dur = parseFloat((line.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0;
-      pending = [{ extinf: line, dur }]; 
-      continue; 
-    }
-    if (line.startsWith('#')) continue;
-    if (pending.length > 0) {
-      segments.push({ ...pending[0], url: line });
-      pending = [];
-    }
-  }
-  
-  const totalSegs = segments.length;
-  const totalDuration = segments.reduce((sum, s) => sum + s.dur, 0);
-  const avgDur = totalSegs > 0 ? (totalDuration / totalSegs).toFixed(2) : 0;
-  
-  const recommendedSegs = Math.max(2, Math.min(4, Math.ceil(8 / upTarget)));
-  const recommendedDelay = (recommendedSegs * upTarget) + 1.5;
-  
-  const out = [
-    '=== DIAGNOSTICA NTV ===',
-    'Canale: ' + c.name + ' (ID: ' + c.ntv + ')',
-    '',
-    '--- Playlist originale ---',
-    'Segmenti totali: ' + totalSegs,
-    'TARGETDURATION: ' + upTarget + 's',
-    'Durata media segmento: ' + avgDur + 's',
-    'Durata totale playlist: ' + totalDuration.toFixed(1) + 's',
-    'MEDIA-SEQUENCE: ' + upSeq,
-    '',
-    '--- Performance ---',
-    'Tempo fetch playlist: ' + fetchTime + 'ms',
-    '',
-    '--- Raccomandazione ---',
-    'Segmenti consigliati: ' + recommendedSegs,
-    'Delay atteso con ' + recommendedSegs + ' seg: ~' + recommendedDelay.toFixed(0) + 's',
-    '(fonte ' + totalDuration.toFixed(0) + 's + buffer 1.5s)',
-    '',
-    '--- Primi 3 segmenti ---'
-  ];
-  
-  for (let i = 0; i < Math.min(3, segments.length); i++) {
-    out.push((i+1) + ') ' + segments[i].dur + 's - ' + segments[i].url.substring(0, 80) + '...');
-  }
-  
-  out.push('');
-  out.push('--- Ultimi 3 segmenti ---');
-  const last3 = segments.slice(-3);
-  for (let i = 0; i < last3.length; i++) {
-    out.push((segments.length - 2 + i) + ') ' + last3[i].dur + 's - ' + last3[i].url.substring(0, 80) + '...');
-  }
-  
-  return out.join('\n');
-}
-
+// ============================= /seg ========================================
 async function seg(u) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
@@ -487,6 +413,7 @@ async function seg(u) {
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
+// ============================= WARM ========================================
 async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -503,6 +430,7 @@ async function warm() {
   log(msg); return R(msg, 200, TXT());
 }
 
+// ============================= UTILS =======================================
 async function probe(u) {
   const q = u.searchParams.get('ch') || ''; const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
@@ -520,7 +448,163 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v7.3';
+// 🔥 DIAGNOSTICA MULTI-FONTE (NTV + VAVOO + DADDY)
+async function diag(u) {
+  const q = u.searchParams.get('ch') || 'sky-sport-24';
+  const c = findCh(q);
+  if (!c) return 'Canale non trovato: ' + q;
+  
+  const results = [];
+  results.push('=== DIAGNOSTICA MULTI-FONTE ===');
+  results.push('Canale: ' + c.name + ' (slug: ' + c.slug + ')');
+  results.push('');
+  
+  // --- TEST NTV ---
+  if (c.ntv) {
+    const t0 = Date.now();
+    try {
+      const pl = await ntvPlaylist(c.ntv);
+      const fetchTime = Date.now() - t0;
+      const info = analyzePlaylist(pl.txt);
+      results.push('--- NTV (ID: ' + c.ntv + ') ---');
+      results.push('OK (' + fetchTime + 'ms)');
+      results.push('Segmenti: ' + info.totalSegs + ' | TARGETDURATION: ' + info.upTarget + 's');
+      results.push('Durata totale: ' + info.totalDuration.toFixed(1) + 's');
+      results.push('Delay stimato (3 seg): ~' + (3 * info.upTarget + 1.5).toFixed(0) + 's');
+      results.push('Delay stimato (2 seg): ~' + (2 * info.upTarget + 1.5).toFixed(0) + 's');
+      results.push('');
+    } catch (e) {
+      results.push('--- NTV ---');
+      results.push('ERRORE: ' + e.message);
+      results.push('');
+    }
+  } else {
+    results.push('--- NTV ---');
+    results.push('Non disponibile');
+    results.push('');
+  }
+  
+  // --- TEST VAVOO ---
+  if (c.vavoo || c.vid) {
+    const t0 = Date.now();
+    try {
+      const vu = await vavooResolve(c.vavoo, c.vid);
+      const resolveTime = Date.now() - t0;
+      if (vu && /\.m3u8/i.test(vu)) {
+        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+        if (r.ok) {
+          const txt = await r.text();
+          const info = analyzePlaylist(txt);
+          const totalTime = Date.now() - t0;
+          results.push('--- VAVOO ---');
+          results.push('OK (' + totalTime + 'ms, resolve: ' + resolveTime + 'ms)');
+          results.push('Segmenti: ' + info.totalSegs + ' | TARGETDURATION: ' + info.upTarget + 's');
+          results.push('Durata totale: ' + info.totalDuration.toFixed(1) + 's');
+          results.push('Delay stimato (3 seg): ~' + (3 * info.upTarget + 1.5).toFixed(0) + 's');
+          results.push('Delay stimato (2 seg): ~' + (2 * info.upTarget + 1.5).toFixed(0) + 's');
+          results.push('');
+        } else {
+          results.push('--- VAVOO ---');
+          results.push('Playlist non scaricabile (' + r.status + ')');
+          results.push('');
+        }
+      } else {
+        results.push('--- VAVOO ---');
+        results.push('URL risolto ma non e m3u8: ' + (vu || 'null'));
+        results.push('');
+      }
+    } catch (e) {
+      results.push('--- VAVOO ---');
+      results.push('ERRORE: ' + e.message);
+      results.push('');
+    }
+  } else {
+    results.push('--- VAVOO ---');
+    results.push('Non disponibile');
+    results.push('');
+  }
+  
+  // --- TEST DADDY ---
+  if (c.daddy) {
+    const t0 = Date.now();
+    try {
+      const du = await daddyResolve(c.daddy);
+      const resolveTime = Date.now() - t0;
+      if (du && /\.m3u8/i.test(du)) {
+        const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
+        if (r.ok) {
+          const txt = await r.text();
+          const info = analyzePlaylist(txt);
+          const totalTime = Date.now() - t0;
+          results.push('--- DADDY (ID: ' + c.daddy + ') ---');
+          results.push('OK (' + totalTime + 'ms, resolve: ' + resolveTime + 'ms)');
+          results.push('Segmenti: ' + info.totalSegs + ' | TARGETDURATION: ' + info.upTarget + 's');
+          results.push('Durata totale: ' + info.totalDuration.toFixed(1) + 's');
+          results.push('Delay stimato (3 seg): ~' + (3 * info.upTarget + 1.5).toFixed(0) + 's');
+          results.push('Delay stimato (2 seg): ~' + (2 * info.upTarget + 1.5).toFixed(0) + 's');
+          results.push('');
+        } else {
+          results.push('--- DADDY ---');
+          results.push('Playlist non scaricabile (' + r.status + ')');
+          results.push('');
+        }
+      } else {
+        results.push('--- DADDY ---');
+        results.push('URL risolto ma non e m3u8: ' + (du || 'null'));
+        results.push('');
+      }
+    } catch (e) {
+      results.push('--- DADDY ---');
+      results.push('ERRORE: ' + e.message);
+      results.push('');
+    }
+  } else {
+    results.push('--- DADDY ---');
+    results.push('Non disponibile');
+    results.push('');
+  }
+  
+  results.push('=== RACCOMANDAZIONE ===');
+  results.push('La fonte con delay minore (TARGETDURATION * segmenti) e\' la migliore.');
+  results.push('Per testare un altro canale: /diag?ch=sky-cinema-uno');
+  
+  return results.join('\n');
+}
+
+// Helper per analizzare una playlist HLS
+function analyzePlaylist(txt) {
+  const lines = String(txt).split(/\r?\n/);
+  let upSeq = 0, upTarget = 4;
+  const segments = [];
+  let pending = [];
+  
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
+    if (line.startsWith('#EXT-X-')) continue;
+    if (line.startsWith('#EXTINF')) { 
+      const dur = parseFloat((line.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0;
+      pending = [{ dur }]; 
+      continue; 
+    }
+    if (line.startsWith('#')) continue;
+    if (pending.length > 0) {
+      segments.push(pending[0]);
+      pending = [];
+    }
+  }
+  
+  const totalSegs = segments.length;
+  const totalDuration = segments.reduce((sum, s) => sum + s.dur, 0);
+  
+  return { totalSegs, upTarget, totalDuration, upSeq };
+}
+
+// ============================= GLOBALS =====================================
+const VER = 'TVNOW-CF v7.4';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -541,7 +625,7 @@ function debug() {
   return L.join('\n'); 
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /diag?ch=sky-sport-24  (diagnostica)','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>','  /diag?ch=sky-sport-24  (diagnostica multi-fonte)','  /warm  /vmap  /probe?ch=X  /debug',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() { 
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() }; 
@@ -550,4 +634,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v7.3 ███
+// ███ FINE TVNOW-CF v7.4 ███
