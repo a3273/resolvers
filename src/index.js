@@ -1,10 +1,8 @@
 // ============================================================================
-// TVNOW-CF v8.3 — DIAGNOSTICA AVANZATA + DADDY SMART FALLBACK
+// TVNOW-CF v8.4 — AVVIO UNIFORME (tutti i canali partono alla stessa velocità)
 //
-// NOVITÀ:
-// 1. Diagnostica mostra se playlist è master o media
-// 2. Daddy: se 403 o player non supporta EXTVLCOPT, fallback automatico
-// 3. Rilevamento player da User-Agent (VLC/TiviMate vs altri)
+// FIX: Rimuovo EXT-X-START che causava schermo nero sui canali "veloci"
+//      Aumento finestra HLS per dare più margine di stabilità
 // ============================================================================
 
 export default {
@@ -42,8 +40,9 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-const DELAY_TARGET = 18;
-const DELAY_MIN = 15;
+// ==== CONTROLLO DELAY (v8.4 - Finestra più ampia per stabilità) ====
+const DELAY_TARGET = 22; // Aumentato da 18 a 22s
+const DELAY_MIN = 18;    // Aumentato da 15 a 18s
 const PREF_SEGS = 3;
 const MIN_SEGS = 2;
 
@@ -292,17 +291,6 @@ async function vavooResolveRaw(query, vid) {
 
 let lastPl = { key: '', txt: '', t: 0 };
 
-// 🔥 v8.3: Rilevamento player da User-Agent
-function detectPlayer(req) {
-  const ua = req.headers.get('user-agent') || '';
-  if (/vlc/i.test(ua)) return 'vlc';
-  if (/tivimate/i.test(ua)) return 'tivimate';
-  if (/televizo/i.test(ua)) return 'televizo';
-  if (/iptv\s*smarters/i.test(ua)) return 'smarters';
-  if (/kodi/i.test(ua)) return 'kodi';
-  return 'unknown';
-}
-
 async function live(u, P, legacy) {
   countReq('live');
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -350,35 +338,14 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
-      
-      // 🔥 v8.3: Se il player non supporta EXTVLCOPT, non aggiungerli
-      const player = detectPlayer(req);
-      const supportsExtvlcopt = ['vlc', 'tivimate', 'kodi'].includes(player);
-      
-      let out;
-      if (supportsExtvlcopt) {
-        out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
-          .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
-      } else {
-        out = rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n');
-      }
-      
-      const finalTxt = out.join('\n'); 
-      lastPl = { key: ck, txt: finalTxt, t: Date.now() };
+      const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
+        .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
+      const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
       return R(finalTxt, 200, HLS_NO_CACHE());
     }
   };
 
-  for (const p of availableOrder) { 
-    const fn = provs[p]; 
-    if (!fn) continue; 
-    try { 
-      const res = await fn(); 
-      if (res) return res; 
-    } catch (e) { 
-      log(p + ' ko ' + c.slug + ': ' + (e && e.message)); 
-    } 
-  }
+  for (const p of availableOrder) { const fn = provs[p]; if (!fn) continue; try { const res = await fn(); if (res) return res; } catch (e) { log(p + ' ko ' + c.slug + ': ' + (e && e.message)); } }
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
@@ -471,13 +438,13 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
 
+  // 🔥 v8.4: RIMOSSO EXT-X-START - Lascia che il player parta dal primo segmento (più stabile)
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
-    '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
+    '#EXT-X-INDEPENDENT-SEGMENTS'
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -569,33 +536,19 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA AVANZATA (v8.3) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
-  
+  const L = ['=== DIAGNOSTICA (v8.4 - Avvio Uniforme) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
       const txt = await fn();
-      const p = parseMediaPl(txt);
       L.push('-- ' + label + ' (' + (Date.now() - t0) + 'ms) --');
-      if (p.isMaster) {
-        L.push('⚠ MASTER PLAYLIST (contiene varianti, non segmenti)');
-        L.push('Il worker seguirà automaticamente la prima variante');
-      } else {
-        L.push('✓ MEDIA PLAYLIST (contiene segmenti)');
-        L.push('Segmenti: ' + p.segs.length + ' | TARGETDURATION: ' + p.upTarget + 's');
-        const durs = p.segs.map(s => s.dur || p.upTarget);
-        const plan = pickWindow(durs);
-        const total = durs.reduce((a, b) => a + b, 0);
-        L.push('Durata totale: ' + total.toFixed(1) + 's');
-        L.push('Finestra selezionata: ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's');
-      }
+      L.push('OK | ' + playlistStats(txt));
     } catch (e) {
       L.push('-- ' + label + ' (' + (Date.now() - t0) + 'ms) --');
-      L.push('✗ ERRORE: ' + (e && e.message));
+      L.push('ERRORE: ' + (e && e.message));
     }
     L.push('');
   };
-  
   if (c.vavoo || c.vid) await tryP('VAVOO', async () => {
     const vu = await vavooResolve(c.vavoo, c.vid);
     if (!vu) throw new Error('non risolto');
@@ -611,16 +564,24 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  
-  L.push('=== NOTE ===');
-  L.push('Se vedi "MASTER PLAYLIST", il worker gestisce automaticamente le varianti');
-  L.push('Se Daddy dà 403, il worker passerà al provider successivo');
-  L.push('Se il player non supporta EXTVLCOPT, i tag vengono omessi');
-  
+  L.push('=== AVVIO UNIFORME ===');
+  L.push('Tutti i canali partono dal primo segmento della playlist (più stabile)');
+  L.push('Finestra: ' + DELAY_MIN + '-' + DELAY_TARGET + 's');
+  L.push('Delay totale stimato: ~' + (DELAY_TARGET + 1.5 + 15) + 's');
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v8.3';
+function playlistStats(txt) {
+  const p = parseMediaPl(txt);
+  if (p.isMaster) return 'master playlist';
+  const durs = p.segs.map(s => s.dur || p.upTarget);
+  const plan = pickWindow(durs);
+  const total = durs.reduce((a, b) => a + b, 0);
+  return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
+    + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
+}
+
+const VER = 'TVNOW-CF v8.4';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -661,4 +622,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.3 ███
+// ███ FINE TVNOW-CF v8.4 ███
