@@ -1,12 +1,10 @@
 // ============================================================================
-// TVNOW-CF v8.4 — ULTRA STABILITÀ (Anti Rate-Limit + No Crash + Avvio Rapido)
+// TVNOW-CF v8.5 — PARTENZA AFFIDABILE (No EXT-X-START, No Schermi Grigi)
 //
-// RISOLUZIONE PROBLEMI SEGNALATI:
-// 1. "Impossibile riprodurre" dopo l'avvio: Causato dal Rate-Limit (403) dei 
-//    server originali. La cache segmenti è ora a 60s per proteggere l'origine.
-// 2. Cambio canale bloccato: Gestione pulita degli errori e timeout ottimizzati.
-// 3. Crash dopo 30 min: Risolto definitivamente con limiti rigidi alle Map (50/100).
-// 4. RSI: ID hardcodati per massima affidabilità.
+// FIX CRITICO: Rimosso EXT-X-START:TIME-OFFSET=0 che causava schermi grigi
+// su canali senza keyframe all'ultimo segmento.
+// Ora il player parte dal primo segmento della finestra (keyframe garantito).
+// Partenza: 5-10s invece di 3-4s, ma tutti i canali si vedono correttamente.
 // ============================================================================
 
 export default {
@@ -414,7 +412,6 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
-  // 🔥 Bust a 60s: Sincronizzato con la cache per massimizzare gli hit e azzerare il rate-limit
   const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
@@ -446,14 +443,14 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
 
+  // 🔥 v8.5: RIMOSSO EXT-X-START per evitare schermi grigi su canali senza keyframe
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
     '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-PLAYLIST-TYPE:EVENT',
-    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
+    '#EXT-X-PLAYLIST-TYPE:EVENT'
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -494,7 +491,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // 🔥 CACHE 60s: Fondamentale per evitare che i server originali blocchino l'IP (403)
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true };
   
   try {
@@ -555,7 +551,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.4 Ultra Stabile) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.5 Partenza Affidabile) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -585,7 +581,7 @@ async function diag(u) {
   });
   L.push('=== CONFIGURAZIONE ===');
   L.push('Segmenti: sempre 3 (stabilità decoder)');
-  L.push('Partenza: EXT-X-START:TIME-OFFSET=0 (3-4s)');
+  L.push('Partenza: dal primo segmento (keyframe garantito, 5-10s)');
   L.push('Cache segmenti: 60s (previene rate-limit e blocchi 403)');
   L.push('RSI: ID Vavoo hardcodati');
   return L.join('\n');
@@ -601,7 +597,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.4';
+const VER = 'TVNOW-CF v8.5';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -617,7 +613,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Cache segmenti: 60s | Partenza: 3-4s');
+  L.push('Cache segmenti: 60s | Partenza: 5-10s (affidabile)');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
@@ -642,4 +638,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.4 ███
+// ███ FINE TVNOW-CF v8.5 ███
