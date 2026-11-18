@@ -1,12 +1,10 @@
 // ============================================================================
-// TVNOW-CF v8.1 — PARTENZA RAPIDA + ANTI-BLOCK + ANTI-SCATTI
+// TVNOW-CF v8.2 — AVVIO UNIVERSALE + RSI FIX
 //
-// MODIFICHE RAGIONATE:
-// 1. PARTENZA 3-4s: EXT-X-START:TIME-OFFSET=0 forza partenza dall'ultimo segmento
-// 2. LOGICA ADATTIVA: 3 segmenti per NTV (4s), 2 segmenti per Vavoo (16s)
-// 3. ANTI-SCATTI: stale-while-revalidate=60 sui segmenti
-// 4. ANTI-BLOCK DADDY: Header Referer/Origin forzati nel /seg
-// 5. EXT-X-INDEPENDENT-SEGMENTS: ogni segmento decodificabile da solo
+// MODIFICHE (senza cambiare tecnologia):
+// 1. Sempre 3 segmenti (anche Vavoo) → più stabilità decoder
+// 2. EXT-X-PLAYLIST-TYPE:EVENT → player capisce che è live
+// 3. Diagnostica RSI → vediamo se Vavoo trova il canale
 // ============================================================================
 
 export default {
@@ -382,19 +380,16 @@ function parseMediaPl(txt) {
   return { upSeq, upTarget, map, segs, isMaster };
 }
 
-// 🔥 LOGICA ADATTIVA: 3 segmenti per NTV (4s), 2 segmenti per Vavoo (16s)
-function pickWindow(durs, upTarget) {
+// 🔥 SEMPRE 3 SEGMENTI (stabilità decoder)
+function pickWindow(durs) {
   const n = durs.length;
   if (!n) return { count: 0, sum: 0 };
   
-  // Adattivo: se segmenti lunghi (>10s), usa max 2; altrimenti 3
-  const maxSegs = upTarget > 10 ? 2 : 3;
-  const targetDelay = upTarget > 10 ? 30 : 12;
-  
+  const maxSegs = 3;
   let count = 0, sum = 0;
   for (let i = n - 1; i >= 0; i--) {
     count++; sum += durs[i];
-    if (count >= maxSegs && sum >= targetDelay) break;
+    if (count >= maxSegs) break;
   }
   return { count, sum };
 }
@@ -435,7 +430,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
   const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs, p.upTarget);
+  const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
 
@@ -445,6 +440,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
     '#EXT-X-INDEPENDENT-SEGMENTS',
+    '#EXT-X-PLAYLIST-TYPE:EVENT',
     '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES'
   ];
   if (p.map) {
@@ -472,7 +468,6 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // 🔥 ANTI-BLOCK DADDY: Forza header se ref contiene thedaddy
   if (ref.includes('thedaddy')) {
     h['Referer'] = 'https://thedaddy.li/';
     h['Origin'] = 'https://thedaddy.li';
@@ -487,7 +482,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // 🔥 ANTI-SCATTI: stale-while-revalidate=60
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true, staleWhileRevalidate: 60 };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
@@ -513,7 +507,7 @@ async function warm() {
   for (let i = 0; i < ids.length; i += 8) {
     await Promise.all(ids.slice(i, i + 8).map(async id => { try { await ntvToken(id); ok++; } catch (e) { err++; } }));
   }
-  const vavooChannels = ['sky sport 24', 'sky sport uno', 'sky sport calcio', 'sky sport tennis', 'dazn 1', 'eurosport 1'];
+  const vavooChannels = ['sky sport 24', 'sky sport uno', 'sky sport calcio', 'sky sport tennis', 'dazn 1', 'eurosport 1', 'rsi la 1', 'rsi la 2'];
   for (const ch of vavooChannels) {
     try { await vavooResolve(ch, null); } catch (e) {}
   }
@@ -543,7 +537,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.1 Partenza Rapida) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.2 Avvio Universale) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -572,8 +566,9 @@ async function diag(u) {
     return await r.text();
   });
   L.push('=== CONFIGURAZIONE ===');
+  L.push('Segmenti: sempre 3 (stabilità decoder)');
   L.push('Partenza: EXT-X-START:TIME-OFFSET=0 (dall\'ultimo segmento)');
-  L.push('Finestra: 3 segmenti per NTV (12s), 2 segmenti per Vavoo (32s)');
+  L.push('Tipo: EXT-X-PLAYLIST-TYPE:EVENT (live in corso)');
   L.push('Anti-scatti: stale-while-revalidate=60');
   L.push('Anti-block Daddy: Header Referer/Origin forzati');
   return L.join('\n');
@@ -583,13 +578,13 @@ function playlistStats(txt) {
   const p = parseMediaPl(txt);
   if (p.isMaster) return 'master playlist';
   const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs, p.upTarget);
+  const plan = pickWindow(durs);
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.1';
+const VER = 'TVNOW-CF v8.2';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -605,7 +600,7 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Partenza rapida: EXT-X-START:TIME-OFFSET=0');
+  L.push('Segmenti: sempre 3 | Partenza: EXT-X-START:TIME-OFFSET=0');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
@@ -630,4 +625,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.1 ███
+// ███ FINE TVNOW-CF v8.2 ███
