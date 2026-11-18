@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v8.0 — BASE STABILE + FIX RSI E DADDY
+// TVNOW-CF v8.0 — BASE STABILE + FIX RSI/DADDY + DIAGNOSTICA SEGMENTI
 // ============================================================================
 
 export default {
@@ -22,6 +22,8 @@ export default {
       if (path === '/probe') return R(await probe(u), 200, TXT());
       if (path === '/diag') return R(await diag(u), 200, TXT());
       if (path === '/debug') return R(debug(), 200, TXT());
+      // 🔥 NUOVO ENDPOINT DI DIAGNOSTICA SEGMENTI
+      if (path === '/checkseg') return await checkseg(u); 
       if (path === '/ip') {
         const ip = req.headers.get('cf-connecting-ip') || '';
         const r = await fetchT('https://www.cloudflare.com/cdn-cgi/trace', {}, 8000);
@@ -498,6 +500,126 @@ async function seg(u) {
 
 function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
+// 🔥 NUOVA FUNZIONE: DIAGNOSTICA SEGMENTI REALI
+async function checkseg(u) {
+  const source = u.searchParams.get('s') || 'ntv';
+  const ch = u.searchParams.get('ch') || '869';
+  const L = ['=== CHECK SEGMENTO REALE ===', 'Fonte: ' + source, 'Canale ID/Name: ' + ch, ''];
+  
+  try {
+    let segUrl = '';
+    let headers = {};
+    let txt = '';
+    
+    if (source === 'ntv') {
+      const pl = await ntvPlaylist(ch);
+      txt = pl.txt;
+      headers = getBrowserHeaders(pl.ref);
+    } else if (source === 'daddy') {
+      const du = await daddyResolve(ch);
+      if (!du) return R('Daddy: URL non risolto', 200, TXT());
+      const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
+      if (!r.ok) return R('Daddy HTTP ' + r.status, 200, TXT());
+      txt = await r.text();
+      headers = getBrowserHeaders('https://thedaddy.li/');
+    } else if (source === 'vavoo') {
+      const c = findCh(ch); // ch qui è lo slug, es. 'sky-sport-24'
+      if (!c) return R('Vavoo: Canale non trovato (usa slug, es. sky-sport-24)', 200, TXT());
+      const vu = await vavooResolve(c.vavoo, c.vid);
+      if (!vu) return R('Vavoo: URL non risolto', 200, TXT());
+      const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+      if (!r.ok) return R('Vavoo HTTP ' + r.status, 200, TXT());
+      txt = await r.text();
+      headers = vavooHeaders({ 'User-Agent': 'VAVOO/1.0' });
+    }
+    
+    const lines = txt.split('\n');
+    let isMaster = txt.includes('#EXT-X-STREAM-INF');
+    
+    if (isMaster) {
+      L.push('⚠️  È una Master Playlist. Il primo URL è un\'altra playlist, non un segmento video.');
+      for(let i=0; i<lines.length; i++) {
+        if(!lines[i].startsWith('#') && lines[i].trim().length > 0) {
+          segUrl = lines[i].trim();
+          break;
+        }
+      }
+    } else {
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trim().startsWith('#EXTINF') && lines[i+1] && !lines[i+1].trim().startsWith('#')) {
+          segUrl = lines[i+1].trim();
+          break;
+        }
+      }
+    }
+    
+    if (!segUrl) return R('Nessun URL trovato nella playlist', 200, TXT());
+    
+    // Se è un URL relativo, lo rendiamo assoluto (semplificazione)
+    if (!segUrl.startsWith('http')) {
+        // Non possiamo risolverlo facilmente qui senza la base URL, ma proviamo
+        L.push('⚠️  URL relativo trovato, impossibile da testare direttamente senza base URL.');
+        return R(L.join('\n'), 200, TXT());
+    }
+
+    L.push('URL testato: ' + segUrl);
+    L.push('');
+    
+    const r = await fetchT(segUrl, { headers: headers }, 10000);
+    L.push('HTTP Status: ' + r.status);
+    L.push('Content-Type: ' + r.headers.get('content-type'));
+    L.push('');
+    
+    const buf = await r.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    L.push('Dimensione: ' + bytes.length + ' bytes');
+    L.push('');
+    
+    // Primi 16 bytes in hex
+    const hex = Array.from(bytes.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    L.push('Primi 16 bytes (hex): ' + hex);
+    L.push('');
+    
+    // Identifica il formato
+    if (bytes.length >= 4) {
+      if (bytes[0] === 0x47) {
+        L.push('✅ Formato: MPEG-TS (Transport Stream) - COMPATIBILE');
+      } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
+        L.push('✅ Formato: fMP4 (Fragmented MP4) - COMPATIBILE');
+        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+        L.push('Brand: ' + brand);
+      } else {
+        const text = String.fromCharCode(...bytes.slice(0, 100));
+        if (text.includes('<html') || text.includes('<!DOCTYPE') || text.includes('<script')) {
+          L.push('❌ Formato: HTML (pagina di errore/blocco) - NON È VIDEO');
+          L.push('Contenuto HTML: ' + text.substring(0, 150) + '...');
+        } else {
+          L.push('❓ Formato: SCONOSCIUTO/RAW');
+        }
+      }
+    }
+    
+    L.push('');
+    L.push('=== CONCLUSIONE ===');
+    if (r.status !== 200) {
+      L.push('❌ Segmento non disponibile (HTTP ' + r.status + ')');
+    } else if (bytes.length < 100) {
+      L.push('❌ Segmento troppo piccolo (' + bytes.length + ' bytes)');
+    } else if (bytes[0] === 0x47 || String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
+      L.push('✅ Il segmento video è VALIDO e scaricato correttamente.');
+      L.push('Se il player mostra schermo nero, il problema è il codec (es. H265) o il player stesso.');
+    } else {
+      L.push('⚠️  Il segmento NON è un video valido. La fonte sta restituendo errori o blocchi.');
+    }
+    
+    return R(L.join('\n'), 200, TXT());
+  } catch (e) {
+    return R('ERRORE: ' + e.message, 200, TXT());
+  }
+}
+
+function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
+
 async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -582,7 +704,7 @@ function playlistStats(txt) {
     + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
 }
 
-const VER = 'TVNOW-CF v8.0 (Originale + Fix)';
+const VER = 'TVNOW-CF v8.0 (Originale + Fix + Checkseg)';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -604,7 +726,7 @@ function debug() {
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 25-30s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-24         diagnostica + finestra scelta','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 25-30s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-24         diagnostica + finestra scelta','  /checkseg?s=ntv&ch=869        test segmento reale NTV','  /checkseg?s=daddy&ch=869      test segmento reale Daddy','  /checkseg?s=vavoo&ch=sky-sport-24  test segmento reale Vavoo','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -623,4 +745,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.0 (Originale + Fix) ███
+// ███ FINE TVNOW-CF v8.0 (Originale + Fix + Checkseg) ███
