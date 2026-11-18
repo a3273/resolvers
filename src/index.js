@@ -1,8 +1,11 @@
 // ============================================================================
-// TVNOW-CF v8.4 — AVVIO UNIFORME (tutti i canali partono alla stessa velocità)
+// TVNOW-CF v8.5 — RETRO-FRONT (Stabilità v8.0 + Daddy Fix Chirurgico)
 //
-// FIX: Rimuovo EXT-X-START che causava schermo nero sui canali "veloci"
-//      Aumento finestra HLS per dare più margine di stabilità
+// 1. DELAY: Tornato ai parametri v8.0 (27s target, 25s min) per massima stabilità.
+// 2. DADDY FIX: Il worker forza SEMPRE gli header 'Referer' e 'Origin' di 
+//    DaddyLive nelle richieste ai segmenti, aggirando i blocchi 403 dei loro server.
+// 3. PULIZIA: Rimossa qualsiasi logica condizionale sugli header che poteva 
+//    creare falle.
 // ============================================================================
 
 export default {
@@ -40,9 +43,9 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY (v8.4 - Finestra più ampia per stabilità) ====
-const DELAY_TARGET = 22; // Aumentato da 18 a 22s
-const DELAY_MIN = 18;    // Aumentato da 15 a 18s
+// ==== CONTROLLO DELAY (RITORNO ALLA STABILITÀ v8.0) ====
+const DELAY_TARGET = 27;
+const DELAY_MIN = 25;
 const PREF_SEGS = 3;
 const MIN_SEGS = 2;
 
@@ -338,9 +341,14 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
-      const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA]
-        .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
-      const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
+      // 🔥 DADDY FIX: Forziamo sempre EXTVLCOPT e riscriviamo tutto tramite proxy
+      const out = [
+        '#EXTVLCOPT:http-referrer=https://thedaddy.li/',
+        '#EXTVLCOPT:http-user-agent=' + UA,
+        '#EXTVLCOPT:http-origin=https://thedaddy.li'
+      ].concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
+      const finalTxt = out.join('\n'); 
+      lastPl = { key: ck, txt: finalTxt, t: Date.now() }; 
       return R(finalTxt, 200, HLS_NO_CACHE());
     }
   };
@@ -438,7 +446,6 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
 
-  // 🔥 v8.4: RIMOSSO EXT-X-START - Lascia che il player parta dal primo segmento (più stabile)
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
@@ -465,9 +472,17 @@ async function seg(u) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
+  
+  // 🔥 DADDY FIX: Forziamo gli header di Daddy se il ref li contiene, per aggirare i blocchi
   const h = getBrowserHeaders(ref);
+  if (ref.includes('thedaddy')) {
+    h['Referer'] = 'https://thedaddy.li/';
+    h['Origin'] = 'https://thedaddy.li';
+  }
+  
   const o = u.searchParams.get('o');
   if (o) h['Origin'] = o;
+  
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
@@ -536,7 +551,7 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA (v8.4 - Avvio Uniforme) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.5 Retro-Front) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
@@ -564,10 +579,9 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== AVVIO UNIFORME ===');
-  L.push('Tutti i canali partono dal primo segmento della playlist (più stabile)');
-  L.push('Finestra: ' + DELAY_MIN + '-' + DELAY_TARGET + 's');
-  L.push('Delay totale stimato: ~' + (DELAY_TARGET + 1.5 + 15) + 's');
+  L.push('=== CONFIGURAZIONE ===');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's');
+  L.push('Daddy: Header Referer/Origin forzati a livello di worker');
   return L.join('\n');
 }
 
@@ -581,7 +595,7 @@ function playlistStats(txt) {
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
 }
 
-const VER = 'TVNOW-CF v8.4';
+const VER = 'TVNOW-CF v8.5';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -622,4 +636,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.4 ███
+// ███ FINE TVNOW-CF v8.5 ███
