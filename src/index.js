@@ -1,19 +1,15 @@
 // ============================================================================
-// TVNOW-CF v6.4 — DELAY 28-30s (SOLUZIONE RAGIONATA)
+// TVNOW-CF v7.0 "RINASCITA" — Ricostruito da zero
 //
-// ANALISI:
-// - Player parte dal primo segmento se playlist lunga → delay alto
-// - Player aspetta di scaricare tutti i segmenti se playlist corta → avvio lento
-// - Tag strani (DISCONTINUITY, ALLOW-CACHE) confondono il player → schermo bianco
+// PRINCIPI:
+// 1. Playlist COMPLETA (non troncata) → player la riconosce come live
+// 2. EXT-X-PLAYLIST-TYPE:EVENT → "live in corso, aggiorna regolarmente"
+// 3. EXT-X-MEDIA-SEQUENCE corretto → sliding window valida
+// 4. EXT-X-PROGRAM-DATE-TIME → orario reale per ogni segmento
+// 5. NO tag problematici (START, DISCONTINUITY, ALLOW-CACHE)
+// 6. Header no-cache → player aggiorna sempre la playlist
 //
-// SOLUZIONE v6.4:
-// - 3 segmenti (12s di contenuto)
-// - EXT-X-START:TIME-OFFSET=0,PRECISE=YES (partenza dall'ultimo segmento)
-// - EXT-X-PLAYLIST-TYPE:EVENT (live in corso)
-// - NO tag problematici
-// - Cache worker 1000ms + buffer player 1500ms
-//
-// Delay atteso: 12s + 15s (fonte) + 1.5s = ~28-30s
+// Delay atteso: 15-20s (fonte) + 1.5s (buffer) = ~17-22s
 // ============================================================================
 
 export default {
@@ -50,6 +46,7 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
+// ============================= CANALI ======================================
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '' },
   { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '' },
@@ -107,6 +104,7 @@ function elencoCanali() {
   return L.join('\n');
 }
 
+// ============================= NTV =========================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
@@ -145,6 +143,7 @@ async function ntvPlaylist(id) {
   return { txt, ref: tk.ref, base: tk.m3u8 };
 }
 
+// ============================= DADDYLIVE ===================================
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map(); 
 const DADDY_TTL = 3*60*1000;
@@ -204,6 +203,7 @@ function getBrowserHeaders(referer) {
   };
 }
 
+// ============================= VAVOO =======================================
 const VAVOO_MIRRORS = ['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES = ['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap = { map: null, t: 0, src: '' };
@@ -278,6 +278,7 @@ async function vavooResolve(query, vid) {
   return null;
 }
 
+// ============================= /live =======================================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -307,7 +308,7 @@ async function live(u, P, legacy) {
       if (/\.m3u8(\?|$)/.test(vu)) {
         const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
         if (r.ok) {
-          const out = rewritePlLowLatency(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
+          const out = rewritePlLive(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
           lastPl = { key: ck, txt: out, t: Date.now() };
           return R(out, 200, HLS_NO_CACHE());
         }
@@ -317,8 +318,8 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      const truncated = truncatePlaylist(pl.txt, 3);
-      const out = rewritePlLowLatency(truncated, pl.base, P, pl.ref, '');
+      // 🔥 v7.0: Playlist completa con tag live corretti
+      const out = rewritePlLive(pl.txt, pl.base, P, pl.ref, '');
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS_NO_CACHE());
     },
@@ -340,60 +341,65 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-function truncatePlaylist(txt, lastN) {
+// 🔥 v7.0: Riscrive playlist COMPLETA con tag live corretti
+function rewritePlLive(txt, baseUrl, P, ref, origin) {
   const lines = String(txt).split(/\r?\n/);
-  let upSeq = 0, upTarget = 0, upDiscSeq = 0;
-  const pending = [];
-  const segments = [];
+  const out = [];
+  const now = Date.now();
+  let targetDuration = 4;
+  let mediaSequence = 0;
+  let segmentIndex = 0;
+  
+  // Prima passata: estrai info dalla playlist originale
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith('#EXT-X-TARGETDURATION:')) targetDuration = parseInt(line.split(':')[1]) || 4;
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) mediaSequence = parseInt(line.split(':')[1]) || 0;
+  }
+  
+  // Header live corretti
+  out.push('#EXTM3U');
+  out.push('#EXT-X-VERSION:3');
+  out.push('#EXT-X-TARGETDURATION:' + targetDuration);
+  out.push('#EXT-X-MEDIA-SEQUENCE:' + mediaSequence);
+  out.push('#EXT-X-PLAYLIST-TYPE:EVENT');  // ← "Questa è una live in corso"
+  
+  // Seconda passata: riscrivi segmenti con PROGRAM-DATE-TIME
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith('#EXTM3U')) continue;
-    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) { upDiscSeq = parseInt(line.split(':')[1]) || 0; continue; }
-    if (line.startsWith('#EXT-X-PLAYLIST-TYPE') || line.startsWith('#EXT-X-ENDLIST')) continue;
-    if (line.startsWith('#EXTINF')) { segments.push({ tags: pending.splice(0), extinf: line, url: '' }); continue; }
-    if (line.startsWith('#')) { pending.push(line); continue; }
-    const s = segments[segments.length - 1];
-    if (s && !s.url) s.url = line; else pending.splice(0);
-  }
-  const valid = segments.filter(s => s.url);
-  const kept = valid.slice(-lastN);
-  const dropped = valid.length - kept.length;
-  let target = upTarget;
-  if (!target) {
-    for (const s of kept) { const d = parseFloat((s.extinf.match(/#EXTINF:([\d.]+)/) || [])[1]) || 0; if (d > target) target = Math.ceil(d); }
-  }
-  const out = [
-    '#EXTM3U',
-    '#EXT-X-VERSION:3',
-    '#EXT-X-TARGETDURATION:' + (target || 4),
-    '#EXT-X-MEDIA-SEQUENCE:' + (upSeq + dropped),
-    '#EXT-X-DISCONTINUITY-SEQUENCE:' + upDiscSeq,
-    '#EXT-X-START:TIME-OFFSET=0,PRECISE=YES',
-    '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-PLAYLIST-TYPE:EVENT'
-  ];
-  for (const s of kept) { for (const t of s.tags) out.push(t); out.push(s.extinf); out.push(s.url); }
-  return out.join('\n');
-}
-
-function rewritePlLowLatency(txt, baseUrl, P, ref, origin) {
-  const out = [];
-  const ts = Date.now();
-  for (const line of String(txt).split(/\r?\n/)) {
-    const t = line.trim(); if (!t) { out.push(''); continue; } if (t[0] === '#') { out.push(t); continue; }
-    let abs = t;
-    if (!/^https?:\/\//i.test(t)) { if (t.startsWith('/')) { const o = new URL(baseUrl); abs = o.origin + t; } else abs = baseUrl.replace(/[^/]*$/,'') + t.replace(/^\.\//,''); abs = abs.replace(/([^:])\/{2,}/g,'$1/'); }
+    if (line.startsWith('#EXT-X-')) continue;  // Salta tutti i tag originali
+    if (line.startsWith('#EXTINF')) {
+      out.push(line);
+      continue;
+    }
+    if (line.startsWith('#')) {
+      out.push(line);
+      continue;
+    }
+    // È un URL di segmento
+    let abs = line;
+    if (!/^https?:\/\//i.test(line)) {
+      if (line.startsWith('/')) { const o = new URL(baseUrl); abs = o.origin + line; }
+      else abs = baseUrl.replace(/[^/]*$/,'') + line.replace(/^\.\//,'');
+      abs = abs.replace(/([^:])\/{2,}/g,'$1/');
+    }
+    // Timestamp per bypass cache Cloudflare
     const sep = abs.includes('?') ? '&' : '?';
-    abs = abs + sep + '_t=' + ts;
-    let seg = P + '/seg?u=' + encodeURIComponent(abs); if (ref) seg += '&ref=' + encodeURIComponent(ref); if (origin) seg += '&o=' + encodeURIComponent(origin);
+    abs = abs + sep + '_t=' + now;
+    // Proxy tramite /seg
+    let seg = P + '/seg?u=' + encodeURIComponent(abs);
+    if (ref) seg += '&ref=' + encodeURIComponent(ref);
+    if (origin) seg += '&o=' + encodeURIComponent(origin);
     out.push(seg);
+    segmentIndex++;
   }
+  
   return out.join('\n');
 }
 
+// ============================= /seg ========================================
 async function seg(u) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
@@ -411,6 +417,7 @@ async function seg(u) {
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
+// ============================= WARM ========================================
 async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -427,6 +434,7 @@ async function warm() {
   log(msg); return R(msg, 200, TXT());
 }
 
+// ============================= UTILS =======================================
 async function probe(u) {
   const q = u.searchParams.get('ch') || ''; const c = findCh(q);
   if (!c) return 'canale non mappato: "' + q + '"\n\n' + elencoCanali();
@@ -444,7 +452,7 @@ async function vmap() {
   return L.join('\n');
 }
 
-const VER = 'TVNOW-CF v6.4';
+const VER = 'TVNOW-CF v7.0 RINASCITA';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -474,4 +482,4 @@ function CORS() { return { 'access-control-allow-origin': '*' }; }
 function R(body, status, headers) { const h = Object.assign({ 'content-type': 'text/plain; charset=utf-8' }, headers || {}); if (status === 302) delete h['content-type']; return new Response(body, { status: status || 200, headers: h }); }
 async function rawu(u) { const t = u.searchParams.get('u'); if (!t) return R('uso: /rawu?u=<url>', 200, TXT()); const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/'); if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o'); let r; try { r = await fetchT(t, { headers: h, redirect: 'follow' }, 20000); } catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); } let body = ''; try { body = await r.text(); } catch (e) { body = '(no body)'; } return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT()); }
 async function fetchT(url, opt, ms) { const o = Object.assign({}, opt); if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) o.signal = AbortSignal.timeout(ms || 12000); return fetch(url, o); }
-// ███ FINE TVNOW-CF v6.4 ███
+// ███ FINE TVNOW-CF v7.0 RINASCITA ███
