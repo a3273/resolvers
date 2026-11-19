@@ -1,6 +1,7 @@
 // ============================================================
-// TVNOW-CF v9.0 Max Stability
-// Fix: canali cinema + calcio 251/252/253 | Anti-Block Max | Anti-interruzioni 30min
+// TVNOW-CF v9.1 Ultimate
+// Unisce: Architettura v9.0 (Sessioni/Anti-Block) + Resolver collaudati v8.x
+// Fix: URL reali NTV / Vavoo / Daddy | Canali cinema + 251/252/253 | Anti-interruzioni 30min
 // ============================================================
 
 const CONFIG = {
@@ -8,7 +9,7 @@ const CONFIG = {
   FAST_MODE_DEFAULT: true,
   EXTRA_KEYFRAME_SEG: 2,
   CACHE_RESOLUTIONS_TTL: 20,
-  SESSION_REFRESH_INTERVAL: 1500, // 25 minuti in secondi (prima dei 30min di scadenza token)
+  SESSION_REFRESH_INTERVAL: 1500, // 25 minuti - PRIMA della scadenza token 30min
   EXT_X_START_OFFSET: -3,
   EXT_X_VERSION: 6,
   MAX_RETRIES: 2,
@@ -18,7 +19,17 @@ const CONFIG = {
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1'
-  ]
+  ],
+  // Mirror Vavoo (come da v8.x)
+  VAVOO_MIRRORS: [
+    'https://geil.to/live/resolve?url=',
+    'https://vavoo.geil.to/live/resolve?url=',
+    'https://live.vavoo.to/hls/'
+  ],
+  // API NTV (come da v8.x)
+  NTV_RESOLVER_API: 'https://chat.cfbu247.sbs/api/resolve-dlstream/',
+  // Daddy embed base
+  DADDY_EMBED_BASE: 'https://thedaddy.to/embed/'
 };
 
 // ============================================================
@@ -38,7 +49,7 @@ const CHANNEL_DB = {
   'sky sport collection': { ntv: '872', vavoo: '186', daddy: '221' },
   'sky sport motogp': { ntv: '873', vavoo: '187', daddy: '222' },
   
-  // ===== CALCIO 251 / 252 / 253 (DAZN / Sky Extra) =====
+  // ===== CALCIO 251 / 252 / 253 =====
   '251': { ntv: '251', vavoo: '251', daddy: '251', direct: true },
   'calcio 251': { ntv: '251', vavoo: '251', daddy: '251', direct: true },
   'sky calcio 251': { ntv: '251', vavoo: '251', daddy: '251', direct: true },
@@ -118,7 +129,7 @@ const CHANNEL_DB = {
 };
 
 // ============================================================
-// SESSION STORE (per Anti-Block e Auto-Refresh)
+// SESSION STORE - Anti-Block + Auto-Refresh 25min
 // ============================================================
 const sessionStore = new Map();
 
@@ -137,7 +148,9 @@ function getOrCreateSession(provider, channelId) {
       uaIndex: Math.floor(Math.random() * CONFIG.USER_AGENT_POOL.length),
       cookies: new Map(),
       failCount: 0,
-      lastSuccess: now
+      lastSuccess: now,
+      resolvedUrl: null,
+      resolvedAt: 0
     };
     sessionStore.set(key, session);
   }
@@ -154,7 +167,7 @@ function getUA(session) {
 }
 
 // ============================================================
-// ANTI-BLOCK HEADERS GENERATOR
+// ANTI-BLOCK HEADERS
 // ============================================================
 function buildAntiBlockHeaders(session, referer = '') {
   const ua = getUA(session);
@@ -176,7 +189,6 @@ function buildAntiBlockHeaders(session, referer = '') {
   };
   if (referer) headers['Referer'] = referer;
   
-  // Aggiungi cookie dalla sessione se presenti
   if (session.cookies.size > 0) {
     const cookieStr = Array.from(session.cookies.entries())
       .map(([k, v]) => `${k}=${v}`).join('; ');
@@ -197,63 +209,12 @@ function storeCookiesFromResponse(session, response) {
 }
 
 // ============================================================
-// CHANNEL RESOLVER
-// ============================================================
-function resolveChannel(input) {
-  if (!input) return null;
-  
-  const key = input.toLowerCase().trim();
-  
-  // Cerca nel database
-  if (CHANNEL_DB[key]) return CHANNEL_DB[key];
-  
-  // Cerca per sottostringa
-  for (const [name, ids] of Object.entries(CHANNEL_DB)) {
-    if (name.includes(key) || key.includes(name)) return ids;
-  }
-  
-  // Fallback: se è puro numero, usalo direttamente come ID
-  if (/^\d+$/.test(key)) {
-    return { ntv: key, vavoo: key, daddy: key, direct: true };
-  }
-  
-  // Rimuovi spazi e riprova
-  const nospace = key.replace(/\s+/g, '');
-  if (CHANNEL_DB[nospace]) return CHANNEL_DB[nospace];
-  
-  return null;
-}
-
-// ============================================================
-// PROVIDER URL BUILDERS
-// ============================================================
-function buildProviderUrl(provider, channelId, isMaster = true) {
-  const id = encodeURIComponent(channelId);
-  
-  switch (provider) {
-    case 'ntv':
-      return isMaster 
-        ? `https://tv.ntv.cloud/live/${id}/master.m3u8`
-        : null;
-    case 'vavoo':
-      return isMaster
-        ? `https://live.vavoo.to/hls/${id}/master.m3u8`
-        : null;
-    case 'daddy':
-      return isMaster
-        ? `https://cdn.daddylive.live/hls/${id}/master.m3u8`
-        : null;
-    default:
-      return null;
-  }
-}
-
-// ============================================================
 // FETCH CON ANTI-BLOCK E RETRY
 // ============================================================
 async function fetchWithAntiBlock(url, session, options = {}) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CONFIG.DEFAULT_TIMEOUT);
+  const timeoutMs = options.timeout || CONFIG.DEFAULT_TIMEOUT;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
   const headers = buildAntiBlockHeaders(session, options.referer);
   
@@ -273,17 +234,13 @@ async function fetchWithAntiBlock(url, session, options = {}) {
   } catch (err) {
     clearTimeout(timeoutId);
     session.failCount++;
-    
-    // Rotazione UA per prossimo tentativo
     rotateUA(session);
     
     if (session.failCount <= CONFIG.MAX_RETRIES) {
-      // Nuovo tentativo con UA diverso
-      const headers2 = buildAntiBlockHeaders(session, options.referer);
       const controller2 = new AbortController();
-      const timeoutId2 = setTimeout(() => controller2.abort(), CONFIG.DEFAULT_TIMEOUT);
-      
+      const timeoutId2 = setTimeout(() => controller2.abort(), timeoutMs);
       try {
+        const headers2 = buildAntiBlockHeaders(session, options.referer);
         const resp = await fetch(url, {
           headers: headers2,
           signal: controller2.signal,
@@ -303,6 +260,192 @@ async function fetchWithAntiBlock(url, session, options = {}) {
 }
 
 // ============================================================
+// ⭐ RESOLVER PROVIDER - COLLAUDATI v8.x ⭐
+// ============================================================
+
+/**
+ * NTV: usa API di risoluzione reale
+ */
+async function resolveNtv(channelId, session) {
+  const apiUrl = `${CONFIG.NTV_RESOLVER_API}${encodeURIComponent(channelId)}`;
+  
+  try {
+    const resp = await fetchWithAntiBlock(apiUrl, session, { timeout: 3000 });
+    if (!resp.ok) throw new Error(`NTV API HTTP ${resp.status}`);
+    
+    const text = await resp.text();
+    
+    // L'API può restituire direttamente URL o JSON
+    let m3u8Url = null;
+    
+    try {
+      const json = JSON.parse(text);
+      m3u8Url = json.url || json.m3u8 || json.stream || json.data?.url;
+    } catch {
+      // Non è JSON: cerca URL m3u8 nel testo
+      const match = text.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/i);
+      if (match) m3u8Url = match[0];
+    }
+    
+    if (!m3u8Url) {
+      // Fallback: costruisci URL diretto come ultima spiaggia
+      m3u8Url = `https://tv.ntv.cloud/live/${channelId}/master.m3u8`;
+    }
+    
+    return m3u8Url;
+  } catch (err) {
+    throw new Error(`NTV resolve fallito: ${err.message}`);
+  }
+}
+
+/**
+ * Vavoo: usa mirror geil.to per la risoluzione
+ */
+async function resolveVavoo(channelId, session) {
+  // Prova ogni mirror
+  for (const mirror of CONFIG.VAVOO_MIRRORS) {
+    try {
+      let resolveUrl;
+      
+      if (mirror.includes('/resolve?url=')) {
+        // Mirror con API resolve: costruisci URL Vavoo e passalo al resolver
+        const vavooStreamUrl = `https://live.vavoo.to/hls/${channelId}/master.m3u8`;
+        resolveUrl = mirror + encodeURIComponent(vavooStreamUrl);
+      } else {
+        // Mirror diretto
+        resolveUrl = `${mirror}${channelId}/master.m3u8`;
+      }
+      
+      const resp = await fetchWithAntiBlock(resolveUrl, session, { timeout: 3000 });
+      
+      if (resp.ok) {
+        const text = await resp.text();
+        
+        // Cerca URL m3u8 nella risposta
+        let m3u8Url = null;
+        try {
+          const json = JSON.parse(text);
+          m3u8Url = json.url || json.m3u8 || json.stream || json.data?.url;
+        } catch {
+          const match = text.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/i);
+          if (match) m3u8Url = match[0];
+        }
+        
+        if (m3u8Url) return m3u8Url;
+        
+        // Se la risposta è già una playlist valida, restituisci l'URL usato
+        if (text.includes('#EXTM3U')) return resolveUrl;
+      }
+    } catch (e) {
+      continue; // Prova prossimo mirror
+    }
+  }
+  
+  throw new Error('Vavoo: tutti i mirror falliti');
+}
+
+/**
+ * DaddyLive: estrai m3u8 dalla pagina embed
+ */
+async function resolveDaddy(channelId, session) {
+  const embedUrl = `${CONFIG.DADDY_EMBED_BASE}${encodeURIComponent(channelId)}`;
+  
+  try {
+    const resp = await fetchWithAntiBlock(embedUrl, session, { 
+      timeout: 3000,
+      referer: 'https://thedaddy.to/'
+    });
+    
+    if (!resp.ok) throw new Error(`Daddy embed HTTP ${resp.status}`);
+    
+    const html = await resp.text();
+    
+    // Cerca URL m3u8 nell'HTML/JS della pagina
+    const patterns = [
+      /source:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/i,
+      /file:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/i,
+      /src:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/i,
+      /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i,
+      /https?:\/\/[^<>"'\s]+\.m3u8[^<>"'\s]*/i
+    ];
+    
+    for (const pattern of patterns) {
+      const match = html.match(pattern);
+      if (match) {
+        let url = match[1] || match[0];
+        // Gestisci URL relativi
+        if (!url.startsWith('http')) {
+          try {
+            url = new URL(url, embedUrl).toString();
+          } catch {}
+        }
+        return url;
+      }
+    }
+    
+    // Fallback: URL diretto
+    return `https://cdn.daddylive.live/hls/${channelId}/master.m3u8`;
+    
+  } catch (err) {
+    throw new Error(`Daddy resolve fallito: ${err.message}`);
+  }
+}
+
+/**
+ * Resolver principale: restituisce URL m3u8 per un canale su un provider
+ */
+async function resolveChannelUrl(provider, channelId, session, forceRefresh = false) {
+  const now = Math.floor(Date.now() / 1000);
+  
+  // Usa cache in sessione se valida e non forzato refresh
+  if (!forceRefresh && session.resolvedUrl && (now - session.resolvedAt) < CONFIG.SESSION_REFRESH_INTERVAL) {
+    return session.resolvedUrl;
+  }
+  
+  let url;
+  switch (provider) {
+    case 'ntv':
+      url = await resolveNtv(channelId, session);
+      break;
+    case 'vavoo':
+      url = await resolveVavoo(channelId, session);
+      break;
+    case 'daddy':
+      url = await resolveDaddy(channelId, session);
+      break;
+    default:
+      throw new Error(`Provider sconosciuto: ${provider}`);
+  }
+  
+  session.resolvedUrl = url;
+  session.resolvedAt = now;
+  return url;
+}
+
+// ============================================================
+// CHANNEL RESOLVER (nome → ID)
+// ============================================================
+function resolveChannel(input) {
+  if (!input) return null;
+  const key = input.toLowerCase().trim();
+  
+  if (CHANNEL_DB[key]) return CHANNEL_DB[key];
+  
+  for (const [name, ids] of Object.entries(CHANNEL_DB)) {
+    if (name.includes(key) || key.includes(name)) return ids;
+  }
+  
+  if (/^\d+$/.test(key)) {
+    return { ntv: key, vavoo: key, daddy: key, direct: true };
+  }
+  
+  const nospace = key.replace(/\s+/g, '');
+  if (CHANNEL_DB[nospace]) return CHANNEL_DB[nospace];
+  
+  return null;
+}
+
+// ============================================================
 // PARSE HLS PLAYLIST
 // ============================================================
 function parseHlsPlaylist(content) {
@@ -316,7 +459,8 @@ function parseHlsPlaylist(content) {
     segments: [],
     map: null,
     start: null,
-    discontinuitySequence: 0
+    discontinuitySequence: 0,
+    _nextHasDiscontinuity: false
   };
   
   let i = 0;
@@ -332,7 +476,6 @@ function parseHlsPlaylist(content) {
     } else if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) {
       result.discontinuitySequence = parseInt(line.split(':')[1]) || 0;
     } else if (line.startsWith('#EXT-X-STREAM-INF:')) {
-      // Variante nella master playlist
       result.isMaster = true;
       const attrs = parseAttributes(line.split(':')[1]);
       const uri = lines[i + 1] && !lines[i + 1].startsWith('#') ? lines[i + 1] : '';
@@ -359,13 +502,11 @@ function parseHlsPlaylist(content) {
     i++;
   }
   
-  delete result._nextHasDiscontinuity;
   return result;
 }
 
 function parseAttributes(attrStr) {
   const result = {};
-  // Regex per catturare KEY=VALUE o KEY="VALUE"
   const regex = /([A-Z0-9-]+)=(?:"([^"]*)"|([^,]+))/g;
   let match;
   while ((match = regex.exec(attrStr)) !== null) {
@@ -375,7 +516,7 @@ function parseAttributes(attrStr) {
 }
 
 // ============================================================
-// PROCESS MASTER PLAYLIST - FILTRO H.264
+// FILTRO H.264 (FONDAMENTALE per schermo grigio!)
 // ============================================================
 function filterVariants(variants, forceH264 = false, variantIndex = -1) {
   if (variantIndex >= 0 && variantIndex < variants.length) {
@@ -384,31 +525,46 @@ function filterVariants(variants, forceH264 = false, variantIndex = -1) {
   
   if (!forceH264) return variants;
   
-  // Filtra solo varianti H.264
   const h264Variants = variants.filter(v => {
     const codecs = (v.CODECS || '').toLowerCase();
-    return codecs.includes('avc1') || !codecs.includes('hvc1') && !codecs.includes('hev1');
+    return codecs.includes('avc1') || (!codecs.includes('hvc1') && !codecs.includes('hev1'));
   });
   
   return h264Variants.length > 0 ? h264Variants : variants;
 }
 
+function selectBestVariant(variants) {
+  const scored = variants.map((v, i) => {
+    let score = 0;
+    const codecs = (v.CODECS || '').toLowerCase();
+    const res = v.RESOLUTION || '';
+    
+    if (codecs.includes('avc1')) score += 100;
+    if (codecs.includes('hvc1') || codecs.includes('hev1')) score -= 50;
+    if (res.includes('1280x720') || res.includes('720')) score += 50;
+    if (res.includes('1920x1080') || res.includes('1080')) score += 30;
+    if (res.includes('854x480') || res.includes('480')) score += 20;
+    
+    return { v, score, i };
+  });
+  
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].v;
+}
+
 // ============================================================
-// PROCESS MEDIA PLAYLIST - FINESTRA OTTIMIZZATA
+// BUILD PLAYLIST OTTIMIZZATA
 // ============================================================
 function buildOptimizedMediaPlaylist(parsed, baseUrl, fastMode = true) {
   const { segments, targetDuration, mediaSequence, version, map, discontinuitySequence } = parsed;
   
   if (segments.length === 0) return null;
   
-  // Calcola indice di inizio: dalla fine, abbastanza indietro per keyframe
   let startIdx;
   
   if (fastMode) {
-    // Fast mode: inizia da 2 segmenti extra + cerca discontinuità
     startIdx = Math.max(0, segments.length - 4 - CONFIG.EXTRA_KEYFRAME_SEG);
     
-    // Se il segmento di inizio ha una discontinuità prima, sposta ancora indietro
     for (let i = startIdx; i < segments.length && i < startIdx + 3; i++) {
       if (segments[i]?.hasDiscontinuity && i > 0) {
         startIdx = Math.max(0, i - 1);
@@ -422,11 +578,9 @@ function buildOptimizedMediaPlaylist(parsed, baseUrl, fastMode = true) {
   const selectedSegments = segments.slice(startIdx);
   const newMediaSequence = mediaSequence + startIdx;
   
-  // Calcola TIME-OFFSET per EXT-X-START
   const totalBackDuration = selectedSegments.slice(0, -1).reduce((sum, s) => sum + s.duration, 0);
   const startOffset = Math.max(CONFIG.EXT_X_START_OFFSET, -totalBackDuration);
   
-  // Costruisci playlist
   let output = '#EXTM3U\n';
   output += `#EXT-X-VERSION:${Math.max(version, CONFIG.EXT_X_VERSION)}\n`;
   output += `#EXT-X-TARGETDURATION:${Math.ceil(targetDuration)}\n`;
@@ -434,7 +588,6 @@ function buildOptimizedMediaPlaylist(parsed, baseUrl, fastMode = true) {
   output += `#EXT-X-DISCONTINUITY-SEQUENCE:${discontinuitySequence}\n`;
   output += `#EXT-X-START:TIME-OFFSET=${startOffset},PRECISE=NO\n`;
   
-  // EXT-X-MAP subito dopo gli header (fondamentale per fMP4)
   if (map) {
     const mapUri = map.URI || map.uri || '';
     const absoluteMapUri = resolveUri(mapUri, baseUrl);
@@ -444,7 +597,6 @@ function buildOptimizedMediaPlaylist(parsed, baseUrl, fastMode = true) {
     output += '\n';
   }
   
-  // Segmenti
   for (const seg of selectedSegments) {
     if (seg.hasDiscontinuity) {
       output += '#EXT-X-DISCONTINUITY\n';
@@ -478,47 +630,17 @@ export default {
     const path = url.pathname;
     
     try {
-      // ===== /live - Endpoint principale streaming =====
-      if (path === '/live' || path === '/') {
-        return handleLive(url, request);
-      }
+      if (path === '/live' || path === '/') return handleLive(url);
+      if (path === '/seg') return handleSegment(url);
+      if (path === '/analyze') return handleAnalyze(url);
+      if (path === '/diag') return handleDiag(url);
+      if (path === '/checkseg') return handleCheckSeg(url);
+      if (path === '/vmap') return handleVariants(url);
+      if (path === '/ch') return handleChannelList(url);
+      if (path === '/debug') return handleDebug();
+      if (path === '/resolve') return handleResolveDebug(url);
       
-      // ===== /seg - Proxy segmenti =====
-      if (path === '/seg') {
-        return handleSegment(url, request);
-      }
-      
-      // ===== /analyze - Diagnostica canale =====
-      if (path === '/analyze') {
-        return handleAnalyze(url);
-      }
-      
-      // ===== /diag - Diagnostica rapida =====
-      if (path === '/diag') {
-        return handleDiag(url);
-      }
-      
-      // ===== /checkseg - Check segmenti =====
-      if (path === '/checkseg') {
-        return handleCheckSeg(url);
-      }
-      
-      // ===== /vmap - Varianti disponibili =====
-      if (path === '/vmap') {
-        return handleVariants(url);
-      }
-      
-      // ===== /ch - Lista canali =====
-      if (path === '/ch') {
-        return handleChannelList(url);
-      }
-      
-      // ===== /debug - Info sistema =====
-      if (path === '/debug') {
-        return handleDebug();
-      }
-      
-      return new Response('TVNOW-CF v9.0 Max Stability - Endpoint: /live?ch=nome_canale', {
+      return new Response('TVNOW-CF v9.1 Ultimate - Usa: /live?ch=nome_canale', {
         headers: { 'Content-Type': 'text/plain' }
       });
       
@@ -534,13 +656,14 @@ export default {
 // ============================================================
 // HANDLER: /live
 // ============================================================
-async function handleLive(url, originalRequest) {
+async function handleLive(url) {
   const chParam = url.searchParams.get('ch') || '';
   const providerParam = url.searchParams.get('p') || 'ntv,vavoo,daddy';
   const fastMode = url.searchParams.get('fast') !== '0';
   const forceH264 = url.searchParams.get('force_h264') === '1';
   const variantIndex = parseInt(url.searchParams.get('variant') || '-1');
   const safeMode = url.searchParams.get('safe') === '1';
+  const forceRefresh = url.searchParams.get('refresh') === '1';
   
   if (!chParam) {
     return new Response('Specificare un canale: /live?ch=rai1 o /live?ch=577', {
@@ -558,8 +681,6 @@ async function handleLive(url, originalRequest) {
   }
   
   const providers = providerParam.split(',').map(p => p.trim());
-  
-  // Prova ogni provider in ordine
   let lastError = null;
   
   for (const provider of providers) {
@@ -568,28 +689,45 @@ async function handleLive(url, originalRequest) {
     
     try {
       const session = getOrCreateSession(provider, channelId);
-      const masterUrl = buildProviderUrl(provider, channelId, true);
-      
-      if (!masterUrl) continue;
-      
-      // Forza refresh sessione se è scaduto il tempo (Anti-interruzione 30min)
       const now = Math.floor(Date.now() / 1000);
-      if ((now - session.createdAt) > CONFIG.SESSION_REFRESH_INTERVAL) {
+      
+      // 🔄 Auto-refresh sessione ogni 25 minuti (Anti-interruzione 30min!)
+      if (forceRefresh || (now - session.createdAt) > CONFIG.SESSION_REFRESH_INTERVAL) {
         sessionStore.delete(getSessionKey(provider, channelId));
-        getOrCreateSession(provider, channelId); // Crea nuova sessione fresca
+        const fresh = getOrCreateSession(provider, channelId);
+        Object.assign(session, fresh);
       }
       
-      const masterResp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0 });
+      // ⭐ Risolvi URL con i resolver collaudati
+      const masterUrl = await resolveChannelUrl(provider, channelId, session, forceRefresh);
       
-      if (!masterResp.ok) {
-        lastError = `Provider ${provider}: HTTP ${masterResp.status}`;
+      if (!masterUrl) {
+        lastError = `${provider}: URL non risolto`;
         continue;
       }
       
-      const masterContent = await masterResp.text();
+      const masterResp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0, timeout: 3000 });
+      
+      if (!masterResp.ok) {
+        // Se fallisce, forza refresh URL e riprova una volta
+        session.resolvedUrl = null;
+        const masterUrl2 = await resolveChannelUrl(provider, channelId, session, true);
+        const masterResp2 = await fetchWithAntiBlock(masterUrl2, session, { cacheTtl: 0, timeout: 3000 });
+        
+        if (!masterResp2.ok) {
+          lastError = `${provider}: HTTP ${masterResp2.status}`;
+          continue;
+        }
+      }
+      
+      const masterContent = await (masterResp.ok ? masterResp.text() : (async () => {
+        const r = await fetchWithAntiBlock(await resolveChannelUrl(provider, channelId, session, true), session, { cacheTtl: 0 });
+        return r.text();
+      })());
+      
       const parsed = parseHlsPlaylist(masterContent);
       
-      // Se è una media playlist direttamente
+      // Caso 1: è già una media playlist
       if (!parsed.isMaster && parsed.segments.length > 0) {
         const optimized = buildOptimizedMediaPlaylist(parsed, masterUrl, fastMode && !safeMode);
         if (optimized) {
@@ -597,20 +735,21 @@ async function handleLive(url, originalRequest) {
             headers: {
               'Content-Type': 'application/vnd.apple.mpegurl',
               'Cache-Control': 'no-cache, no-store, must-revalidate',
-              'Access-Control-Allow-Origin': '*'
+              'Access-Control-Allow-Origin': '*',
+              'X-Provider': provider,
+              'X-Session-Age': `${now - session.createdAt}s`
             }
           });
         }
       }
       
-      // Se è una master playlist
+      // Caso 2: è una master playlist
       if (parsed.isMaster && parsed.variants.length > 0) {
-        // Se richiesto lista varianti
         if (url.searchParams.get('list_variants') === '1') {
           const list = parsed.variants.map((v, i) => 
-            `[${i}] ${v.RESOLUTION || '?'} | ${v.CODECS || '?'} | ${v.BANDWIDTH ? (v.BANDWIDTH/1000).toFixed(0)+'kbps' : '?'}`
+            `[${i}] ${v.RESOLUTION || '?'} | ${v.CODECS || '?'} | ${v.BANDWIDTH ? (v.BANDWIDTH/1000).toFixed(0)+'kbps' : ''}`
           ).join('\n');
-          return new Response(`Varianti per ${chParam} (${provider}):\n${list}`, {
+          return new Response(`Varianti ${provider}:\n${list}`, {
             headers: { 'Content-Type': 'text/plain' }
           });
         }
@@ -618,23 +757,20 @@ async function handleLive(url, originalRequest) {
         const filtered = filterVariants(parsed.variants, forceH264, variantIndex);
         
         if (filtered.length === 0) {
-          lastError = `Nessuna variante H.264 disponibile su ${provider}`;
+          lastError = `${provider}: nessuna variante H.264`;
           continue;
         }
         
-        // Seleziona la variante migliore o quella specificata
         const selected = variantIndex >= 0 ? filtered[0] : selectBestVariant(filtered);
-        
-        // Ottieni la media playlist
         const mediaUrl = resolveUri(selected.uri, masterUrl);
+        
         const mediaSession = getOrCreateSession(provider, channelId + ':media');
         const mediaResp = await fetchWithAntiBlock(mediaUrl, mediaSession, { 
-          cacheTtl: 0, 
-          referer: masterUrl 
+          cacheTtl: 0, referer: masterUrl, timeout: 3000 
         });
         
         if (!mediaResp.ok) {
-          lastError = `Media playlist ${provider}: HTTP ${mediaResp.status}`;
+          lastError = `${provider}: media HTTP ${mediaResp.status}`;
           continue;
         }
         
@@ -642,7 +778,7 @@ async function handleLive(url, originalRequest) {
         const parsedMedia = parseHlsPlaylist(mediaContent);
         
         if (parsedMedia.segments.length === 0) {
-          lastError = `Nessun segmento su ${provider}`;
+          lastError = `${provider}: nessun segmento`;
           continue;
         }
         
@@ -655,7 +791,8 @@ async function handleLive(url, originalRequest) {
               'Cache-Control': 'no-cache, no-store, must-revalidate',
               'Access-Control-Allow-Origin': '*',
               'X-Provider': provider,
-              'X-Variant': `${selected.RESOLUTION || '?'} ${selected.CODECS || ''}`
+              'X-Variant': `${selected.RESOLUTION || '?'} ${selected.CODECS || ''}`,
+              'X-Session-Age': `${now - session.createdAt}s`
             }
           });
         }
@@ -673,42 +810,17 @@ async function handleLive(url, originalRequest) {
   });
 }
 
-function selectBestVariant(variants) {
-  // Preferisce 720p H.264, altrimenti la prima disponibile
-  const scored = variants.map((v, i) => {
-    let score = 0;
-    const codecs = (v.CODECS || '').toLowerCase();
-    const res = v.RESOLUTION || '';
-    
-    if (codecs.includes('avc1')) score += 100; // H.264
-    if (codecs.includes('hvc1') || codecs.includes('hev1')) score -= 50; // HEVC
-    
-    if (res.includes('1280x720') || res.includes('720')) score += 50;
-    if (res.includes('1920x1080') || res.includes('1080')) score += 30;
-    if (res.includes('854x480') || res.includes('480')) score += 20;
-    
-    return { v, score, i };
-  });
-  
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0].v;
-}
-
 // ============================================================
-// HANDLER: /seg - Proxy segmenti
+// HANDLER: /seg
 // ============================================================
-async function handleSegment(url, originalRequest) {
+async function handleSegment(url) {
   const segUrl = url.searchParams.get('url');
   const isInit = url.searchParams.get('init') === '1';
   
-  if (!segUrl) {
-    return new Response('URL segmento mancante', { status: 400 });
-  }
+  if (!segUrl) return new Response('URL mancante', { status: 400 });
   
   try {
     const decodedUrl = decodeURIComponent(segUrl);
-    
-    // Estrai provider dal dominio per la sessione
     const provider = detectProviderFromUrl(decodedUrl);
     const session = getOrCreateSession(provider || 'generic', 'segment');
     
@@ -716,7 +828,6 @@ async function handleSegment(url, originalRequest) {
     const timeout = setTimeout(() => controller.abort(), isInit ? 3000 : 2000);
     
     const headers = buildAntiBlockHeaders(session);
-    // Per init segment: bypass assoluto cache
     if (isInit) {
       headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
       headers['Pragma'] = 'no-cache';
@@ -731,30 +842,21 @@ async function handleSegment(url, originalRequest) {
     clearTimeout(timeout);
     storeCookiesFromResponse(session, resp);
     
-    // Costruisci headers di risposta - NON copiare ciecamente Content-Length se chunked
     const respHeaders = new Headers();
-    const contentType = resp.headers.get('content-type') || 'video/mp2t';
-    respHeaders.set('Content-Type', contentType);
+    respHeaders.set('Content-Type', resp.headers.get('content-type') || 'video/mp2t');
     respHeaders.set('Access-Control-Allow-Origin', '*');
     
     const cl = resp.headers.get('content-length');
     const te = resp.headers.get('transfer-encoding');
     
-    // Fondamentale: non copiare Content-Length se c'è Transfer-Encoding chunked
-    if (cl && !te) {
-      respHeaders.set('Content-Length', cl);
-    }
+    // ⚠️ Fondamentale: NON copiare Content-Length se Transfer-Encoding: chunked
+    if (cl && !te) respHeaders.set('Content-Length', cl);
     
-    if (isInit) {
-      respHeaders.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-    } else {
-      respHeaders.set('Cache-Control', 'public, max-age=5');
-    }
+    respHeaders.set('Cache-Control', isInit 
+      ? 'no-store, no-cache, must-revalidate' 
+      : 'public, max-age=5');
     
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: respHeaders
-    });
+    return new Response(resp.body, { status: resp.status, headers: respHeaders });
     
   } catch (err) {
     return new Response(`Errore segmento: ${err.message}`, { status: 502 });
@@ -762,9 +864,9 @@ async function handleSegment(url, originalRequest) {
 }
 
 function detectProviderFromUrl(url) {
-  if (url.includes('ntv.cloud')) return 'ntv';
-  if (url.includes('vavoo.to')) return 'vavoo';
-  if (url.includes('daddylive')) return 'daddy';
+  if (url.includes('ntv.cloud') || url.includes('cfbu247')) return 'ntv';
+  if (url.includes('vavoo') || url.includes('geil.to')) return 'vavoo';
+  if (url.includes('daddy') || url.includes('daddylive')) return 'daddy';
   return null;
 }
 
@@ -778,85 +880,74 @@ async function handleAnalyze(url) {
   const channel = resolveChannel(ch);
   if (!channel) return new Response('Canale non trovato', { status: 404 });
   
-  let report = `=== ANALISI CANALE: ${ch} ===\n\n`;
-  report += `Mapping trovato: ${JSON.stringify(channel, null, 2)}\n\n`;
+  let report = `=== ANALISI CANALE: ${ch} (v9.1 Ultimate) ===\n\n`;
+  report += `Mapping: ${JSON.stringify(channel, null, 2)}\n\n`;
   
   for (const provider of ['ntv', 'vavoo', 'daddy']) {
     const id = channel[provider];
     if (!id) continue;
     
-    report += `--- PROVIDER: ${provider.toUpperCase()} (ID: ${id}) ---\n`;
+    report += `--- ${provider.toUpperCase()} (ID: ${id}) ---\n`;
     
     try {
       const session = getOrCreateSession(provider, id);
-      const masterUrl = buildProviderUrl(provider, id, true);
-      report += `URL: ${masterUrl}\n`;
-      
       const t0 = Date.now();
-      const resp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0 });
+      const resolved = await resolveChannelUrl(provider, id, session, true);
       const t1 = Date.now();
       
-      report += `Status: ${resp.status} ${resp.statusText}\n`;
-      report += `Tempo risposta: ${t1 - t0}ms\n`;
-      report += `UA usato: ${getUA(session).substring(0, 60)}...\n`;
+      report += `✅ URL risolto: ${resolved.substring(0, 80)}...\n`;
+      report += `Tempo resolve: ${t1 - t0}ms\n`;
+      report += `UA: ${getUA(session).substring(0, 50)}...\n`;
+      
+      const t2 = Date.now();
+      const resp = await fetchWithAntiBlock(resolved, session, { cacheTtl: 0, timeout: 3000 });
+      const t3 = Date.now();
+      
+      report += `Fetch status: ${resp.status} (${t3 - t2}ms)\n`;
       
       if (resp.ok) {
         const content = await resp.text();
         const parsed = parseHlsPlaylist(content);
         
         if (parsed.isMaster) {
-          report += `Tipo: MASTER PLAYLIST\n`;
-          report += `Varianti trovate: ${parsed.variants.length}\n`;
+          report += `Tipo: MASTER | Varianti: ${parsed.variants.length}\n`;
           parsed.variants.forEach((v, i) => {
-            const isH264 = (v.CODECS || '').toLowerCase().includes('avc1');
-            const isHEVC = (v.CODECS || '').toLowerCase().includes('hvc1') || 
-                          (v.CODECS || '').toLowerCase().includes('hev1');
-            report += `  [${i}] ${v.RESOLUTION || '?'} | ${v.CODECS || '?'} | ${(v.BANDWIDTH/1000).toFixed(0)}kbps`;
-            report += isH264 ? ' [H.264 OK]' : isHEVC ? ' [HEVC - rischio schermo grigio]' : '';
-            report += '\n';
+            const c = (v.CODECS || '').toLowerCase();
+            const h264 = c.includes('avc1') ? '✅H264' : (c.includes('hvc1')||c.includes('hev1') ? '⚠️HEVC' : '❓');
+            report += `  [${i}] ${v.RESOLUTION||'?'} | ${v.CODECS||'?'} | ${h264}\n`;
           });
-          
-          // Prova a caricare la prima variante
-          if (parsed.variants.length > 0) {
-            const mediaUrl = resolveUri(parsed.variants[0].uri, masterUrl);
-            report += `\n  Media playlist URL: ${mediaUrl.substring(0, 80)}...\n`;
-            
-            try {
-              const mediaSession = getOrCreateSession(provider, id + ':media');
-              const mediaResp = await fetchWithAntiBlock(mediaUrl, mediaSession, { cacheTtl: 0 });
-              if (mediaResp.ok) {
-                const mediaContent = await mediaResp.text();
-                const mediaParsed = parseHlsPlaylist(mediaContent);
-                report += `  Segmenti: ${mediaParsed.segments.length}\n`;
-                report += `  TargetDuration: ${mediaParsed.targetDuration}s\n`;
-                report += `  MediaSequence: ${mediaParsed.mediaSequence}\n`;
-                report += `  Ha MAP (fMP4): ${mediaParsed.map ? 'SI' : 'NO'}\n`;
-                if (mediaParsed.map) {
-                  report += `    MAP URI: ${mediaParsed.map.URI || mediaParsed.map.uri}\n`;
-                }
-                if (mediaParsed.segments.length > 0) {
-                  report += `  Primo segmento durata: ${mediaParsed.segments[0].duration}s\n`;
-                  report += `  Primo segmento ha DISCONTINUITY prima: ${mediaParsed.segments[0].hasDiscontinuity ? 'SI' : 'NO'}\n`;
-                }
-              }
-            } catch (e) {
-              report += `  Errore media playlist: ${e.message}\n`;
-            }
-          }
         } else {
-          report += `Tipo: MEDIA PLAYLIST\n`;
-          report += `Segmenti: ${parsed.segments.length}\n`;
-          report += `TargetDuration: ${parsed.targetDuration}s\n`;
-          report += `Ha MAP: ${parsed.map ? 'SI' : 'NO'}\n`;
+          report += `Tipo: MEDIA | Segmenti: ${parsed.segments.length} | MAP: ${parsed.map ? 'SI' : 'NO'}\n`;
         }
       }
     } catch (err) {
-      report += `ERRORE: ${err.message}\n`;
+      report += `❌ ERRORE: ${err.message}\n`;
     }
     report += '\n';
   }
   
   return new Response(report, { headers: { 'Content-Type': 'text/plain' } });
+}
+
+// ============================================================
+// HANDLER: /resolve (debug resolver)
+// ============================================================
+async function handleResolveDebug(url) {
+  const ch = url.searchParams.get('ch') || '';
+  const provider = url.searchParams.get('p') || 'ntv';
+  
+  if (!ch) return new Response('?ch=canale&p=ntv|vavoo|daddy', { status: 400 });
+  
+  const channel = resolveChannel(ch);
+  if (!channel || !channel[provider]) return new Response('Canale/provider non trovato', { status: 404 });
+  
+  const session = getOrCreateSession(provider, channel[provider]);
+  const resolved = await resolveChannelUrl(provider, channel[provider], session, true);
+  
+  return new Response(
+    `Provider: ${provider}\nCanale: ${ch}\nID: ${channel[provider]}\nURL risolto:\n${resolved}`,
+    { headers: { 'Content-Type': 'text/plain' } }
+  );
 }
 
 // ============================================================
@@ -877,40 +968,32 @@ async function handleDiag(url) {
     
     try {
       const session = getOrCreateSession(provider, id);
-      const masterUrl = buildProviderUrl(provider, id, true);
       const t0 = Date.now();
-      const resp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0 });
+      const resolved = await resolveChannelUrl(provider, id, session, true);
+      const resp = await fetchWithAntiBlock(resolved, session, { cacheTtl: 0, timeout: 3000 });
       const t1 = Date.now();
       
       if (resp.ok) {
         const content = await resp.text();
         const parsed = parseHlsPlaylist(content);
-        
-        let variantInfo = '';
-        if (parsed.isMaster && parsed.variants.length > 0) {
-          const hasH264 = parsed.variants.some(v => 
-            (v.CODECS || '').toLowerCase().includes('avc1')
-          );
-          const hasHEVC = parsed.variants.some(v => {
-            const c = (v.CODECS || '').toLowerCase();
-            return c.includes('hvc1') || c.includes('hev1');
-          });
-          variantInfo = `|varianti:${parsed.variants.length}|H264:${hasH264 ? 'SI' : 'NO'}|HEVC:${hasHEVC ? 'SI' : 'NO'}`;
+        let info = '';
+        if (parsed.isMaster) {
+          const hasH264 = parsed.variants.some(v => (v.CODECS||'').toLowerCase().includes('avc1'));
+          info = `MASTER ${parsed.variants.length}var H264:${hasH264?'SI':'NO'}`;
+        } else {
+          info = `MEDIA ${parsed.segments.length}seg`;
         }
-        
-        results.push(`${provider.toUpperCase()}: OK ${t1-t0}ms ${variantInfo}`);
+        results.push(`${provider.toUpperCase()}: ✅ OK ${t1-t0}ms | ${info}`);
       } else {
-        results.push(`${provider.toUpperCase()}: HTTP ${resp.status}`);
+        results.push(`${provider.toUpperCase()}: ⚠️ HTTP ${resp.status}`);
       }
     } catch (e) {
-      results.push(`${provider.toUpperCase()}: FAIL (${e.message})`);
+      results.push(`${provider.toUpperCase()}: ❌ FAIL (${e.message})`);
     }
   }
   
   return new Response(
-    `DIAG: ${ch}\n` + 
-    `Risolto come: ${JSON.stringify(channel)}\n\n` +
-    results.join('\n'),
+    `DIAG v9.1: ${ch}\nRisolto come: ${JSON.stringify(channel)}\n\n${results.join('\n')}`,
     { headers: { 'Content-Type': 'text/plain' } }
   );
 }
@@ -924,8 +1007,11 @@ async function handleCheckSeg(url) {
   
   if (!ch) return new Response('?s=ntv&ch=ID', { status: 400 });
   
-  const session = getOrCreateSession(source, ch);
-  const masterUrl = buildProviderUrl(source, ch, true);
+  const channel = resolveChannel(ch);
+  const id = channel?.[source] || ch;
+  
+  const session = getOrCreateSession(source, id);
+  const masterUrl = await resolveChannelUrl(source, id, session, true);
   
   try {
     const resp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0 });
@@ -936,8 +1022,7 @@ async function handleCheckSeg(url) {
     if (parsed.isMaster && parsed.variants.length > 0) {
       mediaUrl = resolveUri(parsed.variants[0].uri, masterUrl);
       const mediaResp = await fetchWithAntiBlock(mediaUrl, session, { cacheTtl: 0 });
-      const mediaContent = await mediaResp.text();
-      return analyzeSegments(mediaContent, mediaUrl);
+      return analyzeSegments(await mediaResp.text(), mediaUrl);
     }
     
     return analyzeSegments(content, mediaUrl);
@@ -948,14 +1033,11 @@ async function handleCheckSeg(url) {
 
 function analyzeSegments(content, baseUrl) {
   const parsed = parseHlsPlaylist(content);
-  let report = `Segmenti totali: ${parsed.segments.length}\n`;
-  report += `TargetDuration: ${parsed.targetDuration}s\n`;
-  report += `MediaSequence: ${parsed.mediaSequence}\n`;
-  report += `Ha MAP: ${parsed.map ? 'SI - ' + (parsed.map.URI || parsed.map.uri) : 'NO'}\n\n`;
+  let report = `Segmenti: ${parsed.segments.length} | TargetDur: ${parsed.targetDuration}s | MAP: ${parsed.map ? 'SI' : 'NO'}\n\n`;
   
   parsed.segments.forEach((s, i) => {
     const abs = resolveUri(s.uri, baseUrl);
-    report += `[${i}] dur:${s.duration.toFixed(2)}s disc:${s.hasDiscontinuity ? 'SI' : 'NO'} ${abs.substring(0, 60)}...\n`;
+    report += `[${i}] ${s.duration.toFixed(2)}s disc:${s.hasDiscontinuity ? 'SI' : 'NO'} ${abs.substring(0, 70)}...\n`;
   });
   
   return new Response(report, { headers: { 'Content-Type': 'text/plain' } });
@@ -981,26 +1063,18 @@ async function handleVariants(url) {
     
     try {
       const session = getOrCreateSession(provider, id);
-      const masterUrl = buildProviderUrl(provider, id, true);
+      const masterUrl = await resolveChannelUrl(provider, id, session, true);
       const resp = await fetchWithAntiBlock(masterUrl, session, { cacheTtl: 0 });
       
       if (resp.ok) {
-        const content = await resp.text();
-        const parsed = parseHlsPlaylist(content);
-        
+        const parsed = parseHlsPlaylist(await resp.text());
         if (parsed.isMaster) {
           parsed.variants.forEach((v, i) => {
-            report += `[${i}] RES=${v.RESOLUTION || '?'} CODECS=${v.CODECS || '?'} BW=${v.BANDWIDTH ? (v.BANDWIDTH/1000).toFixed(0)+'kbps' : '?'}\n`;
+            report += `[${i}] RES=${v.RESOLUTION||'?'} CODECS=${v.CODECS||'?'} BW=${v.BANDWIDTH?(v.BANDWIDTH/1000).toFixed(0)+'kbps':'?'}\n`;
           });
-        } else {
-          report += '(è direttamente una media playlist)\n';
-        }
-      } else {
-        report += `HTTP ${resp.status}\n`;
-      }
-    } catch (e) {
-      report += `ERRORE: ${e.message}\n`;
-    }
+        } else report += '(media playlist)\n';
+      } else report += `HTTP ${resp.status}\n`;
+    } catch (e) { report += `ERRORE: ${e.message}\n`; }
     report += '\n';
   }
   
@@ -1016,28 +1090,21 @@ async function handleChannelList(url) {
   const pageSize = 50;
   
   let channels = Object.keys(CHANNEL_DB);
-  if (search) {
-    channels = channels.filter(c => c.includes(search));
-  }
+  if (search) channels = channels.filter(c => c.includes(search));
   
   const total = channels.length;
   const paged = channels.slice(page * pageSize, (page + 1) * pageSize);
   
-  let output = `=== CANALI DISPONIBILI (${total}) - pagina ${page + 1} ===\n\n`;
+  let output = `=== CANALI (${total}) - v9.1 Ultimate - pagina ${page + 1} ===\n\n`;
   
   for (const name of paged) {
     const ids = CHANNEL_DB[name];
-    output += `${name.padEnd(25)} ntv:${ids.ntv || '-'} vavoo:${ids.vavoo || '-'} daddy:${ids.daddy || '-'}\n`;
+    output += `${name.padEnd(25)} ntv:${ids.ntv||'-'} vavoo:${ids.vavoo||'-'} daddy:${ids.daddy||'-'}\n`;
   }
   
   if ((page + 1) * pageSize < total) {
-    output += `\n... e altri ${total - (page + 1) * pageSize} canali. Usa ?page=${page + 1} per proseguire o ?q=ricerca per filtrare.`;
+    output += `\n... altri ${total - (page + 1) * pageSize} canali. ?page=${page + 1} o ?q=ricerca`;
   }
-  
-  output += `\n\nSuggerimenti:\n`;
-  output += `/ch?q=cinema → filtra canali cinema\n`;
-  output += `/ch?q=sport → filtra canali sport\n`;
-  output += `/ch?q=rai → filtra canali RAI\n`;
   
   return new Response(output, { headers: { 'Content-Type': 'text/plain' } });
 }
@@ -1046,24 +1113,25 @@ async function handleChannelList(url) {
 // HANDLER: /debug
 // ============================================================
 async function handleDebug() {
-  const activeSessions = sessionStore.size;
   const now = Math.floor(Date.now() / 1000);
   
-  let output = `=== TVNOW-CF v9.0 Max Stability ===\n\n`;
-  output += `Sessioni attive: ${activeSessions}\n`;
-  output += `UA pool size: ${CONFIG.USER_AGENT_POOL.length}\n`;
-  output += `Session refresh interval: ${CONFIG.SESSION_REFRESH_INTERVAL}s (25min)\n`;
-  output += `Extra keyframe segments: ${CONFIG.EXTRA_KEYFRAME_SEG}\n`;
+  let output = `=== TVNOW-CF v9.1 Ultimate ===\n\n`;
+  output += `Sessioni attive: ${sessionStore.size}\n`;
+  output += `Session refresh: ${CONFIG.SESSION_REFRESH_INTERVAL}s (25min)\n`;
+  output += `Extra keyframe: ${CONFIG.EXTRA_KEYFRAME_SEG}\n`;
   output += `Timeout: ${CONFIG.DEFAULT_TIMEOUT}ms\n`;
-  output += `Cache resolutions TTL: ${CONFIG.CACHE_RESOLUTIONS_TTL}s\n`;
-  output += `EXT-X-START offset: ${CONFIG.EXT_X_START_OFFSET}s\n`;
-  output += `EXT-X-VERSION: ${CONFIG.EXT_X_VERSION}\n\n`;
+  output += `EXT-X-START: ${CONFIG.EXT_X_START_OFFSET}s\n\n`;
+  
+  output += `NTV resolver: ${CONFIG.NTV_RESOLVER_API}\n`;
+  output += `Vavoo mirrors: ${CONFIG.VAVOO_MIRRORS.length}\n`;
+  output += `Daddy embed: ${CONFIG.DADDY_EMBED_BASE}\n\n`;
   
   output += `=== SESSIONI ===\n`;
   for (const [key, sess] of sessionStore.entries()) {
     const age = now - sess.createdAt;
     const pct = Math.min(100, Math.round((age / CONFIG.SESSION_REFRESH_INTERVAL) * 100));
-    output += `${key} | età:${age}s (${pct}% vita) | fail:${sess.failCount} | UA idx:${sess.uaIndex}\n`;
+    const urlAge = sess.resolvedAt ? now - sess.resolvedAt : 'n/a';
+    output += `${key} | età:${age}s(${pct}%) | urlEtà:${urlAge}s | fail:${sess.failCount}\n`;
   }
   
   return new Response(output, { headers: { 'Content-Type': 'text/plain' } });
