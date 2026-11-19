@@ -1,5 +1,11 @@
 // ============================================================================
-// TVNOW-CF v8.0 — BASE STABILE + FIX RSI/DADDY + DIAGNOSTICA SEGMENTI
+// TVNOW-CF v8.0 — BASE STABILE + FIX MINIMALI
+//
+// MODIFICHE RISPETTO ALLA V8.0 ORIGINALE:
+// 1. RSI: ID Vavoo hardcodati (2455610203, 3475299702)
+// 2. Daddy: Header forcing in seg() per evitare 403
+// 3. rewriteMediaPl: rimossi EXT-X-INDEPENDENT-SEGMENTS e EXT-X-START
+//    (causavano schermo nero su canali con segmenti non-keyframe iniziali)
 // ============================================================================
 
 export default {
@@ -426,6 +432,8 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
+// 🔥 MODIFICATA: rimossi EXT-X-INDEPENDENT-SEGMENTS e EXT-X-START
+// Il player parte dal primo segmento della finestra (keyframe garantito)
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
@@ -434,15 +442,12 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const plan = pickWindow(durs);
   const kept = p.segs.slice(-plan.count);
   const dropped = p.segs.length - kept.length;
-  const offset = Math.max(0, plan.sum - DELAY_TARGET);
 
   const out = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
-    '#EXT-X-INDEPENDENT-SEGMENTS',
-    '#EXT-X-START:TIME-OFFSET=' + (offset > 0.4 ? offset.toFixed(1) : '0') + ',PRECISE=YES'
+    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
   ];
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -469,6 +474,7 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
+  // FIX Daddy: header forcing per evitare 403
   if (ref.includes('thedaddy')) {
     h['Referer'] = 'https://thedaddy.li/';
     h['Origin'] = 'https://thedaddy.li';
@@ -497,7 +503,6 @@ async function seg(u) {
 
 function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
-// 🔥 DIAGNOSTICA SEGMENTI REALI
 async function checkseg(u) {
   const source = u.searchParams.get('s') || 'ntv';
   const ch = u.searchParams.get('ch') || '869';
@@ -695,7 +700,7 @@ function playlistStats(txt) {
     + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
 }
 
-const VER = 'TVNOW-CF v8.0 (Originale + Fix + Checkseg)';
+const VER = 'TVNOW-CF v8.0 (Originale + Fix)';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -736,4 +741,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.0 (Originale + Fix + Checkseg) ███
+// ███ FINE TVNOW-CF v8.0 (Originale + Fix) ███
