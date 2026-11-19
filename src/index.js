@@ -1,11 +1,10 @@
 // ============================================================================
-// TVNOW-CF v8.2 — FIX SPECIFICO: AUDIO OK, VIDEO NERO
-// ✅ Finestra SEMPRE allineata a keyframe (non solo su DISCONTINUITY)
-// ✅ Gestione robusta EXT-X-MAP per flussi fMP4
-// ✅ CODECS dichiarato nella playlist per aiutare il player
-// ✅ Delay ottimizzato 12-16s (non troppo corto per non perdere keyframe)
-// ✅ Init segment fuori dalla cache
-// ✅ Tutte le migliorie anti-block e anti-death della v8.1
+// TVNOW-CF v8.3 — SOLUZIONE COMPLETA:
+// ✅ RSI La 2: ID corretto 3590183307
+// ✅ FIX SCHERMO NERO: Rilevamento codec HEVC + filtro H.264 automatico
+// ✅ NUOVI PARAMETRI: force_h264, variant, list_variants, safe
+// ✅ NUOVO ENDPOINT: /analyze — diagnostica completa codec e varianti
+// ✅ Miglioramenti fMP4, keyframe, anti-block e anti-death
 // ============================================================================
 
 export default {
@@ -27,6 +26,7 @@ export default {
       if (path === '/ch') return R(elencoCanali(), 200, TXT());
       if (path === '/probe') return R(await probe(u), 200, TXT());
       if (path === '/diag') return R(await diag(u), 200, TXT());
+      if (path === '/analyze') return R(await analyze(u), 200, TXT()); // ✅ NUOVO
       if (path === '/debug') return R(debug(), 200, TXT());
       if (path === '/checkseg') return await checkseg(u);
       if (path === '/ip') {
@@ -44,13 +44,13 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== DELAY OTTIMIZZATO v8.2 =====================================
-// Non troppo corto: serve margine per catturare almeno un keyframe completo
-const DELAY_TARGET  = 16;   // ✅ Compromesso: 16s target
-const DELAY_MIN     = 12;   // ✅ Minimo 12s per sicurezza
+// ==== DELAY OTTIMIZZATO v8.3 =====================================
+const DELAY_TARGET  = 16;
+const DELAY_MIN     = 12;
 const PREF_SEGS     = 3;
 const MIN_SEGS      = 2;
-const EXTRA_KEYFRAME_SEG = 1; // ✅ Sempre 1 segmento in più all'inizio per keyframe
+const EXTRA_KEYFRAME_SEG = 1;
+const EXTRA_KEYFRAME_SEG_SAFE = 2; // ✅ Per modalità safe
 
 // ==== ROTAZIONE USER-AGENT ANTI-BLOCK ============================
 const UA_POOL = [
@@ -65,7 +65,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const CHANNELS = [
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '', vid: '2455610203' },
-  { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '', vid: '3475299702' },
+  { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '', vid: '3590183307' }, // ✅ ID CORRETTO
   { slug: 'sky-sport-serie-a', name: 'Sky Sport Serie A', ntv: '', vavoo: 'sky sport serie a', daddy: '880' },
   { slug: 'sky-sport-24', name: 'Sky Sport 24', ntv: '869', vavoo: 'sky sport 24', daddy: '869' },
   { slug: 'sky-sport-uno', name: 'Sky Sport Uno', ntv: '461', vavoo: 'sky sport uno', daddy: '461' },
@@ -120,6 +120,9 @@ function elencoCanali() {
   return L.join('\n');
 }
 
+// ============================================================================
+// NTV
+// ============================================================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
@@ -172,6 +175,9 @@ async function ntvPlaylist(id) {
   throw new Error('ntv playlist: troppi tentativi falliti');
 }
 
+// ============================================================================
+// DADDYLIVE
+// ============================================================================
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map();
 const DADDY_TTL = 2 * 60 * 1000;
@@ -233,6 +239,9 @@ function getBrowserHeaders(referer) {
   };
 }
 
+// ============================================================================
+// VAVOO
+// ============================================================================
 const VAVOO_MIRRORS = ['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES = ['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap = { map: null, t: 0, src: '' };
@@ -322,6 +331,9 @@ async function vavooResolveRaw(query, vid) {
   return null;
 }
 
+// ============================================================================
+// LIVE — Funzione principale
+// ============================================================================
 let lastPl = { key: '', txt: '', t: 0 };
 async function live(u, P, legacy) {
   countReq('live');
@@ -329,6 +341,12 @@ async function live(u, P, legacy) {
   if (!q) return R('uso: /live?ch=<slug|id>\n\n' + elencoCanali(), 200, TXT());
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(), 200, TXT());
+
+  // ✅ Nuovi parametri per v8.3
+  const forceH264 = u.searchParams.get('force_h264') === '1';
+  const variantIdx = parseInt(u.searchParams.get('variant') || '-1');
+  const listVariants = u.searchParams.get('list_variants') === '1';
+  const safeMode = u.searchParams.get('safe') === '1';
 
   const order = legacy ? [legacy, ...['ntv','vavoo','daddy'].filter(x => x !== legacy)]
     : (u.searchParams.get('p') || 'ntv,vavoo,daddy').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -340,7 +358,7 @@ async function live(u, P, legacy) {
     return true;
   });
 
-  const ck = c.slug + ':' + availableOrder.join('.');
+  const ck = c.slug + ':' + availableOrder.join('.') + ':' + forceH264 + ':' + variantIdx + ':' + safeMode;
   if (lastPl.key === ck && Date.now() - lastPl.t < 2500) return R(lastPl.txt, 200, HLS_NO_CACHE());
 
   const provs = {
@@ -351,7 +369,13 @@ async function live(u, P, legacy) {
       if (/\.m3u8(\?|$)/i.test(vu)) {
         const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
         if (!r.ok) { vavooDrop(c.vavoo, c.vid); return null; }
-        const out = rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
+        let txt = await r.text();
+        // ✅ Applica filtri codec se richiesto
+        if (forceH264 || variantIdx >= 0 || listVariants) {
+          txt = filterMasterVariants(txt, forceH264, variantIdx, listVariants);
+          if (listVariants) return R(txt, 200, TXT());
+        }
+        const out = rewriteAny(txt, vu, P, 'https://vavoo.to/', 'https://vavoo.to', safeMode);
         lastPl = { key: ck, txt: out, t: Date.now() };
         return R(out, 200, HLS_NO_CACHE());
       }
@@ -360,7 +384,12 @@ async function live(u, P, legacy) {
     ntv: async () => {
       if (!c.ntv) return null;
       const pl = await ntvPlaylist(c.ntv);
-      const out = rewriteAny(pl.txt, pl.base, P, pl.ref, '');
+      let txt = pl.txt;
+      if (forceH264 || variantIdx >= 0 || listVariants) {
+        txt = filterMasterVariants(txt, forceH264, variantIdx, listVariants);
+        if (listVariants) return R(txt, 200, TXT());
+      }
+      const out = rewriteAny(txt, pl.base, P, pl.ref, '', safeMode);
       lastPl = { key: ck, txt: out, t: Date.now() };
       return R(out, 200, HLS_NO_CACHE());
     },
@@ -370,8 +399,14 @@ async function live(u, P, legacy) {
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
       if (!r.ok) { daddyCache.delete(c.daddy); return null; }
+      let txt = await r.text();
+      if (forceH264 || variantIdx >= 0 || listVariants) {
+        txt = filterMasterVariants(txt, forceH264, variantIdx, listVariants);
+        if (listVariants) return R(txt, 200, TXT());
+      }
+      const rewritten = rewriteAny(txt, du, P, 'https://thedaddy.li/', '', safeMode);
       const out = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + getRandomUA()]
-        .concat(rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '').split('\n'));
+        .concat(rewritten.split('\n'));
       const finalTxt = out.join('\n'); lastPl = { key: ck, txt: finalTxt, t: Date.now() };
       return R(finalTxt, 200, HLS_NO_CACHE());
     }
@@ -381,10 +416,95 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO (' + availableOrder.join(' -> ') + ') per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-function rewriteAny(txt, baseUrl, P, ref, origin) {
+// ============================================================================
+// ✅ NUOVO: Filtro varianti nella Master Playlist
+// ============================================================================
+function filterMasterVariants(txt, forceH264, variantIdx, listVariants) {
+  if (!/#EXT-X-STREAM-INF/.test(txt)) return txt; // Non è una master, lascia invariato
+  
+  const lines = String(txt).split(/\r?\n/);
+  const variants = [];
+  let out = [];
+  let i = 0;
+  
+  // Prima passata: raccogli tutte le varianti
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (!line) { i++; continue; }
+    if (line.startsWith('#EXTM3U') || line.startsWith('#EXT-X-VERSION')) {
+      out.push(line); i++; continue;
+    }
+    if (line.startsWith('#EXT-X-STREAM-INF')) {
+      const infLine = line;
+      const url = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+      const codecs = (infLine.match(/CODECS="([^"]+)"/) || [])[1] || '';
+      const bandwidth = (infLine.match(/BANDWIDTH=(\d+)/) || [])[1] || '0';
+      const resolution = (infLine.match(/RESOLUTION=([\dx]+)/) || [])[1] || '';
+      const frameRate = (infLine.match(/FRAME-RATE=([\d.]+)/) || [])[1] || '';
+      
+      const isH264 = /avc1/i.test(codecs);
+      const isHEVC = /hvc1|hev1/i.test(codecs);
+      const isAudioOnly = !isH264 && !isHEVC && /mp4a|aac/i.test(codecs);
+      
+      variants.push({
+        idx: variants.length,
+        infLine, url, codecs, bandwidth, resolution, frameRate,
+        isH264, isHEVC, isAudioOnly
+      });
+      i += 2; continue;
+    }
+    if (line.startsWith('#')) { out.push(line); i++; continue; }
+    i++;
+  }
+  
+  if (listVariants) {
+    // ✅ Modalità lista: restituisci informazioni sulle varianti
+    const result = ['=== VARIANTI DISPONIBILI ===', ''];
+    variants.forEach((v, idx) => {
+      const codecType = v.isH264 ? '✅ H.264' : v.isHEVC ? '⚠️ HEVC' : v.isAudioOnly ? '🔊 Audio' : '❓ Sconosciuto';
+      result.push(`[${idx}] ${codecType} | ${v.resolution || '?'} | ${Math.round(v.bandwidth/1000)}kbps | ${v.frameRate || '?'}fps | CODECS="${v.codecs}"`);
+      result.push(`      URL: ${v.url.substring(0, 80)}${v.url.length > 80 ? '...' : ''}`);
+      result.push('');
+    });
+    result.push('=== COME USARE ===');
+    result.push('• /live?ch=sky-sport-f1&force_h264=1 → usa SOLO varianti H.264');
+    result.push('• /live?ch=sky-sport-f1&variant=0 → usa la variante con indice 0');
+    result.push('• Prova prima force_h264=1. Se non ci sono varianti H.264, il tuo player non supporta HEVC.');
+    return result.join('\n');
+  }
+  
+  // Filtra le varianti
+  let filtered = variants;
+  if (forceH264) {
+    filtered = variants.filter(v => v.isH264 || v.isAudioOnly);
+    if (filtered.length === 0) {
+      // Nessuna variante H.264: restituisci un messaggio chiaro
+      return '#EXTM3U\n# AVVISO: Nessuna variante H.264 trovata\n# Questo canale usa solo HEVC/H.265 che il tuo player non supporta\n# Prova un altro provider o usa un player compatibile HEVC (VLC, MPV, MX Player)\n';
+    }
+  }
+  
+  // Se è richiesto un indice specifico
+  if (variantIdx >= 0 && variantIdx < filtered.length) {
+    filtered = [filtered[variantIdx]];
+  }
+  
+  // Ricostruisci la playlist
+  const finalOut = [...out];
+  filtered.forEach(v => {
+    finalOut.push(v.infLine);
+    finalOut.push(v.url);
+  });
+  
+  return finalOut.join('\n');
+}
+
+// ============================================================================
+// Riscrittura playlist
+// ============================================================================
+function rewriteAny(txt, baseUrl, P, ref, origin, safeMode) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
-  return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin);
+  return /#EXT-X-STREAM-INF/.test(txt) ? rewriteMaster(txt, baseUrl, P, ref, origin) : rewriteMediaPl(txt, baseUrl, P, ref, origin, safeMode);
 }
 
 function parseMediaPl(txt) {
@@ -461,30 +581,26 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ✅✅✅ v8.2: FIX PRINCIPALE PER SCHERMO NERO ✅✅✅
-// Allineiamo SEMPRE la finestra a un keyframe sicuro
-function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
+// ✅ v8.3: rewriteMediaPl migliorato con safeMode
+function rewriteMediaPl(txt, baseUrl, P, ref, origin, safeMode) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
   const durs = p.segs.map(s => s.dur || p.upTarget);
   const plan = pickWindow(durs);
   
-  // Indice di partenza calcolato dalla durata
   let startIdx = p.segs.length - plan.count;
   
-  // ✅ FIX 1: Sempre 1 segmento EXTRA all'inizio per catturare il keyframe
-  // (Anche se non c'è DISCONTINUITY, il primo segmento della finestra
-  //  potrebbe iniziare con P/B-frame invece di I-frame)
-  startIdx = Math.max(0, startIdx - EXTRA_KEYFRAME_SEG);
+  // ✅ Segmento extra per keyframe (1 normale, 2 in safe mode)
+  const extraSegs = safeMode ? EXTRA_KEYFRAME_SEG_SAFE : EXTRA_KEYFRAME_SEG;
+  startIdx = Math.max(0, startIdx - extraSegs);
   
-  // ✅ FIX 2: Se c'è DISCONTINUITY nel primo segmento della finestra,
-  // andiamo ancora più indietro per includere il segmento PRIMA della discontinuità
+  // ✅ Se c'è DISCONTINUITY, andiamo ancora più indietro
   if (startIdx > 0 && p.segs[startIdx].disc) {
     startIdx = Math.max(0, startIdx - 1);
   }
   
-  // ✅ FIX 3: Se il primo segmento ha durata 0 o anomala, saltiamolo
+  // ✅ Salta segmenti con durata anomala
   while (startIdx < p.segs.length - 1 && (p.segs[startIdx].dur <= 0 || p.segs[startIdx].dur > p.upTarget * 3)) {
     startIdx++;
   }
@@ -494,17 +610,17 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
 
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:4', // ✅ Versione 4 per supportare meglio fMP4 e MAP
+    '#EXT-X-VERSION:6', // ✅ Versione 6 per massima compatibilità fMP4
     '#EXT-X-TARGETDURATION:' + p.upTarget,
-    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
+    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
+    '#EXT-X-ALLOW-CACHE:NO' // ✅ Evita caching di segmenti corrotti
   ];
   
-  // ✅ FIX 4: Gestione robusta EXT-X-MAP per flussi fMP4
+  // ✅ Gestione robusta EXT-X-MAP
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) {
       const mapAbs = absSegUrl(mu, baseUrl);
-      // Aggiungiamo un parametro per dire a /seg che è un init segment (no cache)
       const mapProx = P + '/seg?u=' + encodeURIComponent(mapAbs) + '&init=1' + 
         (ref ? '&ref=' + encodeURIComponent(ref) : '') + 
         (origin ? '&o=' + encodeURIComponent(origin) : '');
@@ -522,11 +638,14 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
+// ============================================================================
+// SEG — Proxy segmenti
+// ============================================================================
 async function seg(u) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
-  const isInit = u.searchParams.get('init') === '1'; // ✅ Riconosciamo init segment
+  const isInit = u.searchParams.get('init') === '1';
   const h = getBrowserHeaders(ref);
   const o = u.searchParams.get('o');
   if (o) h['Origin'] = o;
@@ -547,7 +666,6 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // ✅ FIX 5: Init segment MAI in cache; altri segmenti cache leggera
   const cfOpt = (range || isInit) ? { cacheTtl: 0 } : { cacheTtl: 120, cacheEverything: true };
   
   let retry = 0, maxRetries = 2;
@@ -555,14 +673,19 @@ async function seg(u) {
     try {
       const r = await fetchT(target, { headers: { ...h, 'User-Agent': getRandomUA() }, cf: cfOpt }, 15000);
       if (r.ok || r.status === 206 || r.status === 304) {
+        // ✅ Controllo: non restituiamo HTML di errore come video
+        const contentType = r.headers.get('content-type') || '';
+        if (contentType.includes('text/html') || contentType.includes('application/xml')) {
+          retry++; await sleep(300 * retry); continue;
+        }
+        
         const hh = {
-          'content-type': r.headers.get('content-type') || 'video/mp2t',
+          'content-type': contentType || 'video/mp2t',
           'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
           'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
           'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0',
           'keep-alive': 'timeout=30, max=1000'
         };
-        // ✅ FIX 6: Non copiamo ciecamente content-length — se c'è discrepanza, lasciamo che Cloudflare lo calcoli
         const cl = r.headers.get('content-length');
         const te = r.headers.get('transfer-encoding');
         if (cl && !te) hh['content-length'] = cl;
@@ -579,6 +702,9 @@ async function seg(u) {
 
 function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
+// ============================================================================
+// CHECKSEG
+// ============================================================================
 async function checkseg(u) {
   const source = u.searchParams.get('s') || 'ntv';
   const ch = u.searchParams.get('ch') || '869';
@@ -617,10 +743,30 @@ async function checkseg(u) {
     
     L.push('Tipo playlist: ' + (isMaster ? 'MASTER (varianti)' : 'MEDIA (segmenti)'));
     L.push('Ha EXT-X-MAP (fMP4): ' + (hasMap ? '✅ SÌ' : '❌ NO (MPEG-TS)'));
+    
+    // ✅ Se è master, analizziamo i codec
+    if (isMaster) {
+      L.push('');
+      L.push('=== VARIANTI TROVATE ===');
+      let vIdx = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+          const codecs = (lines[i].match(/CODECS="([^"]+)"/) || [])[1] || '';
+          const resolution = (lines[i].match(/RESOLUTION=([\dx]+)/) || [])[1] || '';
+          const isH264 = /avc1/i.test(codecs);
+          const isHEVC = /hvc1|hev1/i.test(codecs);
+          const codecLabel = isH264 ? '✅ H.264' : isHEVC ? '⚠️ HEVC' : '❓';
+          L.push(`  [${vIdx}] ${codecLabel} | ${resolution} | CODECS="${codecs}"`);
+          vIdx++;
+        }
+      }
+      if (vIdx === 0) L.push('  Nessuna variante trovata');
+    }
+    
     L.push('');
     
     if (isMaster) {
-      L.push('⚠️  È una Master Playlist. Il primo URL è un\'altra playlist, non un segmento video.');
+      L.push('⚠️  È una Master Playlist. Prova una variante specifica con /live?ch=...&variant=N');
       for(let i=0; i<lines.length; i++) {
         if(!lines[i].startsWith('#') && lines[i].trim().length > 0) {
           segUrl = lines[i].trim();
@@ -662,16 +808,11 @@ async function checkseg(u) {
     
     if (bytes.length >= 4) {
       if (bytes[0] === 0x47) {
-        L.push('✅ Formato: MPEG-TS (Transport Stream) - COMPATIBILE');
+        L.push('✅ Formato: MPEG-TS (Transport Stream)');
       } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
-        L.push('✅ Formato: fMP4 (Fragmented MP4) - richiede EXT-X-MAP funzionante');
+        L.push('✅ Formato: fMP4 (Fragmented MP4)');
         const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
         L.push('Brand: ' + brand);
-        // Controlliamo se è HEVC
-        if (bytes.length >= 12) {
-          const boxType = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
-          L.push('Box type: ' + boxType);
-        }
       } else {
         const text = String.fromCharCode(...bytes.slice(0, 100));
         if (text.includes('<html') || text.includes('<!DOCTYPE') || text.includes('<script')) {
@@ -689,10 +830,17 @@ async function checkseg(u) {
       L.push('❌ Segmento non disponibile (HTTP ' + r.status + ')');
     } else if (bytes.length < 100) {
       L.push('❌ Segmento troppo piccolo (' + bytes.length + ' bytes)');
-    } else if (bytes[0] === 0x47) {
-      L.push('✅ MPEG-TS valido. Se schermo nero = probabile codec HEVC non supportato dal tuo player.');
-    } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
-      L.push('✅ fMP4 valido. Se schermo nero = controlla che EXT-X-MAP sia funzionante.');
+    } else if (bytes[0] === 0x47 || String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
+      L.push('✅ Il segmento video è VALIDO.');
+      L.push('');
+      L.push('Se il player mostra schermo nero, le cause possibili sono:');
+      L.push('  1. ❗ Codec HEVC/H.265 non supportato dal tuo player');
+      L.push('     → Prova: /live?ch=sky-sport-f1&force_h264=1');
+      L.push('     → Oppure usa VLC, MPV o MX Player che supportano HEVC');
+      L.push('  2. ❗ Keyframe mancante nella finestra');
+      L.push('     → Prova: /live?ch=sky-sport-f1&safe=1');
+      L.push('  3. ❗ Problema con EXT-X-MAP (fMP4)');
+      L.push('     → Verifica che l\'init segment venga scaricato');
     } else {
       L.push('⚠️  Il segmento NON è un video valido. La fonte sta restituendo errori o blocchi.');
     }
@@ -703,6 +851,144 @@ async function checkseg(u) {
   }
 }
 
+// ============================================================================
+// ✅ NUOVO: ANALYZE — Diagnostica completa
+// ============================================================================
+async function analyze(u) {
+  const q = u.searchParams.get('ch') || 'sky-sport-f1';
+  const c = findCh(q);
+  if (!c) return 'Canale non trovato: ' + q + '\n\n' + elencoCanali();
+  
+  const L = ['═══════════════════════════════════════════',
+             '  ANALISI COMPLETA CANALE: ' + c.name,
+             '═══════════════════════════════════════════',
+             'Slug: ' + c.slug,
+             'NTV ID: ' + (c.ntv || '—'),
+             'Vavoo: ' + (c.vavoo || '—') + (c.vid ? ' (vid=' + c.vid + ')' : ''),
+             'Daddy ID: ' + (c.daddy || '—'),
+             ''];
+  
+  const analyzeSource = async (label, getPlaylistFn) => {
+    L.push('───────────────────────────────────────────');
+    L.push('📡 FONTE: ' + label);
+    L.push('───────────────────────────────────────────');
+    try {
+      const t0 = Date.now();
+      const txt = await getPlaylistFn();
+      const dt = Date.now() - t0;
+      
+      const isMaster = /#EXT-X-STREAM-INF/.test(txt);
+      const hasMap = txt.includes('#EXT-X-MAP');
+      
+      L.push('✅ Caricata in ' + dt + 'ms');
+      L.push('   Tipo: ' + (isMaster ? 'MASTER (varianti multiple)' : 'MEDIA (segmenti diretti)'));
+      L.push('   fMP4: ' + (hasMap ? 'SÌ (usa EXT-X-MAP)' : 'NO (MPEG-TS)'));
+      
+      if (isMaster) {
+        const lines = txt.split(/\r?\n/);
+        const variants = [];
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+            const codecs = (lines[i].match(/CODECS="([^"]+)"/) || [])[1] || '';
+            const resolution = (lines[i].match(/RESOLUTION=([\dx]+)/) || [])[1] || '';
+            const bandwidth = (lines[i].match(/BANDWIDTH=(\d+)/) || [])[1] || '0';
+            const frameRate = (lines[i].match(/FRAME-RATE=([\d.]+)/) || [])[1] || '';
+            const isH264 = /avc1/i.test(codecs);
+            const isHEVC = /hvc1|hev1/i.test(codecs);
+            variants.push({ idx: variants.length, isH264, isHEVC, codecs, resolution, bandwidth, frameRate });
+          }
+        }
+        
+        const h264Count = variants.filter(v => v.isH264).length;
+        const hevcCount = variants.filter(v => v.isHEVC).length;
+        
+        L.push('   Varianti totali: ' + variants.length);
+        L.push('   ✅ H.264: ' + h264Count + ' varianti');
+        L.push('   ⚠️  HEVC: ' + hevcCount + ' varianti');
+        L.push('');
+        
+        if (variants.length > 0) {
+          L.push('   ELENCO VARIANTI:');
+          variants.forEach(v => {
+            const codecLabel = v.isH264 ? '✅ H.264' : v.isHEVC ? '⚠️ HEVC' : '❓';
+            L.push(`     [${v.idx}] ${codecLabel} | ${v.resolution || '?'} | ${Math.round(v.bandwidth/1000)}kbps | ${v.frameRate || '?'}fps | "${v.codecs}"`);
+          });
+        }
+        
+        if (h264Count === 0 && hevcCount > 0) {
+          L.push('');
+          L.push('   ❗❗❗ PROBLEMA: TUTTE le varianti sono HEVC!');
+          L.push('   Il tuo player probabilmente non supporta HEVC → SCHERMO NERO');
+          L.push('   Soluzioni:');
+          L.push('     • Usa un player compatibile HEVC (VLC, MPV, MX Player)');
+          L.push('     • Prova un\'altra fonte che offra H.264');
+          L.push('     • Disabilita accelerazione hardware nel browser');
+        } else if (h264Count > 0) {
+          L.push('');
+          L.push('   💡 Ci sono varianti H.264! Prova:');
+          L.push('      /live?ch=' + c.slug + '&force_h264=1');
+        }
+      } else {
+        // Media playlist: conta segmenti
+        const p = parseMediaPl(txt);
+        L.push('   Segmenti: ' + p.segs.length);
+        L.push('   Durata finestra: ~' + (p.segs.length * p.upTarget) + 's');
+        L.push('   Target duration: ' + p.upTarget + 's');
+      }
+      
+    } catch (e) {
+      L.push('❌ ERRORE: ' + (e && e.message));
+    }
+    L.push('');
+  };
+  
+  if (c.ntv) {
+    await analyzeSource('NTV (ID ' + c.ntv + ')', async () => (await ntvPlaylist(c.ntv)).txt);
+  }
+  if (c.vavoo || c.vid) {
+    await analyzeSource('VAVOO', async () => {
+      const vu = await vavooResolve(c.vavoo, c.vid);
+      if (!vu) throw new Error('URL non risolto');
+      const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    });
+  }
+  if (c.daddy) {
+    await analyzeSource('DADDY (ID ' + c.daddy + ')', async () => {
+      const du = await daddyResolve(c.daddy);
+      if (!du) throw new Error('URL non risolto');
+      const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    });
+  }
+  
+  L.push('═══════════════════════════════════════════');
+  L.push('📋 RIEPILOGO E AZIONI CONSIGLIATE');
+  L.push('═══════════════════════════════════════════');
+  L.push('');
+  L.push('1️⃣  PRIMA PROVA (se ci sono varianti H.264):');
+  L.push('   /live?ch=' + c.slug + '&force_h264=1');
+  L.push('');
+  L.push('2️⃣  SE ANCORA NERO (keyframe):');
+  L.push('   /live?ch=' + c.slug + '&safe=1');
+  L.push('');
+  L.push('3️⃣  VEDI VARIANTI DISPONIBILI:');
+  L.push('   /live?ch=' + c.slug + '&list_variants=1');
+  L.push('   Poi scegli una variante: /live?ch=' + c.slug + '&variant=N');
+  L.push('');
+  L.push('4️⃣  SE TUTTE LE FONTI USANO SOLO HEVC:');
+  L.push('   • Il problema è il tuo player, non il worker');
+  L.push('   • Usa VLC, MPV o MX Player per HEVC');
+  L.push('   • Oppure cerca un canale alternativo con H.264');
+  
+  return L.join('\n');
+}
+
+// ============================================================================
+// Utility di sistema
+// ============================================================================
 async function warm() {
   const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -732,7 +1018,7 @@ async function probe(u) {
 async function vmap() {
   const m = await ensureVavooMap(true); if (!m) return 'VMAP: nessuna fonte';
   const L = ['VMAP: ' + m.size + ' canali (' + vavooMap.src + ')'];
-  for (const c of CHANNELS) if (/tennis/.test(c.slug)) { const id = c.vid || vavooMapFind(c.vavoo, m); L.push((id ? 'OK' : '—') + ' ' + c.slug + ' -> ' + (id || 'non trovato') + (c.vid ? ' (PINNATO)' : '')); }
+  for (const c of CHANNELS) if (/tennis|f1|calcio|arena|rsi/i.test(c.slug)) { const id = c.vid || vavooMapFind(c.vavoo, m); L.push((id ? 'OK' : '—') + ' ' + c.slug + ' -> ' + (id || 'non trovato') + (c.vid ? ' (PINNATO)' : '')); }
   return L.join('\n');
 }
 
@@ -740,16 +1026,16 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.2) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.3) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', '', '💡 Per analisi completa usa: /analyze?ch=' + c.slug, ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
       const txt = await fn();
       L.push('— ' + label + ' (' + (Date.now() - t0) + 'ms) —');
       L.push('OK | ' + playlistStats(txt));
-      // ✅ Controlliamo se c'è MAP
       if (txt.includes('#EXT-X-MAP')) L.push('   ℹ️  Usa fMP4 con EXT-X-MAP');
       else L.push('   ℹ️  Usa MPEG-TS');
+      if (/#EXT-X-STREAM-INF/.test(txt)) L.push('   ℹ️  Master playlist: usa /live?ch=' + c.slug + '&list_variants=1 per vedere codec');
     } catch (e) {
       L.push('— ' + label + ' (' + (Date.now() - t0) + 'ms) —');
       L.push('ERRORE: ' + (e && e.message));
@@ -771,15 +1057,6 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== DELAY v8.2 ===');
-  L.push('Finestra: ' + DELAY_MIN + 's – ' + DELAY_TARGET + 's + ' + EXTRA_KEYFRAME_SEG + ' segmento extra per keyframe');
-  L.push('');
-  L.push('=== FIX SCHERMO NERO APPLICATI ===');
-  L.push('• 1 segmento extra all\'inizio della finestra per garantire keyframe');
-  L.push('• Se DISCONTINUITY, andiamo ancora più indietro');
-  L.push('• EXT-X-MAP proxyato correttamente con flag init=1 (no cache)');
-  L.push('• EXT-X-VERSION:4 per migliore compatibilità fMP4');
-  L.push('• Content-Length non copiato se c\'è transfer-encoding');
   return L.join('\n');
 }
 
@@ -791,11 +1068,11 @@ function playlistStats(txt) {
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's'
-    + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's'
+    + ' | delay ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's'
     + (p.map ? ' | fMP4' : ' | MPEG-TS');
 }
 
-const VER = 'TVNOW-CF v8.2 (Fix Schermo Nero)';
+const VER = 'TVNOW-CF v8.3 (Fix Completo)';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
 
@@ -810,14 +1087,14 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, extra keyframe seg=' + EXTRA_KEYFRAME_SEG);
-  L.push('UA pool: ' + UA_POOL.length + ' user-agent disponibili');
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, extra seg=' + EXTRA_KEYFRAME_SEG + ' (safe=' + EXTRA_KEYFRAME_SEG_SAFE + ')');
+  L.push('UA pool: ' + UA_POOL.length + ' user-agent');
   L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 12-16s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-f1         diagnostica completa','  /checkseg?s=ntv&ch=577        test segmento F1','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso base:','  /live?ch=<slug|id>            playlist standard','','NUOVI PARAMETRI v8.3:','  /live?ch=X&force_h264=1       ✅ Solo varianti H.264 (risolve HEVC)','  /live?ch=X&safe=1             🛡️ Finestra più sicura (più keyframe)','  /live?ch=X&variant=N          🎯 Seleziona variante per indice','  /live?ch=X&list_variants=1    📋 Elenca varianti con codec','  /analyze?ch=X                 🔬 Analisi completa codec e varianti','','altri endpoint:','  /diag?ch=X  /checkseg?s=ntv&ch=ID  /warm  /vmap  /probe?ch=X  /debug  /ch',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -836,4 +1113,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.2 ███
+// ███ FINE TVNOW-CF v8.3 ███
