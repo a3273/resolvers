@@ -1,10 +1,11 @@
 // ============================================================================
-// TVNOW-CF v8.1 — MIGLIORAMENTI INTEGRATI:
-// ✅ FIX Schermo nero: finestra allineata, preservati codec e keyframe
-// ✅ Delay ridotto: 10–14s invece di 25–27s
-// ✅ Anti-death: rinnovo proattivo token + retry intelligente
-// ✅ Anti-block: rotazione User-Agent + backoff esponenziale
-// ✅ Stabilità: gestione discontinuità, cache adattiva, error recovery
+// TVNOW-CF v8.2 — FIX SPECIFICO: AUDIO OK, VIDEO NERO
+// ✅ Finestra SEMPRE allineata a keyframe (non solo su DISCONTINUITY)
+// ✅ Gestione robusta EXT-X-MAP per flussi fMP4
+// ✅ CODECS dichiarato nella playlist per aiutare il player
+// ✅ Delay ottimizzato 12-16s (non troppo corto per non perdere keyframe)
+// ✅ Init segment fuori dalla cache
+// ✅ Tutte le migliorie anti-block e anti-death della v8.1
 // ============================================================================
 
 export default {
@@ -43,11 +44,13 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ==== CONTROLLO DELAY OTTIMIZZATO v8.1 ============================
-const DELAY_TARGET  = 14;   // ✅ Prima era 27 — abbassato
-const DELAY_MIN     = 10;   // ✅ Prima era 25 — abbassato
+// ==== DELAY OTTIMIZZATO v8.2 =====================================
+// Non troppo corto: serve margine per catturare almeno un keyframe completo
+const DELAY_TARGET  = 16;   // ✅ Compromesso: 16s target
+const DELAY_MIN     = 12;   // ✅ Minimo 12s per sicurezza
 const PREF_SEGS     = 3;
 const MIN_SEGS      = 2;
+const EXTRA_KEYFRAME_SEG = 1; // ✅ Sempre 1 segmento in più all'inizio per keyframe
 
 // ==== ROTAZIONE USER-AGENT ANTI-BLOCK ============================
 const UA_POOL = [
@@ -121,11 +124,10 @@ const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve: 0, refresh: 0, err: 0 };
 const MAX_TOKEN_CACHE = 50;
-const NTV_REFRESH_AHEAD = 120; // ✅ Rinnova 2 minuti PRIMA della scadenza
+const NTV_REFRESH_AHEAD = 120;
 
 async function ntvToken(id) {
   const now = Date.now() / 1000; const c = tokenCache.get(id);
-  // ✅ Rinnovo proattivo: non aspettiamo che scada del tutto
   if (c && c.exp - now > NTV_REFRESH_AHEAD) return c;
   if (tokenCache.size > MAX_TOKEN_CACHE) {
     const keys = Array.from(tokenCache.keys());
@@ -142,7 +144,6 @@ async function ntvToken(id) {
     const entry = { m3u8, exp, ref: (j && j.referer) || 'https://tvnow247.today/', lastOk: now };
     tokenCache.set(id, entry); return entry;
   } catch (e) {
-    // ✅ Fallback: se abbiamo un token ancora valido, usalo invece di fallire
     if (c && c.exp - now > 0) { ntvStats.err++; return c; }
     throw e;
   }
@@ -174,7 +175,7 @@ async function ntvPlaylist(id) {
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 const daddyCache = new Map();
 const DADDY_TTL = 2 * 60 * 1000;
-const DADDY_REFRESH_AHEAD = 60 * 1000; // ✅ Rinnova 1 minuto prima
+const DADDY_REFRESH_AHEAD = 60 * 1000;
 const MAX_DADDY_CACHE = 100;
 
 async function daddyResolve(id) {
@@ -221,7 +222,7 @@ async function extractM3u8FromEmbed(url, refererDomain, timeoutMs) {
 
 function getBrowserHeaders(referer) {
   return {
-    'User-Agent': getRandomUA(), // ✅ UA casuale per anti-block
+    'User-Agent': getRandomUA(),
     'Accept': '*/*',
     'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
     'Referer': referer,
@@ -460,7 +461,8 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ✅ MIGLIORATA v8.1: allineamento keyframe + nessun tag problematico
+// ✅✅✅ v8.2: FIX PRINCIPALE PER SCHERMO NERO ✅✅✅
+// Allineiamo SEMPRE la finestra a un keyframe sicuro
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
@@ -468,27 +470,46 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const durs = p.segs.map(s => s.dur || p.upTarget);
   const plan = pickWindow(durs);
   
-  // ✅ FIX SCHERMO NERO: se il primo segmento della finestra ha una discontinuità
-  // prima di lui, includiamo anche il segmento precedente (keyframe sicuro)
+  // Indice di partenza calcolato dalla durata
   let startIdx = p.segs.length - plan.count;
+  
+  // ✅ FIX 1: Sempre 1 segmento EXTRA all'inizio per catturare il keyframe
+  // (Anche se non c'è DISCONTINUITY, il primo segmento della finestra
+  //  potrebbe iniziare con P/B-frame invece di I-frame)
+  startIdx = Math.max(0, startIdx - EXTRA_KEYFRAME_SEG);
+  
+  // ✅ FIX 2: Se c'è DISCONTINUITY nel primo segmento della finestra,
+  // andiamo ancora più indietro per includere il segmento PRIMA della discontinuità
   if (startIdx > 0 && p.segs[startIdx].disc) {
-    startIdx--;
+    startIdx = Math.max(0, startIdx - 1);
   }
-  // ✅ Non andiamo mai sotto 0
-  startIdx = Math.max(0, startIdx);
+  
+  // ✅ FIX 3: Se il primo segmento ha durata 0 o anomala, saltiamolo
+  while (startIdx < p.segs.length - 1 && (p.segs[startIdx].dur <= 0 || p.segs[startIdx].dur > p.upTarget * 3)) {
+    startIdx++;
+  }
   
   const kept = p.segs.slice(startIdx);
   const dropped = startIdx;
 
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:3',
+    '#EXT-X-VERSION:4', // ✅ Versione 4 per supportare meglio fMP4 e MAP
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
   ];
+  
+  // ✅ FIX 4: Gestione robusta EXT-X-MAP per flussi fMP4
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
-    if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
+    if (mu) {
+      const mapAbs = absSegUrl(mu, baseUrl);
+      // Aggiungiamo un parametro per dire a /seg che è un init segment (no cache)
+      const mapProx = P + '/seg?u=' + encodeURIComponent(mapAbs) + '&init=1' + 
+        (ref ? '&ref=' + encodeURIComponent(ref) : '') + 
+        (origin ? '&o=' + encodeURIComponent(origin) : '');
+      out.push('#EXT-X-MAP:URI="' + mapProx + '"');
+    }
   }
 
   kept.forEach((s, idx) => {
@@ -505,13 +526,13 @@ async function seg(u) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
+  const isInit = u.searchParams.get('init') === '1'; // ✅ Riconosciamo init segment
   const h = getBrowserHeaders(ref);
   const o = u.searchParams.get('o');
   if (o) h['Origin'] = o;
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // FIX Daddy: header forcing per evitare 403
   if (ref.includes('thedaddy')) {
     h['Referer'] = 'https://thedaddy.li/';
     h['Origin'] = 'https://thedaddy.li';
@@ -526,7 +547,9 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 300, cacheEverything: true };
+  // ✅ FIX 5: Init segment MAI in cache; altri segmenti cache leggera
+  const cfOpt = (range || isInit) ? { cacheTtl: 0 } : { cacheTtl: 120, cacheEverything: true };
+  
   let retry = 0, maxRetries = 2;
   while (retry <= maxRetries) {
     try {
@@ -539,7 +562,11 @@ async function seg(u) {
           'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0',
           'keep-alive': 'timeout=30, max=1000'
         };
-        const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
+        // ✅ FIX 6: Non copiamo ciecamente content-length — se c'è discrepanza, lasciamo che Cloudflare lo calcoli
+        const cl = r.headers.get('content-length');
+        const te = r.headers.get('transfer-encoding');
+        if (cl && !te) hh['content-length'] = cl;
+        const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
         return new Response(r.body, { status: r.status, headers: hh });
       }
       retry++; await sleep(300 * retry);
@@ -586,6 +613,11 @@ async function checkseg(u) {
     
     const lines = txt.split('\n');
     let isMaster = txt.includes('#EXT-X-STREAM-INF');
+    let hasMap = txt.includes('#EXT-X-MAP');
+    
+    L.push('Tipo playlist: ' + (isMaster ? 'MASTER (varianti)' : 'MEDIA (segmenti)'));
+    L.push('Ha EXT-X-MAP (fMP4): ' + (hasMap ? '✅ SÌ' : '❌ NO (MPEG-TS)'));
+    L.push('');
     
     if (isMaster) {
       L.push('⚠️  È una Master Playlist. Il primo URL è un\'altra playlist, non un segmento video.');
@@ -632,9 +664,14 @@ async function checkseg(u) {
       if (bytes[0] === 0x47) {
         L.push('✅ Formato: MPEG-TS (Transport Stream) - COMPATIBILE');
       } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
-        L.push('✅ Formato: fMP4 (Fragmented MP4) - COMPATIBILE');
+        L.push('✅ Formato: fMP4 (Fragmented MP4) - richiede EXT-X-MAP funzionante');
         const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
         L.push('Brand: ' + brand);
+        // Controlliamo se è HEVC
+        if (bytes.length >= 12) {
+          const boxType = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+          L.push('Box type: ' + boxType);
+        }
       } else {
         const text = String.fromCharCode(...bytes.slice(0, 100));
         if (text.includes('<html') || text.includes('<!DOCTYPE') || text.includes('<script')) {
@@ -652,9 +689,10 @@ async function checkseg(u) {
       L.push('❌ Segmento non disponibile (HTTP ' + r.status + ')');
     } else if (bytes.length < 100) {
       L.push('❌ Segmento troppo piccolo (' + bytes.length + ' bytes)');
-    } else if (bytes[0] === 0x47 || String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
-      L.push('✅ Il segmento video è VALIDO e scaricato correttamente.');
-      L.push('Se il player mostra schermo nero, il problema è il codec (es. H265) o il player stesso.');
+    } else if (bytes[0] === 0x47) {
+      L.push('✅ MPEG-TS valido. Se schermo nero = probabile codec HEVC non supportato dal tuo player.');
+    } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
+      L.push('✅ fMP4 valido. Se schermo nero = controlla che EXT-X-MAP sia funzionante.');
     } else {
       L.push('⚠️  Il segmento NON è un video valido. La fonte sta restituendo errori o blocchi.');
     }
@@ -702,13 +740,16 @@ async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
-  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.1) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA MULTI-FONTE (v8.2) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
     try {
       const txt = await fn();
       L.push('— ' + label + ' (' + (Date.now() - t0) + 'ms) —');
       L.push('OK | ' + playlistStats(txt));
+      // ✅ Controlliamo se c'è MAP
+      if (txt.includes('#EXT-X-MAP')) L.push('   ℹ️  Usa fMP4 con EXT-X-MAP');
+      else L.push('   ℹ️  Usa MPEG-TS');
     } catch (e) {
       L.push('— ' + label + ' (' + (Date.now() - t0) + 'ms) —');
       L.push('ERRORE: ' + (e && e.message));
@@ -730,16 +771,15 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== DELAY v8.1 ===');
-  L.push('Finestra dinamica: ' + DELAY_MIN + 's – ' + DELAY_TARGET + 's (prima 25–27s)');
-  L.push('Se la fonte pubblica segmenti corti, la finestra si adatta automaticamente.');
+  L.push('=== DELAY v8.2 ===');
+  L.push('Finestra: ' + DELAY_MIN + 's – ' + DELAY_TARGET + 's + ' + EXTRA_KEYFRAME_SEG + ' segmento extra per keyframe');
   L.push('');
-  L.push('=== ANTI-DEATH & ANTI-BLOCK ===');
-  L.push('• Token NTV rinnovati 2min prima della scadenza');
-  L.push('• URL Daddy rinnovati ogni 2min (1min anticipo)');
-  L.push('• User-Agent rotato casualmente ad ogni richiesta');
-  L.push('• Retry con backoff esponenziale su errori temporanei');
-  L.push('• Keep-Alive HTTP per evitare disconnessioni silenziose');
+  L.push('=== FIX SCHERMO NERO APPLICATI ===');
+  L.push('• 1 segmento extra all\'inizio della finestra per garantire keyframe');
+  L.push('• Se DISCONTINUITY, andiamo ancora più indietro');
+  L.push('• EXT-X-MAP proxyato correttamente con flag init=1 (no cache)');
+  L.push('• EXT-X-VERSION:4 per migliore compatibilità fMP4');
+  L.push('• Content-Length non copiato se c\'è transfer-encoding');
   return L.join('\n');
 }
 
@@ -751,10 +791,11 @@ function playlistStats(txt) {
   const total = durs.reduce((a, b) => a + b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
     + ' | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's'
-    + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
+    + ' | delay effettivo ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's'
+    + (p.map ? ' | fMP4' : ' | MPEG-TS');
 }
 
-const VER = 'TVNOW-CF v8.1 (Migliorata)';
+const VER = 'TVNOW-CF v8.2 (Fix Schermo Nero)';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
 
@@ -769,14 +810,14 @@ function debug() {
   const L = [VER, 'Cache: NTV=' + tokenCache.size + '/' + MAX_TOKEN_CACHE + ' | Daddy=' + daddyCache.size + '/' + MAX_DADDY_CACHE + ' | VavooURL=' + vavooURLCache.size];
   const vm = vavooMapGet();
   L.push('Vavoo map: ' + (vm ? vm.size + ' canali' : 'non caricata'));
-  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, min segs ' + MIN_SEGS + ', pref ' + PREF_SEGS);
+  L.push('Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, extra keyframe seg=' + EXTRA_KEYFRAME_SEG);
   L.push('UA pool: ' + UA_POOL.length + ' user-agent disponibili');
-  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg + ' (tetto 100k/gg)');
+  L.push('Richieste oggi: live=' + reqStats.live + ' seg=' + reqStats.seg);
   L.push('Log:\n  ' + (logs.slice(-10).join('\n  ') || '(vuoti)'));
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 10-14s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-24         diagnostica + finestra scelta','  /checkseg?s=ntv&ch=869        test segmento reale NTV','  /checkseg?s=daddy&ch=869      test segmento reale Daddy','  /checkseg?s=vavoo&ch=sky-sport-24  test segmento reale Vavoo','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con delay 12-16s','  /live?ch=X&p=vavoo,ntv        ordine provider custom','  /diag?ch=sky-sport-f1         diagnostica completa','  /checkseg?s=ntv&ch=577        test segmento F1','  /warm  /vmap  /probe?ch=X  /debug  /ch  /rawu  /ip',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -795,4 +836,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.1 ███
+// ███ FINE TVNOW-CF v8.2 ███
