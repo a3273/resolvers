@@ -22,8 +22,7 @@ export default {
       if (path === '/probe') return R(await probe(u), 200, TXT());
       if (path === '/diag') return R(await diag(u), 200, TXT());
       if (path === '/debug') return R(debug(), 200, TXT());
-      // 🔥 NUOVO ENDPOINT DI DIAGNOSTICA SEGMENTI
-      if (path === '/checkseg') return await checkseg(u); 
+      if (path === '/checkseg') return await checkseg(u);
       if (path === '/ip') {
         const ip = req.headers.get('cf-connecting-ip') || '';
         const r = await fetchT('https://www.cloudflare.com/cdn-cgi/trace', {}, 8000);
@@ -46,7 +45,6 @@ const PREF_SEGS     = 3;
 const MIN_SEGS      = 2;
 
 const CHANNELS = [
-  // FIX 1: ID Vavoo hardcodati per RSI
   { slug: 'rsi-la-1', name: 'RSI La 1', ntv: '', vavoo: 'rsi la 1', daddy: '', vid: '2455610203' },
   { slug: 'rsi-la-2', name: 'RSI La 2', ntv: '', vavoo: 'rsi la 2', daddy: '', vid: '3475299702' },
   { slug: 'sky-sport-serie-a', name: 'Sky Sport Serie A', ntv: '', vavoo: 'sky sport serie a', daddy: '880' },
@@ -471,7 +469,6 @@ async function seg(u) {
   const range = u.searchParams.get('range');
   if (range) h['Range'] = range;
 
-  // FIX 2: Forziamo gli header di Daddy per evitare i blocchi 403
   if (ref.includes('thedaddy')) {
     h['Referer'] = 'https://thedaddy.li/';
     h['Origin'] = 'https://thedaddy.li';
@@ -500,7 +497,7 @@ async function seg(u) {
 
 function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
-// 🔥 NUOVA FUNZIONE: DIAGNOSTICA SEGMENTI REALI
+// 🔥 DIAGNOSTICA SEGMENTI REALI
 async function checkseg(u) {
   const source = u.searchParams.get('s') || 'ntv';
   const ch = u.searchParams.get('ch') || '869';
@@ -523,7 +520,7 @@ async function checkseg(u) {
       txt = await r.text();
       headers = getBrowserHeaders('https://thedaddy.li/');
     } else if (source === 'vavoo') {
-      const c = findCh(ch); // ch qui è lo slug, es. 'sky-sport-24'
+      const c = findCh(ch);
       if (!c) return R('Vavoo: Canale non trovato (usa slug, es. sky-sport-24)', 200, TXT());
       const vu = await vavooResolve(c.vavoo, c.vid);
       if (!vu) return R('Vavoo: URL non risolto', 200, TXT());
@@ -555,9 +552,7 @@ async function checkseg(u) {
     
     if (!segUrl) return R('Nessun URL trovato nella playlist', 200, TXT());
     
-    // Se è un URL relativo, lo rendiamo assoluto (semplificazione)
     if (!segUrl.startsWith('http')) {
-        // Non possiamo risolverlo facilmente qui senza la base URL, ma proviamo
         L.push('⚠️  URL relativo trovato, impossibile da testare direttamente senza base URL.');
         return R(L.join('\n'), 200, TXT());
     }
@@ -575,12 +570,10 @@ async function checkseg(u) {
     L.push('Dimensione: ' + bytes.length + ' bytes');
     L.push('');
     
-    // Primi 16 bytes in hex
     const hex = Array.from(bytes.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
     L.push('Primi 16 bytes (hex): ' + hex);
     L.push('');
     
-    // Identifica il formato
     if (bytes.length >= 4) {
       if (bytes[0] === 0x47) {
         L.push('✅ Formato: MPEG-TS (Transport Stream) - COMPATIBILE');
@@ -617,8 +610,6 @@ async function checkseg(u) {
     return R('ERRORE: ' + e.message, 200, TXT());
   }
 }
-
-function baseUrl_of(d) { return d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, ''); }
 
 async function warm() {
   const t0 = Date.now();
