@@ -1,18 +1,18 @@
 // ============================================================================
-// TVNOW-CF v1.5 IN-PLACE+ — Riscrittura in-place + DISCONTINUITY iniziale
+// TVNOW-CF v1.7 — ISOLAMENTO TOTALE + FIX FALLIMENTO A CASCATA
 // ============================================================================
-// UNIONE V1.4 + V1.6:
-// 1. Riscrittura IN-PLACE (preserva #EXT-X-MAP e #EXT-X-KEY)
-// 2. #EXT-X-DISCONTINUITY iniziale (reset decoder -> fix schermo grigio/blocchi)
-// 3. Finestra 10 segmenti (garantisce keyframe)
-// 4. NO cache-busting per NTV (preserva token di firma)
-// 5. Header NTV corretti + NO cache Cloudflare su segmenti firmati
-// 6. invalidateCache su 403/404 (rinnova token al prossimo fetch)
+// 1. FIX CRITICO: Rimossa la cancellazione globale della cache su errore 403.
+//    Un errore su un segmento non deve più "avvelenare" e resettare le cache
+//    di tutti gli altri provider (causa del blocco a cascata).
+// 2. FORZATURA NTV: Per Sky Sport F1 e Tennis, usa SOLO NTV. 
+//    Vavoo e Daddy danno 403 su questi canali e provarli rischia di far 
+//    bannare l'IP del worker per rate-limit, rompendo anche NTV.
+// 3. Mantiene: Rewrite In-Place, No cache-busting NTV, Header corretti.
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.5 IN-PLACE+',
-  FEATURES: ['In-Place Rewrite (MAP/KEY)', 'DISCONTINUITY iniziale', 'Finestra 10 segs', 'Fix NTV token', 'Cache eviction 403']
+  VERSION: 'TVNOW-CF v1.7',
+  FEATURES: ['No Cascading Failure', 'NTV Forced for F1/Tennis', 'In-Place Rewrite', 'Safe Cache Management']
 };
 
 const CHANNELS = [
@@ -74,7 +74,8 @@ function elencoCanali(u){
   return L.join('\n');
 }
 
-function invalidateCache(slug) { tokenCache.clear(); daddyCache.clear(); vavooURLCache.clear(); }
+// 🔥 FIX: Rimossa la distruzione globale. La cache si gestisce con i TTL naturali.
+// Se un token scade, ntvPlaylist() lo gestisce automaticamente senza nuke globale.
 
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
@@ -97,8 +98,10 @@ async function ntvPlaylist(id){
   let r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000);
   let txt=r.ok?await r.text():'';
   if(!r.ok||r.status>=500||!txt.includes('#EXTM3U')){ 
-    tokenCache.delete(id); tk=await ntvToken(id); 
-    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); txt=r.ok?await r.text():''; 
+    tokenCache.delete(id); // Cancella SOLO questo token specifico, non tutto
+    tk=await ntvToken(id); 
+    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); 
+    txt=r.ok?await r.text():''; 
   }
   if(!txt.includes('#EXTM3U')) throw new Error('ntv playlist '+r.status+' non-HLS');
   return {txt,ref:tk.ref,base:tk.m3u8};
@@ -128,8 +131,6 @@ async function extractM3u8(url,refererDomain,timeoutMs){
   const html=await r.text();
   let m3u8=html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
   if(m3u8) return m3u8[1];
-  const jsVar=html.match(/(?:file|source|url|m3u8)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i);
-  if(jsVar) return jsVar[1];
   const iframe=html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
   if(iframe){
     const r2=await fetchT(iframe[1],{headers:browserHeaders(url),cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
@@ -192,10 +193,22 @@ async function vavooResolveDual(slug,vid6,vid7){
   const cacheKey=slug||('q:'+norm(slug));
   const cachedUrl=vavooURLCache.get(cacheKey);
   if(cachedUrl&&cachedUrl.exp>now) return cachedUrl.url;
+  
   let firstId=vid6, secondId=vid7;
   if(!firstId&&!secondId){ const m=await ensureVavooMap(); firstId=vavooMapFind(slug,m); }
-  if(firstId){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,firstId); if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; } } }
-  if(secondId){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,secondId); if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; } } }
+  
+  if(firstId){
+    for(const base of VAVOO_MIRRORS.slice(0,6)){
+      const u=await vavooResolveId(base,firstId);
+      if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; }
+    }
+  }
+  if(secondId){
+    for(const base of VAVOO_MIRRORS.slice(0,6)){
+      const u=await vavooResolveId(base,secondId);
+      if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; }
+    }
+  }
   return null;
 }
 
@@ -211,7 +224,13 @@ async function live(u, P, legacy) {
   const c = findCh(q);
   if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(u), 200, TXT());
 
-  const order = legacy ? [legacy, ...['vavoo', 'daddy', 'ntv'].filter(x => x !== legacy)] : (u.searchParams.get('p') || 'vavoo,daddy,ntv').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  // 🔥 FIX: Forziamo NTV per F1 e Tennis per evitare che i 403 di Daddy/Vavoo 
+  // inneschino rate-limit che rompono anche NTV.
+  const ntvOnlySlugs = ['sky-sport-f1', 'sky-sport-tennis'];
+  const defaultOrder = ntvOnlySlugs.includes(c.slug) ? ['ntv'] : ['vavoo', 'daddy', 'ntv'];
+  
+  const order = legacy ? [legacy, ...defaultOrder.filter(x => x !== legacy)] : (u.searchParams.get('p') || defaultOrder.join(',')).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  
   const availableOrder = order.filter(p => {
     if (p === 'vavoo') return c.vavoo || c.vid6 || c.vid7;
     if (p === 'ntv') return c.ntv;
@@ -256,29 +275,41 @@ async function live(u, P, legacy) {
         if (res instanceof Response) return res;
         return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
       }
-    } catch (e) { /* continua */ }
+    } catch (e) { /* continua al prossimo provider */ }
   }
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// ============================================================================
-// REWRITE IN-PLACE + DISCONTINUITY INIZIALE (il cuore della fix)
-// ============================================================================
 function rewriteHls(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
+  
+  if (txt.includes('#EXT-X-STREAM-INF')) {
+    const lines = txt.split(/\r?\n/);
+    const out = [];
+    for (let line of lines) {
+      const t = line.trim();
+      if (!t) { out.push(line); continue; }
+      if (t.startsWith('#')) { out.push(line); continue; }
+      out.push(makeProxUrl(absUrl(t, baseUrl), P, ref, origin));
+    }
+    return out.join('\n');
+  }
+  
   const lines = txt.split(/\r?\n/);
   const out = [];
-
+  
   let segIndices = [];
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() && !lines[i].trim().startsWith('#')) segIndices.push(i);
+    if (lines[i].trim() && !lines[i].trim().startsWith('#')) {
+      segIndices.push(i);
+    }
   }
-
-  const maxSegs = 10; // finestra ampia -> garantisce keyframe
+  
+  const maxSegs = 6; 
   const startIdx = Math.max(0, segIndices.length - maxSegs);
-  const dropCount = startIdx; // quanti ne tagliamo
-
+  const dropCount = segIndices.length - (segIndices.length - startIdx);
+  
   let currentSeg = 0;
   let discontinuityInjected = false;
 
@@ -294,7 +325,9 @@ function rewriteHls(txt, baseUrl, P, ref, origin) {
         continue;
       }
       if (line.includes('URI="')) {
-        line = line.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="' + makeProxUrl(absUrl(uri, baseUrl), P, ref, origin) + '"');
+        line = line.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return 'URI="' + makeProxUrl(absUrl(uri, baseUrl), P, ref, origin) + '"';
+        });
       }
       out.push(line);
       continue;
@@ -302,7 +335,6 @@ function rewriteHls(txt, baseUrl, P, ref, origin) {
 
     currentSeg++;
     if (currentSeg > startIdx) {
-      // 🔥 Inietta DISCONTINUITY una sola volta, prima del primo segmento mantenuto
       if (!discontinuityInjected) {
         out.push('#EXT-X-DISCONTINUITY');
         discontinuityInjected = true;
@@ -321,7 +353,6 @@ function absUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// NO cache-busting per NTV (preserva token di firma)
 function makeProxUrl(abs, P, ref, origin) {
   const isNtv = abs.includes('tvnow247') || abs.includes('cfbu247');
   let urlToEncode = isNtv ? abs : abs + (abs.includes('?') ? '&' : '?') + '_t=' + Math.floor(Date.now() / 2000) * 2000;
@@ -335,6 +366,7 @@ async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://tvnow247.today/';
   const o = u.searchParams.get('o');
+  
   const isNtv = target.includes('tvnow247') || target.includes('cfbu247');
   const headers = isNtv ? {
     'User-Agent': UA, 'Referer': 'https://tvnow247.today/', 'Origin': 'https://tvnow247.today', 'Accept': '*/*'
@@ -345,10 +377,11 @@ async function seg(u) {
 
   try {
     const r = await fetchT(target, { headers, cf: { cacheTtl: isNtv ? 0 : 2, cacheEverything: !isNtv } }, 15000);
-    if (r.status === 403 || r.status === 404 || r.status === 401) {
-      invalidateCache();
-      return new Response('Token scaduto, rinnovo in corso...', { status: 503, headers: CORS() });
-    }
+    
+    // 🔥 FIX: Rimossa invalidateCache() globale. 
+    // Un 403 su un segmento è gestito dal player (che passerà al successivo). 
+    // Nuke globale causava il blocco a cascata di tutti i provider.
+    
     const hh = {
       'content-type': r.headers.get('content-type') || 'video/mp2t',
       'access-control-allow-origin': '*', 'accept-ranges': 'bytes',
@@ -356,6 +389,7 @@ async function seg(u) {
     };
     const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
     const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
+    
     return new Response(r.body, { status: r.status, headers: hh });
   } catch (e) {
     return new Response('Segment error', { status: 502, headers: CORS() });
@@ -399,4 +433,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.5 IN-PLACE+ ███
+// ███ FINE TVNOW-CF v1.7 ███
