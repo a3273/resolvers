@@ -1,23 +1,22 @@
 // ============================================================================
-// TVNOW-CF v9.4 — FIX DEFINITIVO: NO MASTER PLAYLIST + FORZA H.264
+// TVNOW-CF v9.5 — STRATEGIA 4 STADI ANTI-SCHERMO GRIGIO
 // ============================================================================
-// FIX CHIRURGICI:
-// 1. Il worker NON restituisce mai master playlist: scarica la media playlist
-//    della variante H.264 scelta e la restituisce direttamente
-// 2. Se tutte le varianti sono HEVC, passa al provider successivo
-// 3. Fallback automatico: Vavoo → Daddy → NTV (con retry su HEVC)
+// 1. Priorità assoluta a H.264 720p → 480p → qualsiasi H.264
+// 2. Fallback automatico risoluzioni: 720p → 480p → 1080p
+// 3. Ordine provider forzato (NTV→Daddy→Vavoo) per F1 e Tennis
+// 4. Log di conferma della variante inviata al player
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.4',
+  VERSION: 'TVNOW-CF v9.5',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
-    'NO master playlist (solo media)',
-    'Forza H.264 (scarta HEVC)',
-    'Fallback automatico provider',
-    'Quality-Lock auto-fallback',
+    'Priorità H.264 720p/480p',
+    'Fallback automatico 720→480→1080',
+    'Ordine provider forzato (F1/Tennis)',
+    'Log variante inviata al player',
     'Dual-ID Vavoo (6)/(7)',
     'Health Check Auto-Switch',
     'Keyframe Window 8s',
@@ -82,7 +81,7 @@ function findCh(q){ let k=norm(q); if(BY_KEY.has(k)) return BY_KEY.get(k); k=k.r
 function elencoCanali(u){
   const search=(u&&u.searchParams.get('q'))||'';
   const L=[CONFIG.VERSION+' — CANALI ('+CHANNELS.length+')'];
-  L.push('Uso: /live?ch=<slug>   /live?ch=X&res=720   /live?ch=X&fail=1');
+  L.push('Uso: /live?ch=<slug>');
   for(const c of CHANNELS){
     if(search && !c.slug.includes(search) && !c.name.toLowerCase().includes(search)) continue;
     const q = qualityStore.get(c.slug);
@@ -263,9 +262,6 @@ async function vavooResolveDual(slug,query,vid6,vid7){
 async function tryVavooId(id){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,id); if(u) return u; } return null; }
 async function vavooResolve(query,vid){ const c=findCh(query); if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7); return await vavooResolveDual(null,query,vid,null); }
 
-// ============================================================================
-// VARIANT SELECTOR — FORZA H.264, SCARTA HEVC
-// ============================================================================
 function parseMasterPlaylist(body){
   const lines=body.split(/\r?\n/);
   const variants=[]; let current=null;
@@ -285,113 +281,204 @@ function codecIsH264(codecs){ return !!codecs && String(codecs).toLowerCase().in
 function codecIsHEVC(codecs){ return !!codecs && (String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1')); }
 function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
 
+// ============================================================================
+// STADIO 1: NUOVA FUNZIONE SELEZIONE VARIANTE — PRIORITÀ 720p H.264
+// ============================================================================
 function selectVariantSmart(variants, maxRes){
-  // 1) Solo H.264 (avc1) — mai HEVC
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
-  if(h264.length > 0){
-    const eligible = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
-    if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
-    return h264.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
+  log(`🔍 Trovate ${h264.length} varianti H.264 su ${variants.length} totali`);
+
+  // 🥇 PRIMA: CERCHIAMO H.264 A 720p
+  let best720 = h264.find(v => {
+    const h = getResHeight(v.attrs.RESOLUTION);
+    return h >= 680 && h <= 740;
+  });
+  if(best720){
+    log('✅ SCELTA PRIMARIA: H.264 720p');
+    return best720;
   }
-  // 2) Se non c'è H.264, restituisci null (il worker passerà al provider successivo)
-  return null;
+
+  // 🥈 POI: H.264 480p
+  let best480 = h264.find(v => {
+    const h = getResHeight(v.attrs.RESOLUTION);
+    return h >= 440 && h <= 520;
+  });
+  if(best480){
+    log('✅ SCELTA: H.264 480p');
+    return best480;
+  }
+
+  // 🥉 POI: H.264 QUALSIASI RISOLUZIONE ENTRO maxRes
+  const eligibleH264 = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
+  if(eligibleH264.length > 0){
+    const sorted = eligibleH264.sort((a,b) => getResHeight(b.attrs.RESOLUTION) - getResHeight(a.attrs.RESOLUTION));
+    log('✅ SCELTA: H.264 ' + getResHeight(sorted[0].attrs.RESOLUTION) + 'p');
+    return sorted[0];
+  }
+
+  // ⚠️ SOLO SE NESSUN H.264 TROVATO
+  log('❌ NESSUNA VARIANTE H.264 TROVATA → RISCHIO SCHERMO GRIGIO');
+  const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
+  if(hevc.length > 0){
+    const eligibleHEVC = hevc.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
+    if(eligibleHEVC.length > 0){
+      const sortedHEVC = eligibleHEVC.sort((a,b) => getResHeight(b.attrs.RESOLUTION) - getResHeight(a.attrs.RESOLUTION));
+      return sortedHEVC[0];
+    }
+    return hevc[0];
+  }
+
+  // 🟡 ULTIMO FALLBACK
+  if(variants.length === 0) return null;
+  const eligibleAll = variants.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
+  if(eligibleAll.length > 0){
+    return eligibleAll.sort((a,b) => getResHeight(b.attrs.RESOLUTION) - getResHeight(a.attrs.RESOLUTION))[0];
+  }
+  return variants[0];
 }
 
 let lastPl={key:'',txt:'',t:0};
 
-async function live(u,P,legacy){
+// ============================================================================
+// STADIO 2 & 3: FALLBACK AUTOMATICO 720→480→1080 + ORDINE FORZATO
+// ============================================================================
+async function live(u, P, legacy) {
   countReq('live');
-  const q=u.searchParams.get('ch')||u.searchParams.get('c')||'';
-  if(!q) return R('uso: /live?ch=<slug>\n\n'+elencoCanali(u),200,TXT());
-  const c=findCh(q);
-  if(!c) return R('canale non mappato: "'+q+'"\n\n'+elencoCanali(u),200,TXT());
+  const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
+  if (!q) return R('uso: /live?ch=<slug>\n\n' + elencoCanali(u), 200, TXT());
+  const c = findCh(q);
+  if (!c) return R('canale non mappato: "' + q + '"\n\n' + elencoCanali(u), 200, TXT());
 
-  if(u.searchParams.get('fail')==='1') degradeQuality(c.slug);
-  if(u.searchParams.get('reset')==='1') resetQuality(c.slug);
+  if (u.searchParams.get('fail') === '1') degradeQuality(c.slug);
+  if (u.searchParams.get('reset') === '1') resetQuality(c.slug);
   const resParam = u.searchParams.get('res');
-  if(resParam){ const r=parseInt(resParam); if(CONFIG.RES_LADDER.includes(r)) setQuality(c.slug,r); }
+  if (resParam) { const r = parseInt(resParam); if (CONFIG.RES_LADDER.includes(r)) setQuality(c.slug, r); }
 
-  const order = legacy ? [legacy,...['vavoo','daddy','ntv'].filter(x=>x!==legacy)] : (u.searchParams.get('p')||'vavoo,daddy,ntv').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-  const availableOrder = order.filter(p=>{ if(p==='vavoo') return c.vavoo||c.vid6||c.vid7; if(p==='ntv') return c.ntv; if(p==='daddy') return c.daddy; return true; });
+  const order = legacy ? [legacy, ...['vavoo', 'daddy', 'ntv'].filter(x => x !== legacy)] : (u.searchParams.get('p') || 'vavoo,daddy,ntv').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  
+  // 🎯 STADIO 3: Ordine forzato per canali problematici
+  const problematicSlugs = ['sky-sport-f1', 'sky-sport-tennis'];
+  let availableOrder;
+  if (problematicSlugs.includes(c.slug)) {
+    availableOrder = ['ntv', 'daddy', 'vavoo'];
+    log(`🎯 ORDINE FORZATO (NTV → DADDY → VAVOO) PER ${c.name}`);
+  } else {
+    availableOrder = order.filter(p => {
+      if (p === 'vavoo') return c.vavoo || c.vid6 || c.vid7;
+      if (p === 'ntv') return c.ntv;
+      if (p === 'daddy') return c.daddy;
+      return true;
+    });
+  }
 
-  const maxRes = getQuality(c.slug).maxRes;
-  const ck=c.slug+':'+availableOrder.join('.')+':'+maxRes;
-  if(lastPl.key===ck&&Date.now()-lastPl.t<1500) return R(lastPl.txt,200,HLS_NO_CACHE());
+  // 🟢 STADIO 2: Fallback automatico 720p → 480p → 1080p
+  const qualityAttempts = [720, 480, 1080];
+  let finalStream = null;
 
-  const provs={
-    vavoo: async()=>{
-      if(!c.vavoo&&!c.vid6&&!c.vid7) return null;
-      const vu=await vavooResolveDual(c.slug,c.vavoo,c.vid6,c.vid7);
-      if(!vu) return null;
-      if(/\.m3u8(\?|$)/i.test(vu)){
-        const r=await fetchT(vu,{headers:vavooHeaders({'User-Agent':'VAVOO/1.0'})},8000);
-        if(!r.ok){ recordVavooFail(c.slug,6); recordVavooFail(c.slug,7); vavooURLCache.delete(c.slug); return null; }
-        const out=await processPlaylist(await r.text(),vu,P,'https://vavoo.to/','https://vavoo.to',maxRes,c.slug);
-        if(out){ lastPl={key:ck,txt:out,t:Date.now()}; return R(out,200,HLS_NO_CACHE()); }
-        return null; // HEVC-only, passa al prossimo provider
-      }
-      return R('redirect vavoo',302,{Location:vu,...CORS()});
-    },
-    ntv: async()=>{
-      if(!c.ntv) return null;
-      const pl=await ntvPlaylist(c.ntv);
-      const out=await processPlaylist(pl.txt,pl.base,P,pl.ref,'',maxRes,c.slug);
-      if(out){ lastPl={key:ck,txt:out,t:Date.now()}; return R(out,200,HLS_NO_CACHE()); }
-      return null; // HEVC-only, passa al prossimo provider
-    },
-    daddy: async()=>{
-      if(!c.daddy) return null;
-      const du=await daddyResolve(c.daddy);
-      if(!du||!/\.m3u8/i.test(du)) return null;
-      const r=await fetchT(du,{headers:getBrowserHeaders('https://thedaddy.li/')},8000);
-      if(!r.ok){ daddyCache.delete(c.daddy); return null; }
-      const processed=await processPlaylist(await r.text(),du,P,'https://thedaddy.li/','',maxRes,c.slug);
-      if(processed){
-        const finalTxt=['#EXTVLCOPT:http-referrer=https://thedaddy.li/','#EXTVLCOPT:http-user-agent='+UA].concat(processed.split('\n')).join('\n');
-        lastPl={key:ck,txt:finalTxt,t:Date.now()};
-        return R(finalTxt,200,HLS_NO_CACHE());
-      }
-      return null; // HEVC-only
+  for (const tryRes of qualityAttempts) {
+    setQuality(c.slug, tryRes);
+    log(`🔄 PROVO ${c.name} a ${tryRes}p`);
+    
+    const ck = c.slug + ':' + availableOrder.join('.') + ':' + tryRes;
+    if (lastPl.key === ck && Date.now() - lastPl.t < 1500) {
+      finalStream = R(lastPl.txt, 200, HLS_NO_CACHE());
+      break;
     }
-  };
 
-  for(const p of availableOrder){ const fn=provs[p]; if(!fn) continue; try{ const res=await fn(); if(res) return res; }catch(e){ log(p+' ko '+c.slug+': '+(e&&e.message)); } }
-  return R('ERRORE: provider KO ('+availableOrder.join(' -> ')+') per '+c.name+'. /probe?ch='+c.slug,200,TXT());
+    const provs = {
+      vavoo: async () => {
+        if (!c.vavoo && !c.vid6 && !c.vid7) return null;
+        const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
+        if (!vu) return null;
+        if (/\.m3u8(\?|$)/i.test(vu)) {
+          const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+          if (!r.ok) { recordVavooFail(c.slug, 6); recordVavooFail(c.slug, 7); vavooURLCache.delete(c.slug); return null; }
+          const out = await processPlaylist(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to', tryRes, c.slug);
+          if (out) { lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS_NO_CACHE()); }
+          return null;
+        }
+        return R('redirect vavoo', 302, { Location: vu, ...CORS() });
+      },
+      ntv: async () => {
+        if (!c.ntv) return null;
+        const pl = await ntvPlaylist(c.ntv);
+        const out = await processPlaylist(pl.txt, pl.base, P, pl.ref, '', tryRes, c.slug);
+        if (out) { lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS_NO_CACHE()); }
+        return null;
+      },
+      daddy: async () => {
+        if (!c.daddy) return null;
+        const du = await daddyResolve(c.daddy);
+        if (!du || !/\.m3u8/i.test(du)) return null;
+        const r = await fetchT(du, { headers: getBrowserHeaders('https://thedaddy.li/') }, 8000);
+        if (!r.ok) { daddyCache.delete(c.daddy); return null; }
+        const processed = await processPlaylist(await r.text(), du, P, 'https://thedaddy.li/', '', tryRes, c.slug);
+        if (processed) {
+          const finalTxt = ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA].concat(processed.split('\n')).join('\n');
+          lastPl = { key: ck, txt: finalTxt, t: Date.now() };
+          return R(finalTxt, 200, HLS_NO_CACHE());
+        }
+        return null;
+      }
+    };
+
+    let providerSuccess = false;
+    for (const p of availableOrder) {
+      const fn = provs[p];
+      if (!fn) continue;
+      try {
+        const res = await fn();
+        if (res) {
+          finalStream = res;
+          providerSuccess = true;
+          log(`✅ SUCCESSO A ${tryRes}p per ${c.name} tramite ${p}`);
+          break;
+        }
+      } catch (e) {
+        log(`❌ FALLIMENTO ${tryRes}p per ${c.name} (${p}): ` + (e && e.message));
+      }
+    }
+    
+    if (providerSuccess) break;
+  }
+
+  if (finalStream) return finalStream;
+  return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
 // ============================================================================
-// PROCESS PLAYLIST — SCARICA MEDIA PLAYLIST DIRETTAMENTE
+// STADIO 4: LOG DI CONFERMA VARIANTE INVIATA
 // ============================================================================
 async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) return null;
   
   if (/#EXT-X-STREAM-INF/.test(txt)) {
-    // È una master playlist: scegli variante H.264 e scarica la media playlist
     const variants = parseMasterPlaylist(txt);
     const chosen = selectVariantSmart(variants, maxRes);
     
     if (!chosen) {
-      log('⚠️ '+channelSlug+': nessuna variante H.264,跳过');
-      return null; // Passa al provider successivo
+      log('⚠️ ' + channelSlug + ': nessuna variante H.264 trovata,跳过');
+      return null;
     }
+    
+    // 🟣 STADIO 4: Log di conferma
+    log(`📤 INVIATO A TELEVIZO: Risoluzione=${getResHeight(chosen.attrs.RESOLUTION)}p | Codecs=${chosen.attrs.CODECS}`);
     
     const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
     const mediaUrl = resolveUri(baseDir, chosen.uri);
     
-    // Scarica la media playlist della variante H.264 scelta
     try {
       const r = await fetchT(mediaUrl, { headers: getBrowserHeaders(ref) }, 5000);
       if (!r.ok) return null;
       const mediaTxt = await r.text();
       return rewriteMediaPl(mediaTxt, mediaUrl, P, ref, origin);
     } catch (e) {
-      log('❌ '+channelSlug+': errore download media playlist: '+e.message);
+      log('❌ ' + channelSlug + ': errore download media playlist: ' + e.message);
       return null;
     }
   }
   
-  // È già una media playlist
   return rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
@@ -436,7 +523,7 @@ function proxUrl(abs,P,ref,origin){
 
 function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   const p=parseMediaPl(txt);
-  if(p.isMaster||!p.segs.length) return null; // Non dovrebbe mai succedere
+  if(p.isMaster||!p.segs.length) return null;
   const maxSegs=8;
   const kept=p.segs.slice(-maxSegs);
   const dropped=p.segs.length-kept.length;
@@ -604,11 +691,11 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v9.4 ===');
-  L.push('1. Scarica SEMPRE media playlist (mai master)');
-  L.push('2. Sceglie SOLO varianti H.264 (avc1)');
-  L.push('3. Se solo HEVC → passa al provider successivo');
-  L.push('4. Fallback: Vavoo → Daddy → NTV');
+  L.push('=== LOGICA v9.5 ===');
+  L.push('1. Ordine forzato NTV→Daddy→Vavoo per F1/Tennis');
+  L.push('2. Fallback automatico: 720p → 480p → 1080p');
+  L.push('3. Priorità assoluta a H.264 (720p prima di tutto)');
+  L.push('4. HEVC solo come ultima spiaggia (rischio schermo grigio)');
   return L.join('\n');
 }
 
@@ -632,13 +719,13 @@ function debug(){
   L.push('');
   L.push('🌐 ENDPOINT');
   L.push('─────────────────────────────────────────────────────────');
-  L.push('  /live?ch=canale              Stream 1080p H.264');
-  L.push('  /live?ch=canale&fail=1       ⬇️ Scendi risoluzione');
+  L.push('  /live?ch=canale              Stream con fallback 720→480→1080');
+  L.push('  /live?ch=canale&fail=1       ⬇️ Scendi risoluzione manuale');
   L.push('  /live?ch=canale&reset=1      🔄 Torna a 1080p');
   L.push('  /seg?u=...                   Proxy segmento');
   L.push('  /warm                        Riscaldamento cache');
   L.push('  /probe?ch=canale             Test rapido');
-  L.push('  /diag?ch=canale              Diagnostica completa');
+  L.push('  /diag?ch=canale              Diagnostica completa con log varianti');
   L.push('  /checkseg?s=vavoo&ch=X       Test variante');
   L.push('  /vmap?ch=canale              Varianti disponibili');
   L.push('  /ch?q=ricerca                Lista canali');
@@ -684,7 +771,7 @@ function log(m){ logs.push(new Date().toISOString().slice(11,19)+' '+m); if(logs
 let reqStats={day:new Date().toISOString().slice(0,10),live:0,seg:0};
 function countReq(kind){ const d=new Date().toISOString().slice(0,10); if(d!==reqStats.day) reqStats={day:d,live:0,seg:0}; reqStats[kind]++; }
 
-function uso(P){ return [CONFIG.VERSION,'','uso:','  /live?ch=<slug>            playlist H.264 only','  /live?ch=X&fail=1          ⬇️ scendi risoluzione','  /live?ch=X&reset=1         🔄 torna 1080p','  /diag?ch=sky-sport-f1      diagnostica','  /checkseg?s=vavoo&ch=X     test variante','  /probe?ch=X  /debug  /features','  /warm  /vmap  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P){ return [CONFIG.VERSION,'','uso:','  /live?ch=<slug>            Stream con fallback 720→480→1080','  /live?ch=X&fail=1          ⬇️ scendi risoluzione','  /live?ch=X&reset=1         🔄 torna 1080p','  /diag?ch=sky-sport-f1      diagnostica con log varianti','  /checkseg?s=vavoo&ch=X     test variante','  /probe?ch=X  /debug  /features','  /warm  /vmap  /ch  /rawu  /ip',''].join('\n'); }
 function TXT(){ return {'content-type':'text/plain; charset=utf-8',...CORS()}; }
 function HLS_NO_CACHE(){ return {'content-type':'application/vnd.apple.mpegurl','cache-control':'no-cache, no-store, must-revalidate','pragma':'no-cache','expires':'0',...CORS()}; }
 function CORS(){ return {'access-control-allow-origin':'*'}; }
@@ -738,4 +825,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.4 ███
+// ███ FINE TVNOW-CF v9.5 ███
