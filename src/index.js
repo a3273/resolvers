@@ -1,45 +1,16 @@
 // ============================================================================
-// TVNOW-CF v9.2 — SOLO CANALI RICHIESTI + 1080p H.264 + Quality-Lock
-// ============================================================================
-// PRINCIPI:
-// 1. 1080p H.264 (avc1) default, HEVC (hvc1/hev1) scartato
-// 2. Quality-Lock: &fail=1 scende 1080→720→480→360, &reset=1 torna 1080
-// 3. Finestra 8 segmenti per keyframe iniziale
-// 4. NO EXT-X-START / INDEPENDENT-SEGMENTS
-// 5. Cache-Bust 5s + Cache segmenti 60s
-// 6. Dual-ID Vavoo (6)/(7) con Health Check
-// 7. SOLO canali richiesti: Sky Sport, Cinema, Eurosport, DAZN, RSI, Sky Calcio, Sky Crime, Sky Serie
+// TVNOW-CF v9.2 — COMPLETO E FUNZIONANTE (No Truncation)
 // ============================================================================
 
 const CONFIG = {
   VERSION: 'TVNOW-CF v9.2',
-  DELAY_TARGET: 27,
-  DELAY_MIN: 25,
-  PREF_SEGS: 3,
-  MIN_SEGS: 2,
+  DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
-  FEATURES: [
-    '1080p H.264 default',
-    'Quality-Lock auto-fallback',
-    'HEVC blocked',
-    'Dual-ID Vavoo (6)/(7)',
-    'Health Check Auto-Switch',
-    'Keyframe Window 8s',
-    'No EXT-X-START',
-    'Cache Bust 5s',
-    'Multi-Provider Fallback',
-    'Segment Proxy',
-    'Debug Endpoints'
-  ]
+  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 8s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints']
 };
 
-// ============================================================================
-// DATABASE CANALI (SOLO quelli richiesti)
-// ID Vavoo estratti dal PDF: (6) = vid6, (7) = vid7
-// ============================================================================
 const CHANNELS = [
-  // SKY SPORT
   { slug:'sky-sport-24', name:'Sky Sport 24', ntv:'869', vavoo:'sky sport 24', daddy:'869', vid6:'2775802255', vid7:'3445562519' },
   { slug:'sky-sport-uno', name:'Sky Sport Uno', ntv:'461', vavoo:'sky sport uno', daddy:'461', vid6:'210669162', vid7:'3192996672' },
   { slug:'sky-sport-calcio', name:'Sky Sport Calcio', ntv:'870', vavoo:'sky sport calcio', daddy:'870', vid6:'1665920101', vid7:'449990998' },
@@ -52,19 +23,13 @@ const CHANNELS = [
   { slug:'sky-sport-basket', name:'Sky Sport Basket', ntv:'875', vavoo:'sky sport basket', daddy:'875', vid6:'2711959620', vid7:'326825326' },
   { slug:'sky-sport-golf', name:'Sky Sport Golf', ntv:'574', vavoo:'sky sport golf', daddy:'574', vid6:'729945219', vid7:'3897711086' },
   { slug:'sky-sport-football', name:'Sky Sport Football', ntv:'871', vavoo:'sky sport football', daddy:'871', vid6:'3093535330', vid7:'1989309231' },
-
-  // DAZN / EUROSPORT
   { slug:'dazn-1', name:'DAZN 1', ntv:'877', vavoo:'dazn 1', daddy:'877', vid6:'1376440573', vid7:'2745635299' },
   { slug:'dazn-2', name:'DAZN 2', ntv:'', vavoo:'dazn 2', daddy:'', vid6:'363506221', vid7:'' },
   { slug:'zona-dazn', name:'Zona DAZN', ntv:'', vavoo:'zona dazn', daddy:'', vid6:'2911178456', vid7:'' },
   { slug:'eurosport-1', name:'Eurosport 1', ntv:'878', vavoo:'eurosport 1', daddy:'878', vid6:'3481346857', vid7:'3448075317' },
   { slug:'eurosport-2', name:'Eurosport 2', ntv:'879', vavoo:'eurosport 2', daddy:'879', vid6:'2283887097', vid7:'2317684453' },
-
-  // RSI
   { slug:'rsi-la-1', name:'RSI La 1', ntv:'2455610203', vavoo:'rsi la 1', daddy:'', vid6:'2455610203', vid7:'2290395046' },
   { slug:'rsi-la-2', name:'RSI La 2', ntv:'3590183307', vavoo:'rsi la 2', daddy:'', vid6:'3590183307', vid7:'3475299702' },
-
-  // SKY CINEMA
   { slug:'sky-cinema-uno', name:'Sky Cinema Uno', ntv:'860', vavoo:'sky cinema uno', daddy:'860', vid6:'2872151911', vid7:'1759625738' },
   { slug:'sky-cinema-due', name:'Sky Cinema Due', ntv:'', vavoo:'sky cinema due', daddy:'', vid6:'1228534500', vid7:'2330574729' },
   { slug:'sky-cinema-action', name:'Sky Cinema Action', ntv:'861', vavoo:'sky cinema action', daddy:'861', vid6:'3812796171', vid7:'1144128726' },
@@ -74,32 +39,21 @@ const CHANNELS = [
   { slug:'sky-cinema-family', name:'Sky Cinema Family', ntv:'865', vavoo:'sky cinema family', daddy:'865', vid6:'415795144', vid7:'3216516117' },
   { slug:'sky-cinema-drama', name:'Sky Cinema Drama', ntv:'867', vavoo:'sky cinema drama', daddy:'867', vid6:'1235530177', vid7:'' },
   { slug:'sky-cinema-suspense', name:'Sky Cinema Suspense', ntv:'868', vavoo:'sky cinema suspense', daddy:'868', vid6:'1820997555', vid7:'3060043751' },
-
-  // SKY CALCIO 251/252/253
   { slug:'sky-calcio-251', name:'Sky Calcio 251', ntv:'871', vavoo:'', daddy:'871', vid6:'', vid7:'' },
   { slug:'sky-calcio-252', name:'Sky Calcio 252', ntv:'872', vavoo:'', daddy:'872', vid6:'', vid7:'' },
   { slug:'sky-calcio-253', name:'Sky Calcio 253', ntv:'873', vavoo:'', daddy:'873', vid6:'', vid7:'' },
-
-  // SKY SERIE / CRIME
   { slug:'sky-serie', name:'Sky Serie', ntv:'880', vavoo:'sky serie', daddy:'880', vid6:'836680112', vid7:'' },
   { slug:'sky-crime', name:'Sky Crime', ntv:'863', vavoo:'sky crime', daddy:'863', vid6:'', vid7:'' }
 ];
 
-const ALIASES = {
-  'dazn':'dazn-1','dazn-zona':'zona-dazn','zona-dazn':'zona-dazn',
-  'serie-a':'sky-sport-serie-a',
-  'sky-calcio-1':'sky-calcio-251','sky-calcio-2':'sky-calcio-252','sky-calcio-3':'sky-calcio-253',
-  'sky-sport-24-ntv':'sky-sport-24','sky-sport-uno-italy':'sky-sport-uno'
-};
+const ALIASES = { 'dazn':'dazn-1','dazn-zona':'zona-dazn','serie-a':'sky-sport-serie-a', 'sky-calcio-1':'sky-calcio-251','sky-calcio-2':'sky-calcio-252','sky-calcio-3':'sky-calcio-253', 'sky-sport-24-ntv':'sky-sport-24','sky-sport-uno-italy':'sky-sport-uno' };
 
 const BY_KEY = (() => {
   const m = new Map();
   for (const c of CHANNELS) {
     m.set(c.slug, c); m.set(norm(c.name), c);
-    if (c.ntv) m.set(c.ntv, c);
-    if (c.daddy) m.set('d'+c.daddy, c);
-    if (c.vid6) m.set('v'+c.vid6, c);
-    if (c.vid7) m.set('v'+c.vid7, c);
+    if (c.ntv) m.set(c.ntv, c); if (c.daddy) m.set('d'+c.daddy, c);
+    if (c.vid6) m.set('v'+c.vid6, c); if (c.vid7) m.set('v'+c.vid7, c);
   }
   for (const [a,s] of Object.entries(ALIASES)) { const c = m.get(s); if (c) m.set(a, c); }
   return m;
@@ -112,84 +66,26 @@ function elencoCanali(u){
   const search=(u&&u.searchParams.get('q'))||'';
   const L=[CONFIG.VERSION+' — CANALI ('+CHANNELS.length+')'];
   L.push('Uso: /live?ch=<slug>   /live?ch=X&res=720   /live?ch=X&fail=1');
-  L.push('');
   for(const c of CHANNELS){
     if(search && !c.slug.includes(search) && !c.name.toLowerCase().includes(search)) continue;
     const q = qualityStore.get(c.slug);
-    const maxRes = q ? q.maxRes : 1080;
-    L.push('  '+c.slug.padEnd(24)+' ntv='+String(c.ntv).padEnd(4)+' v6='+(c.vid6||'-').padEnd(12)+' v7='+(c.vid7||'-').padEnd(12)+' maxRes='+maxRes);
+    L.push('  '+c.slug.padEnd(24)+' ntv='+String(c.ntv).padEnd(4)+' v6='+(c.vid6||'-').padEnd(12)+' v7='+(c.vid7||'-').padEnd(12)+' maxRes='+(q?q.maxRes:1080));
   }
   return L.join('\n');
 }
 
-// ============================================================================
-// QUALITY-LOCK
-// ============================================================================
 const qualityStore = new Map();
+function getQuality(slug){ const q = qualityStore.get(slug); if(!q || Date.now()-q.t > CONFIG.QUALITY_TTL) return { maxRes: 1080, t: Date.now(), fails: 0 }; return q; }
+function degradeQuality(slug){ const q = getQuality(slug); const idx = CONFIG.RES_LADDER.indexOf(q.maxRes); if(idx >= 0 && idx < CONFIG.RES_LADDER.length-1){ q.maxRes = CONFIG.RES_LADDER[idx+1]; q.fails++; q.t = Date.now(); qualityStore.set(slug, q); log('⬇️ Quality degrade '+slug+' → '+q.maxRes+'p'); return q.maxRes; } return q.maxRes; }
+function resetQuality(slug){ qualityStore.set(slug, { maxRes: 1080, t: Date.now(), fails: 0 }); log('🔄 Quality reset '+slug+' → 1080p'); }
+function setQuality(slug, res){ qualityStore.set(slug, { maxRes: res, t: Date.now(), fails: 0 }); log('🎯 Quality set '+slug+' → '+res+'p'); }
 
-function getQuality(slug){
-  const q = qualityStore.get(slug);
-  if(!q || Date.now()-q.t > CONFIG.QUALITY_TTL){
-    return { maxRes: 1080, t: Date.now(), fails: 0 };
-  }
-  return q;
-}
-
-function degradeQuality(slug){
-  const q = getQuality(slug);
-  const idx = CONFIG.RES_LADDER.indexOf(q.maxRes);
-  if(idx >= 0 && idx < CONFIG.RES_LADDER.length-1){
-    q.maxRes = CONFIG.RES_LADDER[idx+1];
-    q.fails++;
-    q.t = Date.now();
-    qualityStore.set(slug, q);
-    log('⬇️ Quality degrade '+slug+' → '+q.maxRes+'p');
-    return q.maxRes;
-  }
-  return q.maxRes;
-}
-
-function resetQuality(slug){
-  qualityStore.set(slug, { maxRes: 1080, t: Date.now(), fails: 0 });
-  log('🔄 Quality reset '+slug+' → 1080p');
-}
-
-function setQuality(slug, res){
-  qualityStore.set(slug, { maxRes: res, t: Date.now(), fails: 0 });
-  log('🎯 Quality set '+slug+' → '+res+'p');
-}
-
-// ============================================================================
-// HEALTH CHECK VAVOO
-// ============================================================================
 const VAVOO_HEALTH_TTL = 10*60*1000;
 const vavooHealth = new Map();
+function getVavooHealth(slug){ const h = vavooHealth.get(slug); if(!h) return { prefer7:false, t:0, fails6:0, fails7:0 }; if(Date.now()-h.t > VAVOO_HEALTH_TTL){ vavooHealth.delete(slug); return { prefer7:false,t:0,fails6:0,fails7:0 }; } return h; }
+function updateVavooHealth(slug, winnerId){ const h = getVavooHealth(slug); h.t=Date.now(); h.prefer7=(winnerId===7); h.fails6 = winnerId===6 ? 0 : h.fails6+1; h.fails7 = winnerId===7 ? 0 : h.fails7+1; vavooHealth.set(slug, h); }
+function recordVavooFail(slug, idNum){ const h = getVavooHealth(slug); h.t=Date.now(); if(idNum===6) h.fails6++; else h.fails7++; if(h.fails6>=2) h.prefer7=true; if(h.fails7>=2) h.prefer7=false; vavooHealth.set(slug, h); }
 
-function getVavooHealth(slug){
-  const h = vavooHealth.get(slug);
-  if(!h) return { prefer7:false, t:0, fails6:0, fails7:0 };
-  if(Date.now()-h.t > VAVOO_HEALTH_TTL){ vavooHealth.delete(slug); return { prefer7:false,t:0,fails6:0,fails7:0 }; }
-  return h;
-}
-function updateVavooHealth(slug, winnerId){
-  const h = getVavooHealth(slug);
-  h.t=Date.now(); h.prefer7=(winnerId===7);
-  h.fails6 = winnerId===6 ? 0 : h.fails6+1;
-  h.fails7 = winnerId===7 ? 0 : h.fails7+1;
-  vavooHealth.set(slug, h);
-}
-function recordVavooFail(slug, idNum){
-  const h = getVavooHealth(slug);
-  h.t=Date.now();
-  if(idNum===6) h.fails6++; else h.fails7++;
-  if(h.fails6>=2) h.prefer7=true;
-  if(h.fails7>=2) h.prefer7=false;
-  vavooHealth.set(slug, h);
-}
-
-// ============================================================================
-// NTV
-// ============================================================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 let ntvStats = { resolve:0, refresh:0, err:0 };
@@ -220,9 +116,6 @@ async function ntvPlaylist(id){
   return {txt,ref:tk.ref,base:tk.m3u8};
 }
 
-// ============================================================================
-// DADDY
-// ============================================================================
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
 const daddyCache=new Map();
 const DADDY_TTL=3*60*1000;
@@ -257,27 +150,15 @@ async function extractM3u8FromEmbed(url,refererDomain,timeoutMs){
       const html2=await r2.text();
       m3u8=html2.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
       if(m3u8) return m3u8[1];
-      const iframe2=html2.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
-      if(iframe2){
-        const r3=await fetchT(iframe2[1],{headers:getBrowserHeaders(iframe[1]),cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
-        if(r3.ok){ const html3=await r3.text(); m3u8=html3.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i); if(m3u8) return m3u8[1]; }
-      }
     }
   }
   return null;
 }
 
 function getBrowserHeaders(referer){
-  return {
-    'User-Agent':UA,'Accept':'*/*','Accept-Language':'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer':referer,'Origin':referer.replace(/\/$/,''),
-    'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'cross-site','Upgrade-Insecure-Requests':'1'
-  };
+  return { 'User-Agent':UA,'Accept':'*/*','Accept-Language':'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7', 'Referer':referer,'Origin':referer.replace(/\/$/,''), 'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'cross-site','Upgrade-Insecure-Requests':'1' };
 }
 
-// ============================================================================
-// VAVOO
-// ============================================================================
 const VAVOO_MIRRORS=['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES=['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap={map:null,t:0,src:''};
@@ -308,10 +189,7 @@ function vavooMapFind(query,m){
   let best=null,bestScore=-1;
   for(const [k,id] of m){
     const kTok=k.split('-').filter(Boolean);
-    if(qTok.every(w=>kTok.includes(w))){
-      const score=qTok.length-(kTok.length-qTok.length);
-      if(score>bestScore){ bestScore=score; best=id; }
-    }
+    if(qTok.every(w=>kTok.includes(w))){ const score=qTok.length-(kTok.length-qTok.length); if(score>bestScore){ bestScore=score; best=id; } }
   }
   return best;
 }
@@ -365,34 +243,20 @@ async function vavooResolveDual(slug,query,vid6,vid7){
   return null;
 }
 
-async function tryVavooId(id){
-  for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,id); if(u) return u; }
-  return null;
-}
+async function tryVavooId(id){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,id); if(u) return u; } return null; }
+async function vavooResolve(query,vid){ const c=findCh(query); if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7); return await vavooResolveDual(null,query,vid,null); }
 
-async function vavooResolve(query,vid){
-  const c=findCh(query);
-  if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7);
-  return await vavooResolveDual(null,query,vid,null);
-}
-
-// ============================================================================
-// VARIANT SELECTOR: 1080p H.264 default
-// ============================================================================
 function parseMasterPlaylist(body){
   const lines=body.split(/\r?\n/);
   const variants=[]; let current=null;
   for(let i=0;i<lines.length;i++){
     const line=lines[i];
     if(line.startsWith('#EXT-X-STREAM-INF:')){
-      const attrs={};
-      const attrStr=line.substring('#EXT-X-STREAM-INF:'.length);
+      const attrs={}; const attrStr=line.substring('#EXT-X-STREAM-INF:'.length);
       const re=/([A-Z-]+)=("[^"]*"|[^,]+)/g; let m;
       while((m=re.exec(attrStr))!==null) attrs[m[1]]=m[2].replace(/^"|"$/g,'');
       current={attrs,index:variants.length};
-    } else if(current&&line&&!line.startsWith('#')){
-      current.uri=line; variants.push(current); current=null;
-    }
+    } else if(current&&line&&!line.startsWith('#')){ current.uri=line; variants.push(current); current=null; }
   }
   return variants;
 }
@@ -402,32 +266,24 @@ function codecIsHEVC(codecs){ return !!codecs && codecs.split(',').some(c=>c.tri
 function getResHeight(res){ if(!res) return 0; const m=res.match(/x(\d+)/i); return m?parseInt(m[1]):0; }
 
 function selectVariantSmart(variants, maxRes){
-  // 1) Solo H.264
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
   if(h264.length > 0){
     const eligible = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
-    if(eligible.length > 0){
-      return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
-    }
+    if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
     return h264.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
   }
-  // 2) HEVC come ultima spiaggia
   const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
   if(hevc.length > 0){
     const eligible = hevc.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
     if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
     return hevc[0];
   }
-  // 3) Nessun codec dichiarato
   if(variants.length === 0) return null;
   const eligible = variants.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
   if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
   return variants.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
 }
 
-// ============================================================================
-// LIVE
-// ============================================================================
 let lastPl={key:'',txt:'',t:0};
 
 async function live(u,P,legacy){
@@ -437,21 +293,13 @@ async function live(u,P,legacy){
   const c=findCh(q);
   if(!c) return R('canale non mappato: "'+q+'"\n\n'+elencoCanali(u),200,TXT());
 
-  // Quality-Lock comandi
   if(u.searchParams.get('fail')==='1') degradeQuality(c.slug);
   if(u.searchParams.get('reset')==='1') resetQuality(c.slug);
   const resParam = u.searchParams.get('res');
   if(resParam){ const r=parseInt(resParam); if(CONFIG.RES_LADDER.includes(r)) setQuality(c.slug,r); }
 
-  const order = legacy ? [legacy,...['vavoo','daddy','ntv'].filter(x=>x!==legacy)]
-    : (u.searchParams.get('p')||'vavoo,daddy,ntv').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-
-  const availableOrder = order.filter(p=>{
-    if(p==='vavoo') return c.vavoo||c.vid6||c.vid7;
-    if(p==='ntv') return c.ntv;
-    if(p==='daddy') return c.daddy;
-    return true;
-  });
+  const order = legacy ? [legacy,...['vavoo','daddy','ntv'].filter(x=>x!==legacy)] : (u.searchParams.get('p')||'vavoo,daddy,ntv').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+  const availableOrder = order.filter(p=>{ if(p==='vavoo') return c.vavoo||c.vid6||c.vid7; if(p==='ntv') return c.ntv; if(p==='daddy') return c.daddy; return true; });
 
   const maxRes = getQuality(c.slug).maxRes;
   const ck=c.slug+':'+availableOrder.join('.')+':'+maxRes;
@@ -495,9 +343,6 @@ async function live(u,P,legacy){
   return R('ERRORE: provider KO ('+availableOrder.join(' -> ')+') per '+c.name+'. /probe?ch='+c.slug,200,TXT());
 }
 
-// ============================================================================
-// REWRITE HLS
-// ============================================================================
 function rewriteAny(txt,baseUrl,P,ref,origin,maxRes){
   txt=String(txt);
   if(!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
@@ -525,10 +370,7 @@ function parseMediaPl(txt){
     if(line.startsWith('#EXT-X-MAP')){ map=line; continue; }
     if(line.startsWith('#EXT-X-DISCONTINUITY')){ disc=true; continue; }
     if(line.startsWith('#EXT-X-BYTERANGE')){ brange=line; continue; }
-    if(line.startsWith('#EXTINF')){
-      pending={extinf:line,dur:parseFloat((line.match(/#EXTINF:([\d.]+)/)||[])[1])||0,disc,brange};
-      disc=false; brange=null; continue;
-    }
+    if(line.startsWith('#EXTINF')){ pending={extinf:line,dur:parseFloat((line.match(/#EXTINF:([\d.]+)/)||[])[1])||0,disc,brange}; disc=false; brange=null; continue; }
     if(line.startsWith('#')) continue;
     if(pending){ pending.url=line; segs.push(pending); pending=null; }
   }
@@ -561,10 +403,7 @@ function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   const kept=p.segs.slice(-maxSegs);
   const dropped=p.segs.length-kept.length;
   const out=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-TARGETDURATION:'+p.upTarget,'#EXT-X-MEDIA-SEQUENCE:'+(p.upSeq+dropped)];
-  if(p.map){
-    const mu=(p.map.match(/URI="([^"]+)"/)||[])[1];
-    if(mu) out.push('#EXT-X-MAP:URI="'+proxUrl(absSegUrl(mu,baseUrl),P,ref,origin)+'"');
-  }
+  if(p.map){ const mu=(p.map.match(/URI="([^"]+)"/)||[])[1]; if(mu) out.push('#EXT-X-MAP:URI="'+proxUrl(absSegUrl(mu,baseUrl),P,ref,origin)+'"'); }
   kept.forEach((s,idx)=>{
     if(s.disc&&idx>0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
@@ -588,9 +427,6 @@ function rewriteMaster(txt,baseUrl,P,ref,origin){
   return out.join('\n');
 }
 
-// ============================================================================
-// SEG
-// ============================================================================
 async function seg(u){
   countReq('seg');
   const target=u.searchParams.get('u'); if(!target) return R('uso: /seg?u=<url>',200,TXT());
@@ -614,9 +450,6 @@ async function seg(u){
   return new Response(r.body,{status:r.status,headers:hh});
 }
 
-// ============================================================================
-// CHECKSEG
-// ============================================================================
 async function checkseg(u){
   const source=u.searchParams.get('s')||'vavoo';
   const ch=u.searchParams.get('ch')||'sky-sport-24';
@@ -659,9 +492,6 @@ async function checkseg(u){
   }catch(e){ return R('ERRORE: '+e.message,200,TXT()); }
 }
 
-// ============================================================================
-// WARM, PROBE, VMAP, DIAG, DEBUG, FEATURES
-// ============================================================================
 async function warm(){
   const t0=Date.now();
   const ids=['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -834,9 +664,6 @@ function features(){
   return L.join('\n');
 }
 
-// ============================================================================
-// UTILS
-// ============================================================================
 const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs=[];
 function log(m){ logs.push(new Date().toISOString().slice(11,19)+' '+m); if(logs.length>40) logs.shift(); }
@@ -861,4 +688,41 @@ async function fetchT(url,opt,ms){
   }
   return fetch(url,o);
 }
+
+export default {
+  async fetch(req) {
+    const u = new URL(req.url);
+    const P = u.origin;
+    const path = u.pathname;
+    if (req.method === 'HEAD' || req.method === 'OPTIONS')
+      return R('OK', 200, { 'content-type': 'text/plain; charset=utf-8', ...CORS() });
+    try {
+      if (path === '/live') return await live(u, P, null);
+      if (path === '/ntv') return await live(u, P, 'ntv');
+      if (path === '/vavoo') return await live(u, P, 'vavoo');
+      if (path === '/daddy') return await live(u, P, 'daddy');
+      if (path === '/seg') return await seg(u);
+      if (path === '/warm') return await warm();
+      if (path === '/rawu') return await rawu(u);
+      if (path === '/vmap') return R(await vmap(u), 200, TXT());
+      if (path === '/ch') return R(elencoCanali(u), 200, TXT());
+      if (path === '/probe') return R(await probe(u), 200, TXT());
+      if (path === '/diag') return R(await diag(u), 200, TXT());
+      if (path === '/debug') return R(debug(), 200, TXT());
+      if (path === '/checkseg') return await checkseg(u);
+      if (path === '/features') return R(features(), 200, TXT());
+      if (path === '/ip') {
+        const ip = req.headers.get('cf-connecting-ip') || '';
+        const r = await fetchT('https://www.cloudflare.com/cdn-cgi/trace', {}, 8000);
+        const t = r.ok ? await r.text() : 'trace err ' + r.status;
+        return R('worker ip client: ' + ip + '\negress:\n' + t, 200, TXT());
+      }
+      if (path === '/') return R(uso(P), 200, TXT());
+      return R('404: endpoint non trovato\n\n' + uso(P), 200, TXT());
+    } catch (e) {
+      return R('ERRORE: ' + (e && e.message ? e.message : String(e)), 200, TXT());
+    }
+  },
+  async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
+};
 // ███ FINE TVNOW-CF v9.2 ███
