@@ -1,173 +1,92 @@
 // ============================================================================
-// TVNOW-CF v9.0 Quality-Lock — 1080p H.264 default + fallback automatico
-// ============================================================================
-// FIX:
-// 1. selectBestVariant sceglie SEMPRE H.264 (avc1) alla risoluzione massima
-// 2. HEVC (hvc1/hev1) scartato di default (causa schermo nero)
-// 3. Quality-Lock: &fail=1 scende 1080→720→480→360, &reset=1 torna 1080
-// 4. ID Vavoo (6)/(7) completi dal PDF
+// TVNOW-CF v9.1 — SOLO CANALI RICHIESTI + 1080p H.264 + Quality-Lock
+//
+// CANALI: Sky Sport, Sky Cinema, Eurosport, DAZN, RSI, Sky Calcio, Sky Crime, Sky Serie
+// PRINCIPI:
+// 1. 1080p H.264 (avc1) default, HEVC scartato
+// 2. Quality-Lock: &fail=1 scende 1080→720→480→360, &reset=1 torna 1080
+// 3. Finestra 8 segmenti per keyframe iniziale
+// 4. NO EXT-X-START / INDEPENDENT-SEGMENTS
+// 5. Cache-Bust 5s + Cache segmenti 60s
+// 6. Dual-ID Vavoo (6)/(7) con Health Check
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.0 Quality-Lock',
-  DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
+  VERSION: 'TVNOW-CF v9.1',
+  DELAY_TARGET: 27,
+  DELAY_MIN: 25,
+  PREF_SEGS: 3,
+  MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
-    '1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked',
-    'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 8s',
-    'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback',
-    'Segment Proxy', 'UA Rotation', 'Cookie Persistence', 'Debug Endpoints'
+    '1080p H.264 default',
+    'Quality-Lock auto-fallback',
+    'HEVC blocked',
+    'Dual-ID Vavoo (6)/(7)',
+    'Health Check Auto-Switch',
+    'Keyframe Window 8s',
+    'No EXT-X-START',
+    'Cache Bust 5s',
+    'Multi-Provider Fallback',
+    'Segment Proxy',
+    'UA Rotation',
+    'Cookie Persistence',
+    'Debug Endpoints'
   ]
 };
 
 // ============================================================================
-// CHANNELS — ID Vavoo (6)/(7) completi dal PDF
+// DATABASE CANALI (SOLO quelli richiesti)
 // ============================================================================
 const CHANNELS = [
   // SKY SPORT
   { slug:'sky-sport-24', name:'Sky Sport 24', ntv:'869', vavoo:'sky sport 24', daddy:'869', vid6:'2775802255', vid7:'3445562519' },
   { slug:'sky-sport-uno', name:'Sky Sport Uno', ntv:'461', vavoo:'sky sport uno', daddy:'461', vid6:'210669162', vid7:'3192996672' },
   { slug:'sky-sport-calcio', name:'Sky Sport Calcio', ntv:'870', vavoo:'sky sport calcio', daddy:'870', vid6:'1665920101', vid7:'449990998' },
+  { slug:'sky-sport-serie-a', name:'Sky Sport Serie A', ntv:'', vavoo:'sky sport serie a', daddy:'880', vid6:'2077387085', vid7:'' },
   { slug:'sky-sport-tennis', name:'Sky Sport Tennis', ntv:'576', vavoo:'sky sport tennis', daddy:'576', vid6:'2100771782', vid7:'78546677' },
   { slug:'sky-sport-f1', name:'Sky Sport F1', ntv:'577', vavoo:'sky sport f1', daddy:'577', vid6:'4246774056', vid7:'2289038972' },
   { slug:'sky-sport-motogp', name:'Sky Sport MotoGP', ntv:'575', vavoo:'sky sport motogp', daddy:'575', vid6:'3036316886', vid7:'2090703806' },
   { slug:'sky-sport-arena', name:'Sky Sport Arena', ntv:'462', vavoo:'sky sport arena', daddy:'462', vid6:'3007400791', vid7:'2555960713' },
   { slug:'sky-sport-max', name:'Sky Sport Max', ntv:'460', vavoo:'sky sport max', daddy:'460', vid6:'2066326916', vid7:'' },
-  { slug:'sky-sport-basket', name:'Sky Sport Basket', ntv:'875', vavoo:'sky sport nba', daddy:'875', vid6:'2711959620', vid7:'326825326' },
+  { slug:'sky-sport-basket', name:'Sky Sport Basket', ntv:'875', vavoo:'sky sport basket', daddy:'875', vid6:'2711959620', vid7:'326825326' },
   { slug:'sky-sport-golf', name:'Sky Sport Golf', ntv:'574', vavoo:'sky sport golf', daddy:'574', vid6:'729945219', vid7:'3897711086' },
-  { slug:'sky-sport-serie-a', name:'Sky Sport Serie A', ntv:'', vavoo:'sky sport serie a', daddy:'880', vid6:'2077387085', vid7:'' },
-  { slug:'sky-sport-football', name:'Sky Sport Football', ntv:'871', vavoo:'sky sport football', daddy:'871', vid6:'3093535330', vid7:'1989309231' },
+  
   // DAZN / EUROSPORT
   { slug:'dazn-1', name:'DAZN 1', ntv:'877', vavoo:'dazn 1', daddy:'877', vid6:'1376440573', vid7:'2745635299' },
-  { slug:'dazn-2', name:'DAZN 2', ntv:'', vavoo:'dazn 2', daddy:'', vid6:'363506221', vid7:'' },
-  { slug:'zona-dazn', name:'Zona DAZN', ntv:'', vavoo:'zona dazn', daddy:'', vid6:'2911178456', vid7:'' },
   { slug:'eurosport-1', name:'Eurosport 1', ntv:'878', vavoo:'eurosport 1', daddy:'878', vid6:'3481346857', vid7:'3448075317' },
   { slug:'eurosport-2', name:'Eurosport 2', ntv:'879', vavoo:'eurosport 2', daddy:'879', vid6:'2283887097', vid7:'2317684453' },
-  { slug:'wwe-channel', name:'WWE Channel', ntv:'', vavoo:'wwe channel', daddy:'', vid6:'2989824407', vid7:'' },
+  
   // RSI
   { slug:'rsi-la-1', name:'RSI La 1', ntv:'2455610203', vavoo:'rsi la 1', daddy:'', vid6:'2455610203', vid7:'2290395046' },
   { slug:'rsi-la-2', name:'RSI La 2', ntv:'3590183307', vavoo:'rsi la 2', daddy:'', vid6:'3590183307', vid7:'3475299702' },
+  
   // SKY CINEMA
   { slug:'sky-cinema-uno', name:'Sky Cinema Uno', ntv:'860', vavoo:'sky cinema uno', daddy:'860', vid6:'2872151911', vid7:'1759625738' },
-  { slug:'sky-cinema-due', name:'Sky Cinema Due', ntv:'', vavoo:'sky cinema due', daddy:'', vid6:'1228534500', vid7:'2330574729' },
   { slug:'sky-cinema-action', name:'Sky Cinema Action', ntv:'861', vavoo:'sky cinema action', daddy:'861', vid6:'3812796171', vid7:'1144128726' },
   { slug:'sky-cinema-comedy', name:'Sky Cinema Comedy', ntv:'862', vavoo:'sky cinema comedy', daddy:'862', vid6:'500203271', vid7:'3131104474' },
-  { slug:'sky-cinema-drama', name:'Sky Cinema Drama', ntv:'867', vavoo:'sky cinema drama', daddy:'867', vid6:'1235530177', vid7:'' },
-  { slug:'sky-cinema-family', name:'Sky Cinema Family', ntv:'865', vavoo:'sky cinema family', daddy:'865', vid6:'415795144', vid7:'3216516117' },
-  { slug:'sky-cinema-romance', name:'Sky Cinema Romance', ntv:'864', vavoo:'sky cinema romance', daddy:'864', vid6:'2890008905', vid7:'1281264885' },
-  { slug:'sky-cinema-suspense', name:'Sky Cinema Suspense', ntv:'868', vavoo:'sky cinema suspense', daddy:'868', vid6:'1820997555', vid7:'3060043751' },
   { slug:'sky-cinema-collection', name:'Sky Cinema Collection', ntv:'859', vavoo:'sky cinema collection', daddy:'859', vid6:'', vid7:'3525837057' },
-  // SKY PRIMAFILA
-  { slug:'sky-primafila-1', name:'Sky Primafila 1', ntv:'', vavoo:'sky primafila 1', daddy:'', vid6:'1944682394', vid7:'1492183364' },
-  { slug:'sky-primafila-2', name:'Sky Primafila 2', ntv:'', vavoo:'sky primafila 2', daddy:'', vid6:'877200714', vid7:'525374356' },
-  { slug:'sky-primafila-3', name:'Sky Primafila 3', ntv:'', vavoo:'sky primafila 3', daddy:'', vid6:'153693434', vid7:'573618724' },
-  { slug:'sky-primafila-4', name:'Sky Primafila 4', ntv:'', vavoo:'sky primafila 4', daddy:'', vid6:'3137990890', vid7:'2416993844' },
-  { slug:'sky-primafila-5', name:'Sky Primafila 5', ntv:'', vavoo:'sky primafila 5', daddy:'', vid6:'2255083866', vid7:'2909818756' },
-  { slug:'sky-primafila-6', name:'Sky Primafila 6', ntv:'', vavoo:'sky primafila 6', daddy:'', vid6:'3251217290', vid7:'3939513684' },
-  { slug:'sky-primafila-7', name:'Sky Primafila 7', ntv:'', vavoo:'sky primafila 7', daddy:'', vid6:'4238969402', vid7:'3618643172' },
-  { slug:'sky-primafila-8', name:'Sky Primafila 8', ntv:'', vavoo:'sky primafila 8', daddy:'', vid6:'2130255339', vid7:'1440779061' },
-  { slug:'sky-primafila-9', name:'Sky Primafila 9', ntv:'', vavoo:'sky primafila 9', daddy:'', vid6:'1134113883', vid7:'1753260677' },
-  { slug:'sky-primafila-10', name:'Sky Primafila 10', ntv:'', vavoo:'sky primafila 10', daddy:'', vid6:'4272937805', vid7:'2268489342' },
-  // SKY ALTRO
+  { slug:'sky-cinema-romance', name:'Sky Cinema Romance', ntv:'864', vavoo:'sky cinema romance', daddy:'864', vid6:'2890008905', vid7:'1281264885' },
+  { slug:'sky-cinema-family', name:'Sky Cinema Family', ntv:'865', vavoo:'sky cinema family', daddy:'865', vid6:'415795144', vid7:'3216516117' },
+  { slug:'sky-cinema-drama', name:'Sky Cinema Drama', ntv:'867', vavoo:'sky cinema drama', daddy:'867', vid6:'1235530177', vid7:'' },
+  { slug:'sky-cinema-suspense', name:'Sky Cinema Suspense', ntv:'868', vavoo:'sky cinema suspense', daddy:'868', vid6:'1820997555', vid7:'3060043751' },
+  
+  // SKY CALCIO 251/252/253
+  { slug:'sky-calcio-251', name:'Sky Calcio 251', ntv:'871', vavoo:'', daddy:'871', vid6:'', vid7:'' },
+  { slug:'sky-calcio-252', name:'Sky Calcio 252', ntv:'872', vavoo:'', daddy:'872', vid6:'', vid7:'' },
+  { slug:'sky-calcio-253', name:'Sky Calcio 253', ntv:'873', vavoo:'', daddy:'873', vid6:'', vid7:'' },
+  
+  // SKY SERIE / CRIME
   { slug:'sky-serie', name:'Sky Serie', ntv:'880', vavoo:'sky serie', daddy:'880', vid6:'836680112', vid7:'' },
-  { slug:'sky-crime', name:'Sky Crime', ntv:'863', vavoo:'sky crime', daddy:'863', vid6:'', vid7:'' },
-  { slug:'sky-arte', name:'Sky Arte', ntv:'', vavoo:'sky arte', daddy:'', vid6:'1806815496', vid7:'1902695925' },
-  { slug:'sky-atlantic', name:'Sky Atlantic', ntv:'', vavoo:'sky atlantic', daddy:'', vid6:'1421393119', vid7:'1482866609' },
-  { slug:'sky-documentaries', name:'Sky Documentaries', ntv:'', vavoo:'sky documentaries', daddy:'', vid6:'464281981', vid7:'' },
-  { slug:'sky-nature', name:'Sky Nature', ntv:'', vavoo:'sky nature', daddy:'', vid6:'3810188456', vid7:'' },
-  { slug:'sky-uno', name:'Sky Uno', ntv:'', vavoo:'sky uno', daddy:'', vid6:'2130523218', vid7:'322024849' },
-  { slug:'sky-tg24', name:'Sky TG24', ntv:'481', vavoo:'sky tg 24', daddy:'481', vid6:'3376031355', vid7:'318057128' },
-  // RAI
-  { slug:'rai-1', name:'Rai 1', ntv:'101', vavoo:'rai 1', daddy:'101', vid6:'875922788', vid7:'1225653759' },
-  { slug:'rai-2', name:'Rai 2', ntv:'102', vavoo:'rai 2', daddy:'102', vid6:'1939210164', vid7:'246253359' },
-  { slug:'rai-3', name:'Rai 3', ntv:'103', vavoo:'rai 3', daddy:'103', vid6:'1324733956', vid7:'869117599' },
-  { slug:'rai-4', name:'Rai 4', ntv:'104', vavoo:'rai 4', daddy:'104', vid6:'4241820180', vid7:'2179822223' },
-  { slug:'rai-5', name:'Rai 5', ntv:'105', vavoo:'rai 5', daddy:'105', vid6:'3249873828', vid7:'3163380543' },
-  { slug:'rai-movie', name:'Rai Movie', ntv:'106', vavoo:'rai movie', daddy:'106', vid6:'2835672487', vid7:'1925964148' },
-  { slug:'rai-premium', name:'Rai Premium', ntv:'107', vavoo:'rai premium', daddy:'107', vid6:'2861734300', vid7:'2828455552' },
-  { slug:'rai-news-24', name:'Rai News 24', ntv:'108', vavoo:'rai news 24', daddy:'108', vid6:'2272923972', vid7:'2239645272' },
-  { slug:'rai-sport', name:'Rai Sport', ntv:'109', vavoo:'rai sport', daddy:'109', vid6:'2924135092', vid7:'551730224' },
-  { slug:'rai-scuola', name:'Rai Scuola', ntv:'110', vavoo:'rai scuola', daddy:'110', vid6:'2007798511', vid7:'1886684667' },
-  { slug:'rai-yoyo', name:'Rai Yoyo', ntv:'111', vavoo:'rai yoyo', daddy:'111', vid6:'1785501924', vid7:'1890950169' },
-  { slug:'rai-gulp', name:'Rai Gulp', ntv:'112', vavoo:'rai gulp', daddy:'112', vid6:'1901652742', vid7:'1803677691' },
-  { slug:'rai-storia', name:'Rai Storia', ntv:'113', vavoo:'rai storia', daddy:'113', vid6:'78838793', vid7:'57338653' },
-  { slug:'rai-4k', name:'Rai 4K', ntv:'114', vavoo:'rai 4k', daddy:'114', vid6:'2049087681', vid7:'' },
-  { slug:'rai-italia', name:'Rai Italia', ntv:'', vavoo:'rai italia', daddy:'', vid6:'374675593', vid7:'294457245' },
-  // MEDIASET
-  { slug:'canale-5', name:'Canale 5', ntv:'201', vavoo:'canale 5', daddy:'201', vid6:'1534161807', vid7:'1101559666' },
-  { slug:'italia-1', name:'Italia 1', ntv:'202', vavoo:'italia 1', daddy:'202', vid6:'663536394', vid7:'' },
-  { slug:'italia-2', name:'Italia 2', ntv:'', vavoo:'italia 2', daddy:'', vid6:'1613543898', vid7:'3538009430' },
-  { slug:'rete-4', name:'Rete 4', ntv:'203', vavoo:'rete 4', daddy:'203', vid6:'4198218214', vid7:'2235732004' },
-  { slug:'mediaset-20', name:'20 Mediaset', ntv:'204', vavoo:'mediaset 20', daddy:'204', vid6:'1230338185', vid7:'3134481201' },
-  { slug:'mediaset-extra', name:'Mediaset Extra', ntv:'205', vavoo:'mediaset extra', daddy:'205', vid6:'477466531', vid7:'' },
-  { slug:'focus', name:'Focus', ntv:'206', vavoo:'focus', daddy:'206', vid6:'3439223610', vid7:'2982550433' },
-  { slug:'top-crime', name:'Top Crime', ntv:'207', vavoo:'top crime', daddy:'207', vid6:'269503091', vid7:'3420407456' },
-  { slug:'cine-34', name:'Cine 34', ntv:'208', vavoo:'cine 34', daddy:'208', vid6:'62558606', vid7:'1768670187' },
-  { slug:'boing', name:'Boing', ntv:'209', vavoo:'boing', daddy:'209', vid6:'3373510242', vid7:'3022771961' },
-  { slug:'cartoonito', name:'Cartoonito', ntv:'210', vavoo:'cartoonito', daddy:'210', vid6:'1987220436', vid7:'1907000512' },
-  { slug:'iris', name:'Iris', ntv:'', vavoo:'iris', daddy:'', vid6:'576490047', vid7:'23919988' },
-  { slug:'la-5', name:'La 5', ntv:'', vavoo:'la 5', daddy:'', vid6:'84139639', vid7:'1425667375' },
-  { slug:'la-7', name:'La 7', ntv:'', vavoo:'la 7', daddy:'', vid6:'2143522071', vid7:'775530063' },
-  { slug:'la-7-d', name:'La 7 D', ntv:'', vavoo:'la 7 d', daddy:'', vid6:'881846038', vid7:'' },
-  // ALTRO
-  { slug:'tv8', name:'TV8', ntv:'301', vavoo:'tv 8', daddy:'301', vid6:'4038365720', vid7:'2706291008' },
-  { slug:'nove', name:'Nove', ntv:'', vavoo:'discovery nove', daddy:'', vid6:'2651461317', vid7:'1574591400' },
-  { slug:'dmax', name:'DMAX', ntv:'', vavoo:'dmax', daddy:'', vid6:'3008151733', vid7:'3803638765' },
-  { slug:'real-time', name:'Real Time', ntv:'', vavoo:'real time', daddy:'', vid6:'1574975196', vid7:'2251241999' },
-  { slug:'giallo', name:'Giallo', ntv:'', vavoo:'giallo', daddy:'', vid6:'2373936189', vid7:'4060499455' },
-  { slug:'k2', name:'K2', ntv:'', vavoo:'k2', daddy:'', vid6:'2255724318', vid7:'11090349' },
-  { slug:'frisbee', name:'Frisbee', ntv:'', vavoo:'frisbee', daddy:'', vid6:'1995860185', vid7:'' },
-  { slug:'super', name:'Super!', ntv:'', vavoo:'super', daddy:'', vid6:'3550030443', vid7:'2900362153' },
-  { slug:'comedy-central', name:'Comedy Central', ntv:'', vavoo:'comedy central', daddy:'', vid6:'3658277450', vid7:'433893159' },
-  { slug:'nickelodeon', name:'Nickelodeon', ntv:'', vavoo:'nickelodeon', daddy:'', vid6:'3039389215', vid7:'' },
-  { slug:'nick-jr', name:'Nick Jr', ntv:'', vavoo:'nick jr', daddy:'', vid6:'380958472', vid7:'' },
-  { slug:'cartoon-network', name:'Cartoon Network', ntv:'', vavoo:'cartoon network', daddy:'', vid6:'1744435623', vid7:'1289777017' },
-  { slug:'baby-tv', name:'Baby TV', ntv:'', vavoo:'baby tv', daddy:'', vid6:'3938501125', vid7:'2265727942' },
-  { slug:'nat-geo', name:'Nat Geo', ntv:'', vavoo:'nat geo', daddy:'', vid6:'1735702308', vid7:'179844839' },
-  { slug:'nat-geo-wild', name:'Nat Geo Wild', ntv:'', vavoo:'nat geo wild', daddy:'', vid6:'3428501495', vid7:'3229664409' },
-  { slug:'discovery', name:'Discovery', ntv:'', vavoo:'discovery channel', daddy:'', vid6:'1955739367', vid7:'3554841914' },
-  { slug:'discovery-focus', name:'Discovery Focus', ntv:'', vavoo:'discovery focus', daddy:'', vid6:'', vid7:'2113273064' },
-  { slug:'discovery-k2', name:'Discovery K2', ntv:'', vavoo:'discovery k2', daddy:'', vid6:'', vid7:'3037871903' },
-  { slug:'food-network', name:'Food Network', ntv:'', vavoo:'food network', daddy:'', vid6:'2820683351', vid7:'2767861049' },
-  { slug:'hgtv', name:'HGTV', ntv:'', vavoo:'hgtv', daddy:'', vid6:'2897782781', vid7:'4248997029' },
-  { slug:'history', name:'History', ntv:'', vavoo:'history', daddy:'', vid6:'317837654', vid7:'2134724757' },
-  { slug:'motor-trend', name:'Motor Trend', ntv:'', vavoo:'motortrend', daddy:'', vid6:'3758728323', vid7:'3889279895' },
-  { slug:'warner-tv', name:'Warner TV', ntv:'', vavoo:'warner tv', daddy:'', vid6:'3171202588', vid7:'' },
-  { slug:'fox', name:'Fox', ntv:'', vavoo:'fox', daddy:'', vid6:'', vid7:'563160609' },
-  { slug:'star-comedy', name:'Star Comedy', ntv:'', vavoo:'star comedy', daddy:'', vid6:'1512072384', vid7:'' },
-  { slug:'star-life', name:'Star Life', ntv:'', vavoo:'star life', daddy:'', vid6:'3946128844', vid7:'' },
-  { slug:'premium-crime', name:'Premium Crime', ntv:'', vavoo:'premium crime', daddy:'', vid6:'', vid7:'444768053' },
-  { slug:'crime-investigation', name:'Crime Investigation', ntv:'', vavoo:'crime investigation', daddy:'', vid6:'3005227700', vid7:'1968339149' },
-  { slug:'deejay-tv', name:'DeeJay TV', ntv:'', vavoo:'deejay tv', daddy:'', vid6:'963607327', vid7:'3802167244' },
-  { slug:'rtl-1025', name:'RTL 102.5', ntv:'', vavoo:'rtl 102.5', daddy:'', vid6:'3168132911', vid7:'1729811452' },
-  { slug:'radio-capital', name:'Radio Capital', ntv:'', vavoo:'radio capital', daddy:'', vid6:'', vid7:'421441745' },
-  { slug:'m2o', name:'M2O', ntv:'', vavoo:'m2o', daddy:'', vid6:'215827632', vid7:'' },
-  { slug:'tv2000', name:'TV2000', ntv:'', vavoo:'tv 2000', daddy:'', vid6:'1949044924', vid7:'1133734972' },
-  { slug:'tgcom-24', name:'TGCom 24', ntv:'', vavoo:'tgcom 24', daddy:'', vid6:'2418148449', vid7:'1785098768' },
-  { slug:'tg-norba-24', name:'Tg Norba 24', ntv:'', vavoo:'tg norba 24', daddy:'', vid6:'3379729817', vid7:'3413557893' },
-  { slug:'bloomberg-tv', name:'Bloomberg TV', ntv:'', vavoo:'bloomberg tv', daddy:'', vid6:'', vid7:'116299718' },
-  { slug:'france-24', name:'France 24', ntv:'', vavoo:'france 24', daddy:'', vid6:'', vid7:'2179686828' },
-  { slug:'euronews', name:'Euronews', ntv:'', vavoo:'euronews', daddy:'', vid6:'490955579', vid7:'' },
-  { slug:'animal-planet', name:'Animal Planet', ntv:'', vavoo:'animal planet', daddy:'', vid6:'', vid7:'1908877526' },
-  { slug:'rakuten-top-free', name:'Rakuten Top Free', ntv:'', vavoo:'rakuten top free', daddy:'', vid6:'', vid7:'1572866962' },
-  { slug:'rakuten-comedy-movies', name:'Rakuten Comedy Movies', ntv:'', vavoo:'rakuten comedy movies', daddy:'', vid6:'', vid7:'1109372778' },
-  { slug:'rakuten-drama', name:'Rakuten Drama', ntv:'', vavoo:'rakuten drama', daddy:'', vid6:'', vid7:'2098624390' },
-  { slug:'rakuten-family', name:'Rakuten Family', ntv:'', vavoo:'rakuten family', daddy:'', vid6:'', vid7:'3902650955' },
-  { slug:'rakuten-tv-shows', name:'Rakuten TV Shows', ntv:'', vavoo:'rakuten tv shows', daddy:'', vid6:'', vid7:'86091226' },
-  { slug:'super-tennis', name:'Super Tennis', ntv:'', vavoo:'super tennis', daddy:'', vid6:'3213195143', vid7:'3009377513' },
-  { slug:'sport-italia', name:'Sport Italia', ntv:'', vavoo:'sport italia', daddy:'', vid6:'', vid7:'2881739927' },
-  { slug:'mtv-hits', name:'MTV Hits', ntv:'', vavoo:'mtv hits', daddy:'', vid6:'', vid7:'3446813098' },
-  { slug:'cielo', name:'Cielo', ntv:'', vavoo:'cielo', daddy:'', vid6:'2719953688', vid7:'3743894403' },
-  { slug:'sky-super-tennis', name:'Sky Super Tennis', ntv:'', vavoo:'sky super tennis', daddy:'', vid6:'', vid7:'558282118' }
+  { slug:'sky-crime', name:'Sky Crime', ntv:'863', vavoo:'sky crime', daddy:'863', vid6:'', vid7:'' }
 ];
 
 const ALIASES = {
-  'dazn':'dazn-1','dazn-zona':'zona-dazn','serie-a':'sky-sport-serie-a',
-  'sky-calcio-1':'sky-sport-calcio','sky-calcio-2':'sky-sport-calcio','sky-calcio-3':'sky-sport-calcio',
-  'sky-sport-24-ntv':'sky-sport-24','sky-sport-uno-italy':'sky-sport-uno',
-  'nove':'nove','tv-8':'tv8','rai-news':'rai-news-24','rai-news':'rai-news-24',
-  'mediaset-20':'mediaset-20','20-mediaset':'mediaset-20','20mediaset':'mediaset-20'
+  'dazn':'dazn-1','dazn-zona':'dazn-1','zona-dazn':'dazn-1',
+  'serie-a':'sky-sport-serie-a',
+  'sky-calcio-1':'sky-calcio-251','sky-calcio-2':'sky-calcio-252','sky-calcio-3':'sky-calcio-253',
+  'sky-sport-24-ntv':'sky-sport-24','sky-sport-uno-italy':'sky-sport-uno'
 };
 
 const BY_KEY = (() => {
@@ -201,7 +120,7 @@ function elencoCanali(u){
 }
 
 // ============================================================================
-// QUALITY-LOCK — gestisce la risoluzione massima per ogni canale
+// QUALITY-LOCK
 // ============================================================================
 const qualityStore = new Map();
 
@@ -455,7 +374,7 @@ async function vavooResolve(query,vid){
 }
 
 // ============================================================================
-// ⭐ VARIANTE INTELLIGENTE: 1080p H.264 default, fallback automatico
+// ⭐ VARIANT SELECTOR: 1080p H.264 default
 // ============================================================================
 function parseMasterPlaylist(body){
   const lines=body.split(/\r?\n/);
@@ -479,30 +398,24 @@ function codecIsH264(codecs){ return !!codecs && codecs.split(',').some(c=>c.tri
 function codecIsHEVC(codecs){ return !!codecs && codecs.split(',').some(c=>c.trim().startsWith('hvc1')||c.trim().startsWith('hev1')); }
 function getResHeight(res){ if(!res) return 0; const m=res.match(/x(\d+)/i); return m?parseInt(m[1]):0; }
 
-// 🔥 LOGICA CHIAVE: sceglie H.264 alla risoluzione massima disponibile ≤ maxRes
 function selectVariantSmart(variants, maxRes){
-  // 1) Filtra SOLO H.264 (mai HEVC di default)
+  // 1) Solo H.264
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
-  
-  // 2) Se ci sono H.264, scegli quella con risoluzione più alta MA ≤ maxRes
   if(h264.length > 0){
     const eligible = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
     if(eligible.length > 0){
       return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
     }
-    // Se nessuna ≤ maxRes, usa la più bassa disponibile (comunque H.264)
     return h264.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
   }
-  
-  // 3) Nessun H.264: usa HEVC come ULTIMA spiaggia (rischio schermo nero)
+  // 2) HEVC come ultima spiaggia
   const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
   if(hevc.length > 0){
     const eligible = hevc.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
     if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
     return hevc[0];
   }
-  
-  // 4) Nessun codec dichiarato: prendi la più alta ≤ maxRes
+  // 3) Nessun codec dichiarato
   if(variants.length === 0) return null;
   const eligible = variants.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
   if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
@@ -521,7 +434,7 @@ async function live(u,P,legacy){
   const c=findCh(q);
   if(!c) return R('canale non mappato: "'+q+'"\n\n'+elencoCanali(u),200,TXT());
 
-  // 🎯 Quality-Lock: comandi per l'utente
+  // Quality-Lock comandi
   if(u.searchParams.get('fail')==='1') degradeQuality(c.slug);
   if(u.searchParams.get('reset')==='1') resetQuality(c.slug);
   const resParam = u.searchParams.get('res');
@@ -691,9 +604,9 @@ async function seg(u){
     const out=rewriteAny(txt,baseDir,u.origin,ref,o||'',1080);
     return R(out,200,HLS_NO_CACHE());
   }
-  const cfOpt=range?{cacheTtl:0}:{cacheTtl:5,cacheEverything:true};
+  const cfOpt=range?{cacheTtl:0}:{cacheTtl:60,cacheEverything:true};
   const r=await fetchT(target,{headers:h,cf:cfOpt},15000);
-  const hh={'content-type':r.headers.get('content-type')||'video/mp2t','access-control-allow-origin':'*','access-control-allow-methods':'GET, HEAD, OPTIONS','access-control-allow-headers':'Range, User-Agent, Referer, Origin','cache-control':range?'no-cache':'public, max-age=5','pragma':range?'no-cache':''};
+  const hh={'content-type':r.headers.get('content-type')||'video/mp2t','access-control-allow-origin':'*','access-control-allow-methods':'GET, HEAD, OPTIONS','access-control-allow-headers':'Range, User-Agent, Referer, Origin','cache-control':range?'no-cache':'public, max-age=60','pragma':range?'no-cache':''};
   const cl=r.headers.get('content-length'); const cr=r.headers.get('content-range'); if(cl) hh['content-length']=cl; if(cr) hh['content-range']=cr;
   return new Response(r.body,{status:r.status,headers:hh});
 }
@@ -722,7 +635,6 @@ async function checkseg(u){
         const sel=(chosen===v)?' ← SCELTA':'';
         L.push('  ['+i+'] '+v.attrs.RESOLUTION+' | '+c+' | '+h264+sel);
       });
-      if(chosen){ const baseDir=txt.match(/#EXT-X-STREAM-INF/)?lines.find((l,i,a)=>!l.startsWith('#')&&l.trim()&&i>0):''; segUrl=resolveUri(lines.find((l,i,a)=>!l.startsWith('#')&&l.trim())||'',chosen.uri); }
     } else {
       for(let i=0;i<lines.length;i++){ if(lines[i].trim().startsWith('#EXTINF')&&lines[i+1]&&!lines[i+1].trim().startsWith('#')){ segUrl=lines[i+1].trim(); break; } }
     }
@@ -946,4 +858,4 @@ async function fetchT(url,opt,ms){
   }
   return fetch(url,o);
 }
-// ███ FINE TVNOW-CF v9.0 Quality-Lock ███
+// ███ FINE TVNOW-CF v9.1 ███
