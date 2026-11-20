@@ -1,14 +1,14 @@
 // ============================================================================
-// TVNOW-CF v1.5 — FIX PROXY SEGMENTI NTV (NO CACHE-BUSTING)
+// TVNOW-CF v1.6 — FIX KEYFRAME (10 segmenti + DISCONTINUITY iniziale)
 // ============================================================================
-// Fix chirurgica: i segmenti NTV hanno token di firma. Aggiungere &_t= li rompe.
-// Ora: NO cache-busting per NTV, NO cache Cloudflare, header Referer corretti.
-// Mantiene: Vavoo raw bypass, Daddy deep scraping.
+// Fix: servire 10 segmenti invece di 6 per garantire un keyframe all'inizio.
+// Aggiungere EXT-X-DISCONTINUITY all'inizio per forzare il reset del decoder.
+// Mantiene: NO cache-busting per NTV, header corretti.
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.5',
-  FEATURES: ['Fix proxy segmenti NTV (no cache-busting)', 'Vavoo Raw IP Bypass', 'Daddy Deep Scraping']
+  VERSION: 'TVNOW-CF v1.6',
+  FEATURES: ['Fix keyframe (10 segmenti + DISCONTINUITY)', 'NO cache-busting NTV', 'Vavoo Raw Bypass', 'Daddy Deep Scraping']
 };
 
 const CHANNELS = [
@@ -70,9 +70,6 @@ function elencoCanali(u){
   return L.join('\n');
 }
 
-// ============================================================================
-// FETCH RESILIENTE
-// ============================================================================
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 async function fetchStream(url, ref) {
@@ -98,9 +95,6 @@ async function fetchStream(url, ref) {
   return r;
 }
 
-// ============================================================================
-// NTV
-// ============================================================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
 
@@ -127,9 +121,6 @@ async function ntvPlaylist(id){
   return {txt,ref:tk.ref,base:tk.m3u8};
 }
 
-// ============================================================================
-// DADDY
-// ============================================================================
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
 const daddyCache=new Map();
 
@@ -169,9 +160,6 @@ async function extractM3u8Deep(url, refererDomain, timeoutMs, depth){
   return null;
 }
 
-// ============================================================================
-// VAVOO
-// ============================================================================
 const VAVOO_MIRRORS=['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net'];
 const VAVOO_SOURCES=['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap={map:null,t:0,src:''};
@@ -239,9 +227,6 @@ async function vavooResolveDual(slug,vid6,vid7){
   return null;
 }
 
-// ============================================================================
-// LIVE
-// ============================================================================
 async function live(u, P, legacy) {
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
   if (!q) return R('uso: /live?ch=<slug>\n\n' + elencoCanali(u), 200, TXT());
@@ -295,9 +280,6 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// ============================================================================
-// REWRITE HLS
-// ============================================================================
 function rewriteAny(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
@@ -337,13 +319,9 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// 🔥 FIX: NO CACHE-BUSTING PER NTV (rompe i token di firma)
 function proxUrl(abs, P, ref, origin) {
   const isNtv = abs.includes('tvnow247') || abs.includes('cfbu247');
-  
-  // Per NTV: NON aggiungere _t= (rompe il token)
   let urlToEncode = isNtv ? abs : abs + (abs.includes('?') ? '&' : '?') + '_t=' + Math.floor(Date.now() / 60000) * 60000;
-  
   let u = P + '/seg?u=' + encodeURIComponent(urlToEncode);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
   if (origin) u += '&o=' + encodeURIComponent(origin);
@@ -364,34 +342,45 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
+// 🔥 FIX: 10 segmenti + DISCONTINUITY iniziale per forzare keyframe
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
-  const kept = p.segs.slice(-6);
+  
+  // Servire 10 segmenti invece di 6 per garantire un keyframe
+  const kept = p.segs.slice(-10);
   const dropped = p.segs.length - kept.length;
-  const out = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:' + p.upTarget, '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)];
+  
+  const out = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-TARGETDURATION:' + p.upTarget,
+    '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped),
+    '#EXT-X-DISCONTINUITY-SEQUENCE:0'
+  ];
+  
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
   }
+  
+  // Aggiungere DISCONTINUITY all'inizio per forzare il reset del decoder
+  out.push('#EXT-X-DISCONTINUITY');
+  
   kept.forEach((s, idx) => {
-    if (s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
     if (s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url, baseUrl), P, ref, origin));
   });
+  
   return out.join('\n');
 }
 
-// ============================================================================
-// SEG PROXY — FIX: NO CACHE PER NTV, HEADER CORRETTI
-// ============================================================================
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://tvnow247.today/';
   const o = u.searchParams.get('o');
   
-  // 🔥 Header corretti per NTV
   const isNtv = target.includes('tvnow247') || target.includes('cfbu247');
   const headers = isNtv ? {
     'User-Agent': UA,
@@ -425,9 +414,6 @@ async function seg(u) {
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// ============================================================================
-// DEBUG / DIAG
-// ============================================================================
 async function diag(u) {
   const q = u.searchParams.get('ch') || 'sky-sport-24';
   const c = findCh(q);
@@ -495,9 +481,6 @@ function debug() {
   return L.join('\n');
 }
 
-// ============================================================================
-// UTILS
-// ============================================================================
 function uso(P) { return [CONFIG.VERSION, '', 'uso:', '  /live?ch=<slug>            Stream', '  /diag?ch=canale              Diagnostica', '  /probe?ch=canale             Test rapido', '  /ch?q=ricerca                Lista canali', '  /debug                       Info sistema', ''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function CORS() { return { 'access-control-allow-origin': '*' }; }
@@ -514,9 +497,6 @@ async function fetchT(url, opt, ms) {
   return fetch(url, o);
 }
 
-// ============================================================================
-// ROUTER
-// ============================================================================
 export default {
   async fetch(req) {
     const u = new URL(req.url);
@@ -541,4 +521,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.5 ███
+// ███ FINE TVNOW-CF v1.6 ███
