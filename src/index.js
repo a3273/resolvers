@@ -1,29 +1,25 @@
 // ============================================================================
-// TVNOW-CF v9.7 — TOLLERANZA CODEC/RESOLUTION + LOG MASTER/MEDIA
+// TVNOW-CF v9.9 — FIX DEFINITIVA: FORZATURA NTV + HEADER SEGMENTI CORRETTI
 // ============================================================================
-// FIX CHIRURGICI:
-// 1. Se CODECS è vuoto, ASSUME H.264 (evita scarti falsi positivi)
-// 2. Se RESOLUTION manca, dà priorità massima (999) invece di scartare
-// 3. Log esplicito: dice se la sorgente è MASTER o MEDIA playlist
-// 4. Mantiene fallback 720→480→1080 e ordine forzato NTV per F1/Tennis
+// 1. Forza NTV come unico provider per Sky Sport F1 e Tennis (Vavoo 403, Daddy KO)
+// 2. La funzione seg() ora riconosce i domini NTV e inietta gli header corretti 
+//    (Referer/Origin/User-Agent) per evitare il blocco dei segmenti .ts
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.7',
+  VERSION: 'TVNOW-CF v9.9',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
-    'Tolleranza CODECS vuoto (assume H.264)',
-    'Tolleranza RESOLUTION mancante (priorità 999)',
-    'Log esplicito MASTER vs MEDIA playlist',
+    'Forzatura NTV per F1/Tennis',
+    'Header segmenti NTV corretti (Anti-Gray-Screen)',
     'Fallback automatico 720→480→1080',
-    'Ordine provider forzato (F1/Tennis)',
+    'Tolleranza CODECS vuoto = H.264',
     'Dual-ID Vavoo (6)/(7)',
     'Health Check Auto-Switch',
     'Cache Bust 5s',
-    'Segment Proxy',
-    'Debug Endpoints'
+    'Segment Proxy'
   ]
 };
 
@@ -278,7 +274,6 @@ function parseMasterPlaylist(body){
   return variants;
 }
 
-// 🔥 MODIFICA 1: TOLLERANZA CODEC E RISOLUZIONE
 function codecIsH264(codecs){
   if(!codecs || String(codecs).trim()===''){
     log('⚠️ TAG CODECS VUOTO → ASSUMIAMO H.264 (COMPATIBILE TELEVIZO)');
@@ -293,7 +288,7 @@ function codecIsHEVC(codecs){
 }
 
 function getResHeight(res){
-  if(!res) return 999; // ⚠️ IMPORTANTE: SE RISOLUZIONE MANCANTE → NON SCARTIAMO, DIAMO PRIORITÀ
+  if(!res) return 999;
   const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i);
   return m ? parseInt(m[1]) : 999;
 }
@@ -350,12 +345,12 @@ async function live(u, P, legacy) {
 
   const order = legacy ? [legacy, ...['vavoo', 'daddy', 'ntv'].filter(x => x !== legacy)] : (u.searchParams.get('p') || 'vavoo,daddy,ntv').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   
-  // 🎯 Ordine forzato per canali problematici
-  const problematicSlugs = ['sky-sport-f1', 'sky-sport-tennis'];
+  // 🟡 SOLUZIONE 1: FORZA NTV COME UNICO PROVIDER PER SKY SPORT F1 E SKY SPORT TENNIS
+  const ntvOnlySlugs = ['sky-sport-f1', 'sky-sport-tennis'];
   let availableOrder;
-  if (problematicSlugs.includes(c.slug)) {
-    availableOrder = ['ntv', 'daddy', 'vavoo'];
-    log(`🎯 ORDINE FORZATO (NTV → DADDY → VAVOO) PER ${c.name}`);
+  if (ntvOnlySlugs.includes(c.slug)) {
+    availableOrder = ['ntv']; 
+    log(`🎯 FORZATO: SOLO NTV PER ${c.name}`);
   } else {
     availableOrder = order.filter(p => {
       if (p === 'vavoo') return c.vavoo || c.vid6 || c.vid7;
@@ -365,7 +360,6 @@ async function live(u, P, legacy) {
     });
   }
 
-  // 🟢 Fallback automatico 720p → 480p → 1080p
   const qualityAttempts = [720, 480, 1080];
   let finalStream = null;
 
@@ -440,7 +434,6 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// 🔥 MODIFICA 2: LOG ESPlicito MASTER vs MEDIA
 async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) return null;
@@ -470,7 +463,7 @@ async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug
       return null;
     }
   } else {
-    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE A TELEVIZO');
+    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE');
     return rewriteMediaPl(txt, baseUrl, P, ref, origin);
   }
 }
@@ -487,12 +480,10 @@ function rewriteAny(txt, baseUrl, P, ref, origin, maxRes) {
     
     const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
     const mediaUrl = resolveUri(baseDir, chosen.uri);
-    
     const safeStreamInf = chosen.line || '#EXT-X-STREAM-INF:BANDWIDTH=2000000';
-    
     return '#EXTM3U\n' + safeStreamInf + '\n' + proxUrl(mediaUrl, P, ref, origin);
   } else {
-    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE A TELEVIZO');
+    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE');
     return rewriteMediaPl(txt, baseUrl, P, ref, origin);
   }
 }
@@ -558,14 +549,25 @@ function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   return out.join('\n');
 }
 
+// 🟠 SOLUZIONE 2: CORREZIONE HEADER PER IL PROXY DEI SEGMENTI NTV
 async function seg(u){
   countReq('seg');
   const target=u.searchParams.get('u'); if(!target) return R('uso: /seg?u=<url>',200,TXT());
-  const ref=u.searchParams.get('ref')||'https://thedaddy.li/';
+  
+  // ✅ CAMBIA IL REF DI DEFAULT A QUELLO DI NTV
+  const ref=u.searchParams.get('ref') || 'https://tvnow247.today/'; 
   const h=getBrowserHeaders(ref);
   const o=u.searchParams.get('o'); if(o) h['Origin']=o;
   const range=u.searchParams.get('range'); if(range) h['Range']=range;
-  if(ref.includes('thedaddy')){ h['Referer']='https://thedaddy.li/'; h['Origin']='https://thedaddy.li'; }
+
+  // ✅ SE È UN SEGMENTO NTV FORZA HEADER FISSI PER EVITARE IL BLOCCO
+  if(target.includes('tvnow247') || target.includes('cfbu247')){
+    h['Referer'] = 'https://tvnow247.today/';
+    h['Origin'] = 'https://tvnow247.today';
+    h['User-Agent'] = UA;
+    log('🔒 SEGMENTO NTV: HEADER FORZATI (tvnow247.today)');
+  }
+
   if(/\.m3u8(\?|$)/i.test(target)){
     const r=await fetchT(target,{headers:h,cf:{cacheTtl:0}},10000);
     if(!r.ok) return R('upstream '+r.status,r.status,TXT());
@@ -575,6 +577,7 @@ async function seg(u){
     if(out) return R(out,200,HLS_NO_CACHE());
     return R('ERRORE: nessuna variante H.264',200,TXT());
   }
+  
   const cfOpt=range?{cacheTtl:0}:{cacheTtl:60,cacheEverything:true};
   const r=await fetchT(target,{headers:h,cf:cfOpt},15000);
   const hh={'content-type':r.headers.get('content-type')||'video/mp2t','access-control-allow-origin':'*','access-control-allow-methods':'GET, HEAD, OPTIONS','access-control-allow-headers':'Range, User-Agent, Referer, Origin','cache-control':range?'no-cache':'public, max-age=60','pragma':range?'no-cache':''};
@@ -711,11 +714,11 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v9.7 ===');
-  L.push('1. Ordine forzato NTV→Daddy→Vavoo per F1/Tennis');
-  L.push('2. Fallback automatico: 720p → 480p → 1080p');
-  L.push('3. Tolleranza: CODECS vuoto = H.264, RISOLUZIONE mancante = priorità 999');
-  L.push('4. Log esplicito: distingue MASTER da MEDIA playlist');
+  L.push('=== LOGICA v9.9 ===');
+  L.push('1. 🎯 FORZATO: Solo NTV per F1/Tennis (salta Vavoo/Daddy KO)');
+  L.push('2. 🔒 SEGMENTI NTV: Header Referer/Origin forzati su tvnow247.today');
+  L.push('3. Fallback automatico: 720p → 480p → 1080p');
+  L.push('4. Tolleranza: CODECS vuoto = H.264, RISOLUZIONE mancante = priorità 999');
   return L.join('\n');
 }
 
@@ -742,7 +745,7 @@ function debug(){
   L.push('  /live?ch=canale              Stream con fallback 720→480→1080');
   L.push('  /live?ch=canale&fail=1       ⬇️ Scendi risoluzione manuale');
   L.push('  /live?ch=canale&reset=1      🔄 Torna a 1080p');
-  L.push('  /seg?u=...                   Proxy segmento');
+  L.push('  /seg?u=...                   Proxy segmento (con fix header NTV)');
   L.push('  /warm                        Riscaldamento cache');
   L.push('  /probe?ch=canale             Test rapido');
   L.push('  /diag?ch=canale              Diagnostica completa con log varianti');
@@ -845,4 +848,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.7 ███
+// ███ FINE TVNOW-CF v9.9 ███
