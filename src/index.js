@@ -1,14 +1,14 @@
 // ============================================================================
-// TVNOW-CF v1.4 FINAL — MOTORE BLINDATO PER TUTTE E 3 LE FONTI
+// TVNOW-CF v1.5 — FIX PROXY SEGMENTI NTV (NO CACHE-BUSTING)
 // ============================================================================
-// 1. VAVOO: Bypass aggressivo per IP raw (niente header Cloudflare, solo browser nudo)
-// 2. DADDY: Scraping a 3 livelli di profondità + regex multiple per JS offuscato
-// 3. NTV: Proxy perfetto del flusso (con nota: HEVC .ts richiede decoder software come VLC su iOS)
+// Fix chirurgica: i segmenti NTV hanno token di firma. Aggiungere &_t= li rompe.
+// Ora: NO cache-busting per NTV, NO cache Cloudflare, header Referer corretti.
+// Mantiene: Vavoo raw bypass, Daddy deep scraping.
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.4 FINAL',
-  FEATURES: ['Vavoo Raw IP Bypass', 'Daddy Deep Scraping (3 livelli)', 'NTV Proxy Perfetto']
+  VERSION: 'TVNOW-CF v1.5',
+  FEATURES: ['Fix proxy segmenti NTV (no cache-busting)', 'Vavoo Raw IP Bypass', 'Daddy Deep Scraping']
 };
 
 const CHANNELS = [
@@ -71,14 +71,13 @@ function elencoCanali(u){
 }
 
 // ============================================================================
-// FETCH BLINDATO (Bypassa firewall per IP raw e tentativi multipli)
+// FETCH RESILIENTE
 // ============================================================================
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 async function fetchStream(url, ref) {
   const isRaw = /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(url) || url.includes('sunshine');
   
-  // Per IP raw: header MINIMALI ASSOLUTI. Niente Origin, Sec-Fetch, ecc. che fanno scattare i WAF.
   const headers = isRaw ? {
     'User-Agent': UA,
     'Referer': ref || 'https://geil.to/',
@@ -90,10 +89,8 @@ async function fetchStream(url, ref) {
     'Accept': '*/*'
   };
 
-  // 1. Tentativo originale
   let r = await fetchT(url, { headers }, 8000);
   
-  // 2. Fallback: se 403 ed è HTTP, prova HTTPS (molti server raw rispondono su entrambe le porte)
   if (r.status === 403 && url.startsWith('http://')) {
     r = await fetchT(url.replace('http://', 'https://'), { headers }, 8000);
   }
@@ -131,7 +128,7 @@ async function ntvPlaylist(id){
 }
 
 // ============================================================================
-// DADDY (Deep Scraping a 3 livelli)
+// DADDY
 // ============================================================================
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
 const daddyCache=new Map();
@@ -152,21 +149,18 @@ async function daddyResolve(id){
 }
 
 async function extractM3u8Deep(url, refererDomain, timeoutMs, depth){
-  if(depth > 2) return null; // Massimo 3 livelli di iframe
+  if(depth > 2) return null;
   
   const r=await fetchT(url,{headers:{'User-Agent':UA,'Referer':refererDomain+'/'},cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
   if(!r.ok) return null;
   const html=await r.text();
   
-  // 1. Cerca m3u8 in chiaro
   let m3u8=html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
   if(m3u8) return m3u8[1];
   
-  // 2. Cerca variabili JS offuscate (file, source, url, m3u8, o stringhe base64 che finiscono in .m3u8)
   const jsVar = html.match(/(?:file|source|url|m3u8)["']?\s*[:=]\s*["']([^"']+)["']/i);
   if(jsVar && jsVar[1].includes('.m3u8')) return jsVar[1];
   
-  // 3. Fallback iframe ricorsivo
   const iframe=html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
   if(iframe){
     return await extractM3u8Deep(iframe[1], url, timeoutMs, depth + 1);
@@ -296,7 +290,7 @@ async function live(u, P, legacy) {
     try {
       const res = await fn();
       if (res) return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
-    } catch (e) { /* continua al prossimo provider */ }
+    } catch (e) { /* continua */ }
   }
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
@@ -343,10 +337,14 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
+// 🔥 FIX: NO CACHE-BUSTING PER NTV (rompe i token di firma)
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 60000) * 60000;
-  const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
-  let u = P + '/seg?u=' + encodeURIComponent(withBust);
+  const isNtv = abs.includes('tvnow247') || abs.includes('cfbu247');
+  
+  // Per NTV: NON aggiungere _t= (rompe il token)
+  let urlToEncode = isNtv ? abs : abs + (abs.includes('?') ? '&' : '?') + '_t=' + Math.floor(Date.now() / 60000) * 60000;
+  
+  let u = P + '/seg?u=' + encodeURIComponent(urlToEncode);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
   if (origin) u += '&o=' + encodeURIComponent(origin);
   return u;
@@ -386,14 +384,28 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
 }
 
 // ============================================================================
-// SEG PROXY
+// SEG PROXY — FIX: NO CACHE PER NTV, HEADER CORRETTI
 // ============================================================================
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
-  const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
+  const ref = u.searchParams.get('ref') || 'https://tvnow247.today/';
   const o = u.searchParams.get('o');
   
-  const r = await fetchStream(target, ref);
+  // 🔥 Header corretti per NTV
+  const isNtv = target.includes('tvnow247') || target.includes('cfbu247');
+  const headers = isNtv ? {
+    'User-Agent': UA,
+    'Referer': 'https://tvnow247.today/',
+    'Origin': 'https://tvnow247.today',
+    'Accept': '*/*'
+  } : {
+    'User-Agent': UA,
+    'Referer': ref,
+    'Origin': ref.replace(/\/$/, ''),
+    'Accept': '*/*'
+  };
+
+  const r = await fetchT(target, { headers, cf: { cacheTtl: isNtv ? 0 : 60, cacheEverything: !isNtv } }, 15000);
   if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
 
   if (/\.m3u8(\?|$)/i.test(target)) {
@@ -407,7 +419,7 @@ async function seg(u) {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'public, max-age=60'
+    'cache-control': isNtv ? 'no-cache' : 'public, max-age=60'
   };
   const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
   return new Response(r.body, { status: r.status, headers: hh });
@@ -529,4 +541,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.4 FINAL ███
+// ███ FINE TVNOW-CF v1.5 ███
