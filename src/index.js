@@ -1,17 +1,30 @@
 // ============================================================================
-// TVNOW-CF v9.3 — FIX CRITICO HLS "UNDEFINED" + QUALITY-LOCK
+// TVNOW-CF v9.4 — FIX DEFINITIVO: NO MASTER PLAYLIST + FORZA H.264
 // ============================================================================
-// GENIUS FIX: Preserva la riga #EXT-X-STREAM-INF originale invece di 
-// ricostruirla con variabili undefined (causa principale dello schermo nero 
-// sui canali Cinema che omettono metadata nel master playlist).
+// FIX CHIRURGICI:
+// 1. Il worker NON restituisce mai master playlist: scarica la media playlist
+//    della variante H.264 scelta e la restituisce direttamente
+// 2. Se tutte le varianti sono HEVC, passa al provider successivo
+// 3. Fallback automatico: Vavoo → Daddy → NTV (con retry su HEVC)
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.3',
+  VERSION: 'TVNOW-CF v9.4',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
-  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 3/5s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints', 'FIX: No undefined HLS tags']
+  FEATURES: [
+    'NO master playlist (solo media)',
+    'Forza H.264 (scarta HEVC)',
+    'Fallback automatico provider',
+    'Quality-Lock auto-fallback',
+    'Dual-ID Vavoo (6)/(7)',
+    'Health Check Auto-Switch',
+    'Keyframe Window 8s',
+    'Cache Bust 5s',
+    'Segment Proxy',
+    'Debug Endpoints'
+  ]
 };
 
 const CHANNELS = [
@@ -251,7 +264,7 @@ async function tryVavooId(id){ for(const base of VAVOO_MIRRORS.slice(0,6)){ cons
 async function vavooResolve(query,vid){ const c=findCh(query); if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7); return await vavooResolveDual(null,query,vid,null); }
 
 // ============================================================================
-// VARIANT SELECTOR & PARSER (IMMUNE TO UNDEFINED)
+// VARIANT SELECTOR — FORZA H.264, SCARTA HEVC
 // ============================================================================
 function parseMasterPlaylist(body){
   const lines=body.split(/\r?\n/);
@@ -262,34 +275,26 @@ function parseMasterPlaylist(body){
       const attrs={}; const attrStr=line.substring('#EXT-X-STREAM-INF:'.length);
       const re=/([A-Z-]+)=("[^"]*"|[^,]+)/g; let m;
       while((m=re.exec(attrStr))!==null) attrs[m[1]]=m[2].replace(/^"|"$/g,'');
-      current={attrs, line:line, index:variants.length}; // GENIUS: Save original line
+      current={attrs, line:line, index:variants.length};
     } else if(current&&line&&!line.startsWith('#')){ current.uri=line; variants.push(current); current=null; }
   }
   return variants;
 }
 
-// GENIUS FIX: Immuni a undefined/null
-function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
 function codecIsH264(codecs){ return !!codecs && String(codecs).toLowerCase().includes('avc1'); }
 function codecIsHEVC(codecs){ return !!codecs && (String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1')); }
+function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
 
 function selectVariantSmart(variants, maxRes){
+  // 1) Solo H.264 (avc1) — mai HEVC
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
   if(h264.length > 0){
     const eligible = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
     if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
     return h264.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
   }
-  const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
-  if(hevc.length > 0){
-    const eligible = hevc.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
-    if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
-    return hevc[0];
-  }
-  if(variants.length === 0) return null;
-  const eligible = variants.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
-  if(eligible.length > 0) return eligible.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) >= getResHeight(b.attrs.RESOLUTION) ? a : b);
-  return variants.reduce((a,b) => getResHeight(a.attrs.RESOLUTION) <= getResHeight(b.attrs.RESOLUTION) ? a : b);
+  // 2) Se non c'è H.264, restituisci null (il worker passerà al provider successivo)
+  return null;
 }
 
 let lastPl={key:'',txt:'',t:0};
@@ -321,18 +326,18 @@ async function live(u,P,legacy){
       if(/\.m3u8(\?|$)/i.test(vu)){
         const r=await fetchT(vu,{headers:vavooHeaders({'User-Agent':'VAVOO/1.0'})},8000);
         if(!r.ok){ recordVavooFail(c.slug,6); recordVavooFail(c.slug,7); vavooURLCache.delete(c.slug); return null; }
-        const out=rewriteAny(await r.text(),vu,P,'https://vavoo.to/','https://vavoo.to',maxRes);
-        lastPl={key:ck,txt:out,t:Date.now()};
-        return R(out,200,HLS_NO_CACHE());
+        const out=await processPlaylist(await r.text(),vu,P,'https://vavoo.to/','https://vavoo.to',maxRes,c.slug);
+        if(out){ lastPl={key:ck,txt:out,t:Date.now()}; return R(out,200,HLS_NO_CACHE()); }
+        return null; // HEVC-only, passa al prossimo provider
       }
       return R('redirect vavoo',302,{Location:vu,...CORS()});
     },
     ntv: async()=>{
       if(!c.ntv) return null;
       const pl=await ntvPlaylist(c.ntv);
-      const out=rewriteAny(pl.txt,pl.base,P,pl.ref,'',maxRes);
-      lastPl={key:ck,txt:out,t:Date.now()};
-      return R(out,200,HLS_NO_CACHE());
+      const out=await processPlaylist(pl.txt,pl.base,P,pl.ref,'',maxRes,c.slug);
+      if(out){ lastPl={key:ck,txt:out,t:Date.now()}; return R(out,200,HLS_NO_CACHE()); }
+      return null; // HEVC-only, passa al prossimo provider
     },
     daddy: async()=>{
       if(!c.daddy) return null;
@@ -340,10 +345,13 @@ async function live(u,P,legacy){
       if(!du||!/\.m3u8/i.test(du)) return null;
       const r=await fetchT(du,{headers:getBrowserHeaders('https://thedaddy.li/')},8000);
       if(!r.ok){ daddyCache.delete(c.daddy); return null; }
-      const processed=rewriteAny(await r.text(),du,P,'https://thedaddy.li/','',maxRes);
-      const finalTxt=['#EXTVLCOPT:http-referrer=https://thedaddy.li/','#EXTVLCOPT:http-user-agent='+UA].concat(processed.split('\n')).join('\n');
-      lastPl={key:ck,txt:finalTxt,t:Date.now()};
-      return R(finalTxt,200,HLS_NO_CACHE());
+      const processed=await processPlaylist(await r.text(),du,P,'https://thedaddy.li/','',maxRes,c.slug);
+      if(processed){
+        const finalTxt=['#EXTVLCOPT:http-referrer=https://thedaddy.li/','#EXTVLCOPT:http-user-agent='+UA].concat(processed.split('\n')).join('\n');
+        lastPl={key:ck,txt:finalTxt,t:Date.now()};
+        return R(finalTxt,200,HLS_NO_CACHE());
+      }
+      return null; // HEVC-only
     }
   };
 
@@ -352,25 +360,38 @@ async function live(u,P,legacy){
 }
 
 // ============================================================================
-// REWRITE HLS (GENIUS FIX APPLIED HERE)
+// PROCESS PLAYLIST — SCARICA MEDIA PLAYLIST DIRETTAMENTE
 // ============================================================================
-function rewriteAny(txt, baseUrl, P, ref, origin, maxRes) {
+async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug) {
   txt = String(txt);
-  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
+  if (!txt.includes('#EXTM3U')) return null;
+  
   if (/#EXT-X-STREAM-INF/.test(txt)) {
+    // È una master playlist: scegli variante H.264 e scarica la media playlist
     const variants = parseMasterPlaylist(txt);
-    const chosen = selectVariantSmart(variants, maxRes || 1080);
-    if (!chosen) throw new Error('nessuna variante');
+    const chosen = selectVariantSmart(variants, maxRes);
+    
+    if (!chosen) {
+      log('⚠️ '+channelSlug+': nessuna variante H.264,跳过');
+      return null; // Passa al provider successivo
+    }
     
     const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
     const mediaUrl = resolveUri(baseDir, chosen.uri);
     
-    // 💡 GENIUS FIX: Usa la riga originale (#EXT-X-STREAM-INF:...) invece di ricostruirla.
-    // Questo previene l'output di "RESOLUTION=undefined" che manda in crash i player.
-    const safeStreamInf = chosen.line || '#EXT-X-STREAM-INF:BANDWIDTH=2000000';
-    
-    return '#EXTM3U\n' + safeStreamInf + '\n' + proxUrl(mediaUrl, P, ref, origin);
+    // Scarica la media playlist della variante H.264 scelta
+    try {
+      const r = await fetchT(mediaUrl, { headers: getBrowserHeaders(ref) }, 5000);
+      if (!r.ok) return null;
+      const mediaTxt = await r.text();
+      return rewriteMediaPl(mediaTxt, mediaUrl, P, ref, origin);
+    } catch (e) {
+      log('❌ '+channelSlug+': errore download media playlist: '+e.message);
+      return null;
+    }
   }
+  
+  // È già una media playlist
   return rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
@@ -415,7 +436,7 @@ function proxUrl(abs,P,ref,origin){
 
 function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   const p=parseMediaPl(txt);
-  if(p.isMaster||!p.segs.length) return rewriteMaster(txt,baseUrl,P,ref,origin);
+  if(p.isMaster||!p.segs.length) return null; // Non dovrebbe mai succedere
   const maxSegs=8;
   const kept=p.segs.slice(-maxSegs);
   const dropped=p.segs.length-kept.length;
@@ -427,20 +448,6 @@ function rewriteMediaPl(txt,baseUrl,P,ref,origin){
     if(s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url,baseUrl),P,ref,origin));
   });
-  return out.join('\n');
-}
-
-function rewriteMaster(txt,baseUrl,P,ref,origin){
-  const out=[];
-  for(const raw of String(txt).split(/\r?\n/)){
-    const line=raw.trim();
-    if(!line) continue;
-    if(line.startsWith('#')){ out.push(line); continue; }
-    let u=P+'/seg?u='+encodeURIComponent(absSegUrl(line,baseUrl));
-    if(ref) u+='&ref='+encodeURIComponent(ref);
-    if(origin) u+='&o='+encodeURIComponent(origin);
-    out.push(u);
-  }
   return out.join('\n');
 }
 
@@ -457,8 +464,9 @@ async function seg(u){
     if(!r.ok) return R('upstream '+r.status,r.status,TXT());
     const txt=await r.text();
     const baseDir=target.substring(0,target.lastIndexOf('/')+1)||target;
-    const out=rewriteAny(txt,baseDir,u.origin,ref,o||'',1080);
-    return R(out,200,HLS_NO_CACHE());
+    const out=await processPlaylist(txt,baseDir,u.origin,ref,o||'',1080,'seg-proxy');
+    if(out) return R(out,200,HLS_NO_CACHE());
+    return R('ERRORE: nessuna variante H.264',200,TXT());
   }
   const cfOpt=range?{cacheTtl:0}:{cacheTtl:60,cacheEverything:true};
   const r=await fetchT(target,{headers:h,cf:cfOpt},15000);
@@ -482,6 +490,7 @@ async function checkseg(u){
       const variants=parseMasterPlaylist(txt);
       const chosen=selectVariantSmart(variants,1080);
       L.push('Varianti trovate: '+variants.length);
+      L.push('Variante H.264 scelta: '+(chosen?'SÌ ('+chosen.attrs.RESOLUTION+')':'NO — solo HEVC'));
       variants.forEach((v,i)=>{
         const c=v.attrs.CODECS||'?';
         const h264=codecIsH264(c)?'✅H264':(codecIsHEVC(c)?'⚠️HEVC':'❓');
@@ -562,17 +571,20 @@ async function diag(u){
     try{
       const txt=await fn();
       L.push('— '+label+' ('+(Date.now()-t0)+'ms) —');
-      L.push('OK | '+playlistStats(txt));
       if(/#EXT-X-STREAM-INF/.test(txt)){
         const variants=parseMasterPlaylist(txt);
         const chosen=selectVariantSmart(variants,qual.maxRes);
-        L.push('   Varianti: '+variants.length+' | Scelta: '+getResHeight(chosen?.attrs.RESOLUTION)+'p '+(chosen?.attrs.CODECS||'?'));
+        L.push('   Master playlist: '+variants.length+' varianti');
+        L.push('   Variante H.264: '+(chosen?'SÌ ('+chosen.attrs.RESOLUTION+')':'NO — solo HEVC'));
         variants.forEach((v,i)=>{
           const c=v.attrs.CODECS||'?';
           const h264=codecIsH264(c)?'✅H264':(codecIsHEVC(c)?'⚠️HEVC':'❓');
-          const sel=(chosen===v)?' ←':'';
+          const sel=(chosen===v)?' ← SCELTA':'';
           L.push('   ['+i+'] '+v.attrs.RESOLUTION+' | '+c+' | '+h264+sel);
         });
+      } else {
+        const p=parseMediaPl(txt);
+        L.push('   Media playlist: '+p.segs.length+' segmenti, TARGETDURATION='+p.upTarget+'s');
       }
     }catch(e){ L.push('— '+label+' ('+(Date.now()-t0)+'ms) —\nERRORE: '+(e&&e.message)); }
     L.push('');
@@ -592,23 +604,12 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA QUALITY-LOCK ===');
-  L.push('1. Default: 1080p H.264 (avc1)');
-  L.push('2. HEVC (hvc1/hev1) SEMPRE scartato di default (schermo nero)');
-  L.push('3. &fail=1 → scende a 720p, poi 480p, poi 360p, poi 240p');
-  L.push('4. &reset=1 → torna a 1080p');
-  L.push('5. &res=720 → forza manualmente 720p');
-  L.push('6. TTL 30min: poi torna a 1080p');
-  L.push('7. 💡 FIX: Preserva tag HLS originali (niente "undefined")');
+  L.push('=== LOGICA v9.4 ===');
+  L.push('1. Scarica SEMPRE media playlist (mai master)');
+  L.push('2. Sceglie SOLO varianti H.264 (avc1)');
+  L.push('3. Se solo HEVC → passa al provider successivo');
+  L.push('4. Fallback: Vavoo → Daddy → NTV');
   return L.join('\n');
-}
-
-function playlistStats(txt){
-  const p=parseMediaPl(txt);
-  if(/#EXT-X-STREAM-INF/.test(txt)){ const v=parseMasterPlaylist(txt); return 'master playlist, '+v.length+' varianti'; }
-  const durs=p.segs.map(s=>s.dur||p.upTarget);
-  const total=durs.reduce((a,b)=>a+b,0);
-  return 'fonte '+p.segs.length+' segs / '+total.toFixed(1)+'s | finestra '+Math.min(p.segs.length,8)+' segs';
 }
 
 function debug(){
@@ -631,20 +632,19 @@ function debug(){
   L.push('');
   L.push('🌐 ENDPOINT');
   L.push('─────────────────────────────────────────────────────────');
-  L.push('  /live?ch=canale              Stream 1080p H.264 default');
-  L.push('  /live?ch=canale&fail=1       ⬇️ Scendi risoluzione (720→480→360)');
+  L.push('  /live?ch=canale              Stream 1080p H.264');
+  L.push('  /live?ch=canale&fail=1       ⬇️ Scendi risoluzione');
   L.push('  /live?ch=canale&reset=1      🔄 Torna a 1080p');
-  L.push('  /live?ch=canale&res=720      🎯 Forza risoluzione specifica');
   L.push('  /seg?u=...                   Proxy segmento');
   L.push('  /warm                        Riscaldamento cache');
   L.push('  /probe?ch=canale             Test rapido');
   L.push('  /diag?ch=canale              Diagnostica completa');
-  L.push('  /checkseg?s=vavoo&ch=X       Test variante scelta');
+  L.push('  /checkseg?s=vavoo&ch=X       Test variante');
   L.push('  /vmap?ch=canale              Varianti disponibili');
   L.push('  /ch?q=ricerca                Lista canali');
   L.push('  /debug                       Questa pagina');
   L.push('  /features                    Lista funzionalità');
-  L.push('  /rawu?u=<url>                Debug URL grezzo');
+  L.push('  /rawu?u=<url>                Debug URL');
   L.push('  /ip                          Info IP');
   L.push('');
   L.push('📊 CACHE');
@@ -653,11 +653,6 @@ function debug(){
   L.push('Daddy URLs:      '+daddyCache.size+'/'+MAX_DADDY_CACHE);
   L.push('Vavoo URLs:      '+vavooURLCache.size);
   L.push('Vavoo Map:       '+(vavooMapGet()?vavooMapGet().size+' canali':'non caricata'));
-  L.push('');
-  L.push('🎯 QUALITY-LOCK ATTIVI');
-  L.push('─────────────────────────────────────────────────────────');
-  if(qualityStore.size===0) L.push('  (nessuno — tutti a 1080p default)');
-  else{ for(const [slug,q] of qualityStore.entries()){ L.push('  '+slug.padEnd(24)+' maxRes='+q.maxRes+'p | fails='+q.fails+' | età='+Math.floor((Date.now()-q.t)/1000)+'s'); } }
   L.push('');
   L.push('📈 STATISTICHE');
   L.push('─────────────────────────────────────────────────────────');
@@ -689,7 +684,7 @@ function log(m){ logs.push(new Date().toISOString().slice(11,19)+' '+m); if(logs
 let reqStats={day:new Date().toISOString().slice(0,10),live:0,seg:0};
 function countReq(kind){ const d=new Date().toISOString().slice(0,10); if(d!==reqStats.day) reqStats={day:d,live:0,seg:0}; reqStats[kind]++; }
 
-function uso(P){ return [CONFIG.VERSION,'','uso:','  /live?ch=<slug>            playlist 1080p H.264','  /live?ch=X&fail=1          ⬇️ scendi risoluzione','  /live?ch=X&reset=1         🔄 torna 1080p','  /live?ch=X&res=720         🎯 forza 720p','  /diag?ch=sky-sport-f1      diagnostica','  /checkseg?s=vavoo&ch=X     test variante','  /probe?ch=X  /debug  /features','  /warm  /vmap  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P){ return [CONFIG.VERSION,'','uso:','  /live?ch=<slug>            playlist H.264 only','  /live?ch=X&fail=1          ⬇️ scendi risoluzione','  /live?ch=X&reset=1         🔄 torna 1080p','  /diag?ch=sky-sport-f1      diagnostica','  /checkseg?s=vavoo&ch=X     test variante','  /probe?ch=X  /debug  /features','  /warm  /vmap  /ch  /rawu  /ip',''].join('\n'); }
 function TXT(){ return {'content-type':'text/plain; charset=utf-8',...CORS()}; }
 function HLS_NO_CACHE(){ return {'content-type':'application/vnd.apple.mpegurl','cache-control':'no-cache, no-store, must-revalidate','pragma':'no-cache','expires':'0',...CORS()}; }
 function CORS(){ return {'access-control-allow-origin':'*'}; }
@@ -743,4 +738,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.3 ███
+// ███ FINE TVNOW-CF v9.4 ███
