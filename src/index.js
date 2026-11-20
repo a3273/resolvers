@@ -1,23 +1,24 @@
 // ============================================================================
-// TVNOW-CF v9.6 — DECODER RESET + STRATEGIA 4 STADI
+// TVNOW-CF v9.7 — TOLLERANZA CODEC/RESOLUTION + LOG MASTER/MEDIA
 // ============================================================================
-// 1. Fallback automatico risoluzioni: 720p → 480p → 1080p
-// 2. Ordine provider forzato (NTV→Daddy→Vavoo) per F1/Tennis
-// 3. Caccia aggressiva a H.264 720p nelle Master Playlist
-// 4. 🔥 INIEZIONE #EXT-X-DISCONTINUITY: forza il reset del decoder all'avvio 
-//    per prevenire schermo grigio su Media Playlist dirette (NTV F1/Tennis)
+// FIX CHIRURGICI:
+// 1. Se CODECS è vuoto, ASSUME H.264 (evita scarti falsi positivi)
+// 2. Se RESOLUTION manca, dà priorità massima (999) invece di scartare
+// 3. Log esplicito: dice se la sorgente è MASTER o MEDIA playlist
+// 4. Mantiene fallback 720→480→1080 e ordine forzato NTV per F1/Tennis
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.6',
+  VERSION: 'TVNOW-CF v9.7',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
+    'Tolleranza CODECS vuoto (assume H.264)',
+    'Tolleranza RESOLUTION mancante (priorità 999)',
+    'Log esplicito MASTER vs MEDIA playlist',
     'Fallback automatico 720→480→1080',
     'Ordine provider forzato (F1/Tennis)',
-    'Priorità assoluta a H.264 720p',
-    '🔥 Decoder Reset (Discontinuity injection)',
     'Dual-ID Vavoo (6)/(7)',
     'Health Check Auto-Switch',
     'Cache Bust 5s',
@@ -81,7 +82,7 @@ function findCh(q){ let k=norm(q); if(BY_KEY.has(k)) return BY_KEY.get(k); k=k.r
 function elencoCanali(u){
   const search=(u&&u.searchParams.get('q'))||'';
   const L=[CONFIG.VERSION+' — CANALI ('+CHANNELS.length+')'];
-  L.push('Uso: /live?ch=<slug>');
+  L.push('Uso: /live?ch=<slug>   /live?ch=X&fail=1');
   for(const c of CHANNELS){
     if(search && !c.slug.includes(search) && !c.name.toLowerCase().includes(search)) continue;
     const q = qualityStore.get(c.slug);
@@ -277,9 +278,25 @@ function parseMasterPlaylist(body){
   return variants;
 }
 
-function codecIsH264(codecs){ return !!codecs && String(codecs).toLowerCase().includes('avc1'); }
-function codecIsHEVC(codecs){ return !!codecs && (String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1')); }
-function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
+// 🔥 MODIFICA 1: TOLLERANZA CODEC E RISOLUZIONE
+function codecIsH264(codecs){
+  if(!codecs || String(codecs).trim()===''){
+    log('⚠️ TAG CODECS VUOTO → ASSUMIAMO H.264 (COMPATIBILE TELEVIZO)');
+    return true;
+  }
+  return String(codecs).toLowerCase().includes('avc1');
+}
+
+function codecIsHEVC(codecs){
+  if(!codecs || String(codecs).trim()==='') return false;
+  return String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1');
+}
+
+function getResHeight(res){
+  if(!res) return 999; // ⚠️ IMPORTANTE: SE RISOLUZIONE MANCANTE → NON SCARTIAMO, DIAMO PRIORITÀ
+  const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i);
+  return m ? parseInt(m[1]) : 999;
+}
 
 function selectVariantSmart(variants, maxRes){
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
@@ -333,7 +350,7 @@ async function live(u, P, legacy) {
 
   const order = legacy ? [legacy, ...['vavoo', 'daddy', 'ntv'].filter(x => x !== legacy)] : (u.searchParams.get('p') || 'vavoo,daddy,ntv').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   
-  // 🎯 STADIO 3: Ordine forzato per canali problematici
+  // 🎯 Ordine forzato per canali problematici
   const problematicSlugs = ['sky-sport-f1', 'sky-sport-tennis'];
   let availableOrder;
   if (problematicSlugs.includes(c.slug)) {
@@ -348,7 +365,7 @@ async function live(u, P, legacy) {
     });
   }
 
-  // 🟢 STADIO 2: Fallback automatico 720p → 480p → 1080p
+  // 🟢 Fallback automatico 720p → 480p → 1080p
   const qualityAttempts = [720, 480, 1080];
   let finalStream = null;
 
@@ -423,16 +440,18 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
+// 🔥 MODIFICA 2: LOG ESPlicito MASTER vs MEDIA
 async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) return null;
-  
+
   if (/#EXT-X-STREAM-INF/.test(txt)) {
+    log('✅ È MASTER PLAYLIST → USO SELEZIONE H.264');
     const variants = parseMasterPlaylist(txt);
     const chosen = selectVariantSmart(variants, maxRes);
     
     if (!chosen) {
-      log('⚠️ ' + channelSlug + ': nessuna variante H.264 trovata,跳过');
+      log('⚠️ ' + channelSlug + ': nessuna variante H.264 trovata');
       return null;
     }
     
@@ -450,9 +469,32 @@ async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug
       log('❌ ' + channelSlug + ': errore download media playlist: ' + e.message);
       return null;
     }
+  } else {
+    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE A TELEVIZO');
+    return rewriteMediaPl(txt, baseUrl, P, ref, origin);
   }
-  
-  return rewriteMediaPl(txt, baseUrl, P, ref, origin);
+}
+
+function rewriteAny(txt, baseUrl, P, ref, origin, maxRes) {
+  txt = String(txt);
+  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
+
+  if (/#EXT-X-STREAM-INF/.test(txt)) {
+    log('✅ È MASTER PLAYLIST → USO SELEZIONE H.264');
+    const variants = parseMasterPlaylist(txt);
+    const chosen = selectVariantSmart(variants, maxRes || 1080);
+    if (!chosen) throw new Error('nessuna variante');
+    
+    const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+    const mediaUrl = resolveUri(baseDir, chosen.uri);
+    
+    const safeStreamInf = chosen.line || '#EXT-X-STREAM-INF:BANDWIDTH=2000000';
+    
+    return '#EXTM3U\n' + safeStreamInf + '\n' + proxUrl(mediaUrl, P, ref, origin);
+  } else {
+    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE A TELEVIZO');
+    return rewriteMediaPl(txt, baseUrl, P, ref, origin);
+  }
 }
 
 function parseMediaPl(txt){
@@ -502,23 +544,13 @@ function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   const dropped=p.segs.length-kept.length;
   const out=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-TARGETDURATION:'+p.upTarget,'#EXT-X-MEDIA-SEQUENCE:'+(p.upSeq+dropped)];
   
-  // 🔥 COLPO DI GENIO: Forza il reset del decoder all'avvio. 
-  // Risolve lo schermo grigio su F1/Tennis (NTV) causato da join a metà keyframe o codec HEVC.
-  let needsDisc = true;
-  
   if(p.map){ 
     const mu=(p.map.match(/URI="([^"]+)"/)||[])[1]; 
     if(mu) out.push('#EXT-X-MAP:URI="'+proxUrl(absSegUrl(mu,baseUrl),P,ref,origin)+'"'); 
   }
   
   kept.forEach((s,idx)=>{
-    if(s.disc && needsDisc) {
-      // La discontinuità è già nel segmento, non aggiungerne una extra
-    } else if (needsDisc) {
-      out.push('#EXT-X-DISCONTINUITY');
-    }
-    needsDisc = false; // Reset fatto, non servire più per i successivi
-    
+    if(s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
     if(s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url,baseUrl),P,ref,origin));
@@ -679,11 +711,11 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v9.6 ===');
+  L.push('=== LOGICA v9.7 ===');
   L.push('1. Ordine forzato NTV→Daddy→Vavoo per F1/Tennis');
   L.push('2. Fallback automatico: 720p → 480p → 1080p');
-  L.push('3. Priorità assoluta a H.264 (720p prima di tutto)');
-  L.push('4. 🔥 Iniezione #EXT-X-DISCONTINUITY per reset decoder (anti schermo grigio)');
+  L.push('3. Tolleranza: CODECS vuoto = H.264, RISOLUZIONE mancante = priorità 999');
+  L.push('4. Log esplicito: distingue MASTER da MEDIA playlist');
   return L.join('\n');
 }
 
@@ -813,4 +845,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.6 ███
+// ███ FINE TVNOW-CF v9.7 ███
