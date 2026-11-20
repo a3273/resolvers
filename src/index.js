@@ -1,16 +1,18 @@
 // ============================================================================
-// TVNOW-CF v1.4 IN-PLACE — Riscrittura sicura + Fix NTV definitive
+// TVNOW-CF v1.5 IN-PLACE+ — Riscrittura in-place + DISCONTINUITY iniziale
 // ============================================================================
-// 1. FIX SCHERMO GRIGIO: Riscrittura IN-PLACE (riga per riga). Preserva
-//    #EXT-X-MAP e #EXT-X-KEY (fondamentali per F1, Tennis e flussi fMP4).
-// 2. FIX NTV: NO cache-busting (_t=) per URL tvnow247/cfbu247 (rompe il token).
-// 3. FIX NTV: Header Referer/Origin corretti e NO cache Cloudflare sui segmenti.
-// 4. DELAY MINIMO: Taglio dei segmenti vecchi aggiornando #EXT-X-MEDIA-SEQUENCE.
+// UNIONE V1.4 + V1.6:
+// 1. Riscrittura IN-PLACE (preserva #EXT-X-MAP e #EXT-X-KEY)
+// 2. #EXT-X-DISCONTINUITY iniziale (reset decoder -> fix schermo grigio/blocchi)
+// 3. Finestra 10 segmenti (garantisce keyframe)
+// 4. NO cache-busting per NTV (preserva token di firma)
+// 5. Header NTV corretti + NO cache Cloudflare su segmenti firmati
+// 6. invalidateCache su 403/404 (rinnova token al prossimo fetch)
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.4 IN-PLACE',
-  FEATURES: ['In-Place HLS Rewrite (preserva MAP/KEY)', 'Fix NTV (no bust, header corretti)', 'Vavoo Dual-ID', 'Daddy Embed']
+  VERSION: 'TVNOW-CF v1.5 IN-PLACE+',
+  FEATURES: ['In-Place Rewrite (MAP/KEY)', 'DISCONTINUITY iniziale', 'Finestra 10 segs', 'Fix NTV token', 'Cache eviction 403']
 };
 
 const CHANNELS = [
@@ -72,9 +74,7 @@ function elencoCanali(u){
   return L.join('\n');
 }
 
-function invalidateCache(slug) {
-  tokenCache.clear(); daddyCache.clear(); vavooURLCache.clear();
-}
+function invalidateCache(slug) { tokenCache.clear(); daddyCache.clear(); vavooURLCache.clear(); }
 
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
@@ -97,10 +97,8 @@ async function ntvPlaylist(id){
   let r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000);
   let txt=r.ok?await r.text():'';
   if(!r.ok||r.status>=500||!txt.includes('#EXTM3U')){ 
-    tokenCache.delete(id); 
-    tk=await ntvToken(id); 
-    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); 
-    txt=r.ok?await r.text():''; 
+    tokenCache.delete(id); tk=await ntvToken(id); 
+    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); txt=r.ok?await r.text():''; 
   }
   if(!txt.includes('#EXTM3U')) throw new Error('ntv playlist '+r.status+' non-HLS');
   return {txt,ref:tk.ref,base:tk.m3u8};
@@ -130,6 +128,8 @@ async function extractM3u8(url,refererDomain,timeoutMs){
   const html=await r.text();
   let m3u8=html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
   if(m3u8) return m3u8[1];
+  const jsVar=html.match(/(?:file|source|url|m3u8)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i);
+  if(jsVar) return jsVar[1];
   const iframe=html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
   if(iframe){
     const r2=await fetchT(iframe[1],{headers:browserHeaders(url),cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
@@ -192,22 +192,10 @@ async function vavooResolveDual(slug,vid6,vid7){
   const cacheKey=slug||('q:'+norm(slug));
   const cachedUrl=vavooURLCache.get(cacheKey);
   if(cachedUrl&&cachedUrl.exp>now) return cachedUrl.url;
-  
   let firstId=vid6, secondId=vid7;
   if(!firstId&&!secondId){ const m=await ensureVavooMap(); firstId=vavooMapFind(slug,m); }
-  
-  if(firstId){
-    for(const base of VAVOO_MIRRORS.slice(0,6)){
-      const u=await vavooResolveId(base,firstId);
-      if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; }
-    }
-  }
-  if(secondId){
-    for(const base of VAVOO_MIRRORS.slice(0,6)){
-      const u=await vavooResolveId(base,secondId);
-      if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; }
-    }
-  }
+  if(firstId){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,firstId); if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; } } }
+  if(secondId){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,secondId); if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+120000}); return u; } } }
   return null;
 }
 
@@ -268,31 +256,31 @@ async function live(u, P, legacy) {
         if (res instanceof Response) return res;
         return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
       }
-    } catch (e) { /* continua al prossimo provider */ }
+    } catch (e) { /* continua */ }
   }
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// 🔥 REWRITE IN-PLACE: Preserva MAP, KEY e ordine originale
+// ============================================================================
+// REWRITE IN-PLACE + DISCONTINUITY INIZIALE (il cuore della fix)
+// ============================================================================
 function rewriteHls(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
-  
   const lines = txt.split(/\r?\n/);
   const out = [];
-  
+
   let segIndices = [];
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() && !lines[i].trim().startsWith('#')) {
-      segIndices.push(i);
-    }
+    if (lines[i].trim() && !lines[i].trim().startsWith('#')) segIndices.push(i);
   }
-  
-  const maxSegs = 6; // Aumentato a 6 per garantire keyframe
+
+  const maxSegs = 10; // finestra ampia -> garantisce keyframe
   const startIdx = Math.max(0, segIndices.length - maxSegs);
-  const dropCount = segIndices.length - (segIndices.length - startIdx);
-  
+  const dropCount = startIdx; // quanti ne tagliamo
+
   let currentSeg = 0;
+  let discontinuityInjected = false;
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
@@ -305,12 +293,8 @@ function rewriteHls(txt, baseUrl, P, ref, origin) {
         out.push('#EXT-X-MEDIA-SEQUENCE:' + (seq + dropCount));
         continue;
       }
-      
-      // Riscrivi URI="..." (per MAP, KEY, ecc.)
       if (line.includes('URI="')) {
-        line = line.replace(/URI="([^"]+)"/g, (match, uri) => {
-          return 'URI="' + makeProxUrl(absUrl(uri, baseUrl), P, ref, origin) + '"';
-        });
+        line = line.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="' + makeProxUrl(absUrl(uri, baseUrl), P, ref, origin) + '"');
       }
       out.push(line);
       continue;
@@ -318,10 +302,14 @@ function rewriteHls(txt, baseUrl, P, ref, origin) {
 
     currentSeg++;
     if (currentSeg > startIdx) {
+      // 🔥 Inietta DISCONTINUITY una sola volta, prima del primo segmento mantenuto
+      if (!discontinuityInjected) {
+        out.push('#EXT-X-DISCONTINUITY');
+        discontinuityInjected = true;
+      }
       out.push(makeProxUrl(absUrl(t, baseUrl), P, ref, origin));
     }
   }
-  
   return out.join('\n');
 }
 
@@ -333,13 +321,10 @@ function absUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
-// 🔥 FIX NTV: NO cache-busting per URL firmati
+// NO cache-busting per NTV (preserva token di firma)
 function makeProxUrl(abs, P, ref, origin) {
   const isNtv = abs.includes('tvnow247') || abs.includes('cfbu247');
-  
-  // Per NTV: NON aggiungere _t= (rompe il token di firma)
   let urlToEncode = isNtv ? abs : abs + (abs.includes('?') ? '&' : '?') + '_t=' + Math.floor(Date.now() / 2000) * 2000;
-  
   let u = P + '/seg?u=' + encodeURIComponent(urlToEncode);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
   if (origin) u += '&o=' + encodeURIComponent(origin);
@@ -350,30 +335,20 @@ async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://tvnow247.today/';
   const o = u.searchParams.get('o');
-  
-  // 🔥 FIX NTV: Header corretti e NO cache per segmenti firmati
   const isNtv = target.includes('tvnow247') || target.includes('cfbu247');
   const headers = isNtv ? {
-    'User-Agent': UA,
-    'Referer': 'https://tvnow247.today/',
-    'Origin': 'https://tvnow247.today',
-    'Accept': '*/*'
+    'User-Agent': UA, 'Referer': 'https://tvnow247.today/', 'Origin': 'https://tvnow247.today', 'Accept': '*/*'
   } : browserHeaders(ref);
 
   if (ref.includes('thedaddy')) { headers['Referer'] = 'https://thedaddy.li/'; headers['Origin'] = 'https://thedaddy.li'; }
   if (u.req && u.req.headers.has('Range')) { headers['Range'] = u.req.headers.get('Range'); }
 
   try {
-    const r = await fetchT(target, { 
-      headers, 
-      cf: { cacheTtl: isNtv ? 0 : 2, cacheEverything: !isNtv } 
-    }, 15000);
-    
+    const r = await fetchT(target, { headers, cf: { cacheTtl: isNtv ? 0 : 2, cacheEverything: !isNtv } }, 15000);
     if (r.status === 403 || r.status === 404 || r.status === 401) {
       invalidateCache();
       return new Response('Token scaduto, rinnovo in corso...', { status: 503, headers: CORS() });
     }
-
     const hh = {
       'content-type': r.headers.get('content-type') || 'video/mp2t',
       'access-control-allow-origin': '*', 'accept-ranges': 'bytes',
@@ -381,7 +356,6 @@ async function seg(u) {
     };
     const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
     const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
-    
     return new Response(r.body, { status: r.status, headers: hh });
   } catch (e) {
     return new Response('Segment error', { status: 502, headers: CORS() });
@@ -425,4 +399,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.4 IN-PLACE ███
+// ███ FINE TVNOW-CF v1.5 IN-PLACE+ ███
