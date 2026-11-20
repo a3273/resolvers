@@ -1,17 +1,16 @@
 // ============================================================================
-// TVNOW-CF v1.0 — BASE PULITA PER TEST
+// TVNOW-CF v1.1 — FIX SCHERMO GRIGIO + DELAY + ANTI-BLOCK
 // ============================================================================
-// Solo l'essenziale:
-// 1. Resolver NTV (API cfbu247)
-// 2. Resolver Vavoo (resolve API + Dual-ID 6/7)
-// 3. Resolver Daddy (embed scraping)
-// 4. Proxy segmenti con cache 60s
-// 5. NO EXT-X-START
+// 1. FIX SCHERMO GRIGIO/VERDE: Aggiunto il supporto per #EXT-X-KEY (decifratura AES)
+//    e #EXT-X-VERSION. Prima venivano ignorati, impedendo la riproduzione.
+// 2. FIX DELAY MINIMO: Finestra ridotta a 3 segmenti + tag #EXT-X-START.
+// 3. FIX ANTI-BLOCK: Pass-through dell'header Range, rinnovo reattivo su 401/403,
+//    e cache segmenti ridotta per evitare i blocchi dopo 30 minuti.
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.0',
-  FEATURES: ['NTV Resolver', 'Vavoo Dual-ID', 'Daddy Embed', 'Segment Proxy 60s']
+  VERSION: 'TVNOW-CF v1.1',
+  FEATURES: ['NTV Resolver', 'Vavoo Dual-ID', 'Daddy Embed', 'Segment Proxy 2s', 'Anti-Block & Renewal']
 };
 
 // Database canali (SOLO quelli richiesti)
@@ -93,12 +92,18 @@ async function ntvToken(id){
   tokenCache.set(id,entry); return entry;
 }
 
-async function ntvPlaylist(id){
+async function ntvPlaylist(id, forceRenew = false){
+  if (forceRenew) tokenCache.delete(id);
   let tk=await ntvToken(id);
   let r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000);
   let txt=r.ok?await r.text():'';
   const bad=!r.ok||r.status>=500||!txt.includes('#EXTM3U');
-  if(bad){ tokenCache.delete(id); tk=await ntvToken(id); r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); txt=r.ok?await r.text():''; }
+  if(bad){ 
+    tokenCache.delete(id); 
+    tk=await ntvToken(id); 
+    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); 
+    txt=r.ok?await r.text():''; 
+  }
   if(!txt.includes('#EXTM3U')) throw new Error('ntv playlist '+r.status+' non-HLS');
   return {txt,ref:tk.ref,base:tk.m3u8};
 }
@@ -109,8 +114,9 @@ async function ntvPlaylist(id){
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
 const daddyCache=new Map();
 
-async function daddyResolve(id){
+async function daddyResolve(id, forceRenew = false){
   if(!id) return null;
+  if (forceRenew) daddyCache.delete(id);
   const now=Date.now(); const cached=daddyCache.get(id);
   if(cached&&cached.exp>now) return cached.url;
   for(const domain of DADDY_DOMAINS){
@@ -190,9 +196,11 @@ async function vavooResolveId(base,id){
 
 const vavooURLCache=new Map();
 
-async function vavooResolveDual(slug,vid6,vid7){
+async function vavooResolveDual(slug,vid6,vid7, forceRenew = false){
   const now=Date.now();
   const cacheKey=slug||('q:'+norm(slug));
+  if (forceRenew) vavooURLCache.delete(cacheKey);
+  
   const cachedUrl=vavooURLCache.get(cacheKey);
   if(cachedUrl&&cachedUrl.exp>now) return cachedUrl.url;
   
@@ -241,28 +249,28 @@ async function live(u, P, legacy) {
   });
 
   const provs = {
-    vavoo: async () => {
+    vavoo: async (force = false) => {
       if (!c.vavoo && !c.vid6 && !c.vid7) return null;
-      const vu = await vavooResolveDual(c.slug, c.vid6, c.vid7);
+      const vu = await vavooResolveDual(c.slug, c.vid6, c.vid7, force);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
         const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
-        if (!r.ok) { vavooURLCache.delete(c.slug); return null; }
+        if (!r.ok) { if(!force) return provs.vavoo(true); return null; }
         return rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    ntv: async () => {
+    ntv: async (force = false) => {
       if (!c.ntv) return null;
-      const pl = await ntvPlaylist(c.ntv);
+      const pl = await ntvPlaylist(c.ntv, force);
       return rewriteAny(pl.txt, pl.base, P, pl.ref, '');
     },
-    daddy: async () => {
+    daddy: async (force = false) => {
       if (!c.daddy) return null;
-      const du = await daddyResolve(c.daddy);
+      const du = await daddyResolve(c.daddy, force);
       if (!du || !/\.m3u8/i.test(du)) return null;
       const r = await fetchT(du, { headers: browserHeaders('https://thedaddy.li/') }, 8000);
-      if (!r.ok) { daddyCache.delete(c.daddy); return null; }
+      if (!r.ok) { if(!force) return provs.daddy(true); return null; }
       const processed = rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '');
       return ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA].concat(processed.split('\n')).join('\n');
     }
@@ -272,15 +280,18 @@ async function live(u, P, legacy) {
     const fn = provs[p];
     if (!fn) continue;
     try {
-      const res = await fn();
-      if (res) return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
+      const res = await fn(false);
+      if (res) {
+        if (res instanceof Response) return res;
+        return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
+      }
     } catch (e) { /* continua al prossimo provider */ }
   }
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
 // ============================================================================
-// REWRITE HLS
+// REWRITE HLS (FIX SCHERMO GRIGIO + DELAY MINIMO)
 // ============================================================================
 function rewriteAny(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
@@ -289,7 +300,8 @@ function rewriteAny(txt, baseUrl, P, ref, origin) {
 }
 
 function parseMediaPl(txt) {
-  let upSeq = 0, upTarget = 4, map = null, isMaster = false;
+  let upSeq = 0, upTarget = 4, map = null, isMaster = false, version = 3;
+  const keys = [];
   const segs = [];
   let pending = null, disc = false, brange = null;
   for (const raw of String(txt).split(/\r?\n/)) {
@@ -297,9 +309,11 @@ function parseMediaPl(txt) {
     if (!line) continue;
     if (line.startsWith('#EXT-X-STREAM-INF')) { isMaster = true; break; }
     if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXT-X-VERSION:')) { version = parseInt(line.split(':')[1]) || 3; continue; }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
+    if (line.startsWith('#EXT-X-KEY')) { keys.push(line); continue; }
     if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
     if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
     if (line.startsWith('#EXTINF')) {
@@ -310,7 +324,7 @@ function parseMediaPl(txt) {
     if (line.startsWith('#')) continue;
     if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
-  return { upSeq, upTarget, map, segs, isMaster };
+  return { upSeq, upTarget, map, keys, segs, isMaster, version };
 }
 
 function absSegUrl(url, baseUrl) {
@@ -322,7 +336,7 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 60000) * 60000;
+  const bust = Math.floor(Date.now() / 2000) * 2000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -348,26 +362,39 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
-  // Prendi ultimi 6 segmenti (finestra semplice)
-  const kept = p.segs.slice(-6);
+  // Mantieni ultimi 3 segmenti (Delay Minimo)
+  const kept = p.segs.slice(-3);
   const dropped = p.segs.length - kept.length;
 
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:3',
+    '#EXT-X-VERSION:' + (p.version || 3),
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
   ];
+
+  // FIX: Riscrive il tag EXT-X-MAP (Inizializzazione fMP4)
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
   }
+
+  // FIX: Riscrive i tag EXT-X-KEY (Chiavi di decifratura AES)
+  for (const k of p.keys) {
+    out.push(k.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="' + proxUrl(absSegUrl(uri, baseUrl), P, ref, origin) + '"'));
+  }
+
+  // FIX: Tag per forzare il player vicino al live
+  const dur = kept.reduce((a, b) => a + b.dur, 0) || p.upTarget;
+  out.push('#EXT-X-START:TIME-OFFSET=-' + Math.ceil(dur) + ',PRECISE=YES');
+
   kept.forEach((s, idx) => {
     if (s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
     if (s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url, baseUrl), P, ref, origin));
   });
+
   return out.join('\n');
 }
 
@@ -392,14 +419,24 @@ async function seg(u) {
     return R(out, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache', ...CORS() });
   }
 
-  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 60, cacheEverything: true } }, 15000);
+  // FIX: Inoltra l'header Range alla richiesta upstream (evita blocchi a 30 min)
+  if (u.req && u.req.headers.has('Range')) {
+     h['Range'] = u.req.headers.get('Range');
+  }
+
+  // FIX: Cache breve (2s) per evitare loop infiniti e segmenti vecchi
+  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 2, cacheEverything: true } }, 15000);
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
-    'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-origin': '*', 
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'public, max-age=60'
+    'cache-control': 'public, max-age=2',
+    'accept-ranges': 'bytes'
   };
   const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
+  const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
+  
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -504,6 +541,7 @@ async function fetchT(url, opt, ms) {
 export default {
   async fetch(req) {
     const u = new URL(req.url);
+    u.req = req; // Passa la request al contesto per leggere l'header Range
     const P = u.origin;
     const path = u.pathname;
     if (req.method === 'HEAD' || req.method === 'OPTIONS')
@@ -525,4 +563,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.0 ███
+// ███ FINE TVNOW-CF v1.1 ███
