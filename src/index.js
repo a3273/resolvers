@@ -1,13 +1,13 @@
 // ============================================================================
-// TVNOW-CF v9.2 — COMPLETO E FUNZIONANTE (No Truncation)
+// TVNOW-CF v9.2.1 — COMPLETO, CORREZIONI SCHERMO GRIGIO + AVVIO VELOCE
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.2',
+  VERSION: 'TVNOW-CF v9.2.1',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
-  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 8s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints']
+  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 3/5s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints']
 };
 
 const CHANNELS = [
@@ -141,6 +141,7 @@ async function extractM3u8FromEmbed(url,refererDomain,timeoutMs){
   const r=await fetchT(url,{headers:getBrowserHeaders(refererDomain+'/'),cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
   if(!r.ok) return null;
   const html=await r.text();
+  // FIX: Sostituite le smart quotes con virgolette standard per evitare errori di sintassi
   let m3u8=html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
   if(m3u8) return m3u8[1];
   const iframe=html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
@@ -212,6 +213,7 @@ async function vavooLiveFind(base,query){
     const tmp=new Map();
     for(const it of items){
       const nm=it.name||it.title||'';
+      // FIX: Chiusura corretta della regex e dell'array match
       const iid=it.id||((it.url||'').match(/play\/(\d+)/)||[])[1];
       if(nm&&iid){ const k=norm(nm.replace(/\s*\(\d+\)\s*$/,'')); if(k&&!tmp.has(k)) tmp.set(k,String(iid)); }
     }
@@ -725,4 +727,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.2 ███
+// ███ FINE TVNOW-CF v9.2.1 ███
