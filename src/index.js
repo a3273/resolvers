@@ -1,19 +1,17 @@
 // ============================================================================
-// TVNOW-CF v1.1 — FIX SCHERMO GRIGIO + DELAY + ANTI-BLOCK
+// TVNOW-CF v1.2 — SBLOCCO URL RAW VAVOO (Sunshine/IP)
 // ============================================================================
-// 1. FIX SCHERMO GRIGIO/VERDE: Aggiunto il supporto per #EXT-X-KEY (decifratura AES)
-//    e #EXT-X-VERSION. Prima venivano ignorati, impedendo la riproduzione.
-// 2. FIX DELAY MINIMO: Finestra ridotta a 3 segmenti + tag #EXT-X-START.
-// 3. FIX ANTI-BLOCK: Pass-through dell'header Range, rinnovo reattivo su 401/403,
-//    e cache segmenti ridotta per evitare i blocchi dopo 30 minuti.
+// Novità:
+// 1. Rileva URL raw (IP o 'sunshine') e applica header browser reali (geil.to)
+// 2. Se HTTP dà 403, prova automaticamente la versione HTTPS dell'URL
+// 3. Mantiene la logica semplice e funzionale per tutti gli altri canali
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v1.1',
-  FEATURES: ['NTV Resolver', 'Vavoo Dual-ID', 'Daddy Embed', 'Segment Proxy 2s', 'Anti-Block & Renewal']
+  VERSION: 'TVNOW-CF v1.2',
+  FEATURES: ['Sblocco URL raw Vavoo (Header mirati)', 'Fallback HTTP->HTTPS', 'Cache 60s', 'No EXT-X-START']
 };
 
-// Database canali (SOLO quelli richiesti)
 const CHANNELS = [
   { slug:'sky-sport-24', name:'Sky Sport 24', ntv:'869', vavoo:'sky sport 24', daddy:'869', vid6:'2775802255', vid7:'3445562519' },
   { slug:'sky-sport-uno', name:'Sky Sport Uno', ntv:'461', vavoo:'sky sport uno', daddy:'461', vid6:'210669162', vid7:'3192996672' },
@@ -46,7 +44,7 @@ const CHANNELS = [
   { slug:'sky-crime', name:'Sky Crime', ntv:'863', vavoo:'sky crime', daddy:'863', vid6:'', vid7:'' }
 ];
 
-const ALIASES = { 'dazn':'dazn-1','dazn-zona':'dazn-1','serie-a':'sky-sport-serie-a', 'sky-calcio-1':'sky-calcio-251','sky-calcio-2':'sky-calcio-252','sky-calcio-3':'sky-calcio-253' };
+const ALIASES = { 'dazn':'dazn-1','serie-a':'sky-sport-serie-a', 'sky-calcio-1':'sky-calcio-251','sky-calcio-2':'sky-calcio-252','sky-calcio-3':'sky-calcio-253' };
 
 const BY_KEY = (() => {
   const m = new Map();
@@ -68,13 +66,13 @@ function elencoCanali(u){
   L.push('Uso: /live?ch=<slug>');
   for(const c of CHANNELS){
     if(search && !c.slug.includes(search) && !c.name.toLowerCase().includes(search)) continue;
-    L.push('  '+c.slug.padEnd(24)+' ntv='+String(c.ntv).padEnd(4)+' v6='+(c.vid6||'-').padEnd(12)+' v7='+(c.vid7||'-').padEnd(12)+' daddy='+(c.daddy||'-'));
+    L.push('  '+c.slug.padEnd(24)+' ntv='+String(c.ntv).padEnd(4)+' v6='+(c.vid6||'-').padEnd(12)+' daddy='+(c.daddy||'-'));
   }
   return L.join('\n');
 }
 
 // ============================================================================
-// NTV RESOLVER
+// NTV
 // ============================================================================
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 const tokenCache = new Map();
@@ -92,31 +90,24 @@ async function ntvToken(id){
   tokenCache.set(id,entry); return entry;
 }
 
-async function ntvPlaylist(id, forceRenew = false){
-  if (forceRenew) tokenCache.delete(id);
+async function ntvPlaylist(id){
   let tk=await ntvToken(id);
   let r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000);
   let txt=r.ok?await r.text():'';
   const bad=!r.ok||r.status>=500||!txt.includes('#EXTM3U');
-  if(bad){ 
-    tokenCache.delete(id); 
-    tk=await ntvToken(id); 
-    r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); 
-    txt=r.ok?await r.text():''; 
-  }
+  if(bad){ tokenCache.delete(id); tk=await ntvToken(id); r=await fetchT(tk.m3u8,{headers:browserHeaders(tk.ref)},8000); txt=r.ok?await r.text():''; }
   if(!txt.includes('#EXTM3U')) throw new Error('ntv playlist '+r.status+' non-HLS');
   return {txt,ref:tk.ref,base:tk.m3u8};
 }
 
 // ============================================================================
-// DADDY RESOLVER
+// DADDY
 // ============================================================================
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
 const daddyCache=new Map();
 
-async function daddyResolve(id, forceRenew = false){
+async function daddyResolve(id){
   if(!id) return null;
-  if (forceRenew) daddyCache.delete(id);
   const now=Date.now(); const cached=daddyCache.get(id);
   if(cached&&cached.exp>now) return cached.url;
   for(const domain of DADDY_DOMAINS){
@@ -149,7 +140,7 @@ async function extractM3u8(url,refererDomain,timeoutMs){
 }
 
 // ============================================================================
-// VAVOO RESOLVER
+// VAVOO
 // ============================================================================
 const VAVOO_MIRRORS=['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net'];
 const VAVOO_SOURCES=['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
@@ -196,11 +187,9 @@ async function vavooResolveId(base,id){
 
 const vavooURLCache=new Map();
 
-async function vavooResolveDual(slug,vid6,vid7, forceRenew = false){
+async function vavooResolveDual(slug,vid6,vid7){
   const now=Date.now();
   const cacheKey=slug||('q:'+norm(slug));
-  if (forceRenew) vavooURLCache.delete(cacheKey);
-  
   const cachedUrl=vavooURLCache.get(cacheKey);
   if(cachedUrl&&cachedUrl.exp>now) return cachedUrl.url;
   
@@ -223,12 +212,36 @@ async function vavooResolveDual(slug,vid6,vid7, forceRenew = false){
 }
 
 // ============================================================================
-// HEADERS
+// HEADERS & FETCH
 // ============================================================================
 const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 function browserHeaders(referer){
   return { 'User-Agent':UA,'Accept':'*/*','Accept-Language':'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7', 'Referer':referer,'Origin':referer.replace(/\/$/,''), 'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'cross-site','Upgrade-Insecure-Requests':'1' };
+}
+
+// 🔥 FUNZIONE DI FETCH SPECIALE PER SBLOCCARE URL RAW (SUNSHINE/IP)
+async function fetchStream(url, ref) {
+  // Se è un URL raw (IP nudo o contiene 'sunshine'), usiamo header browser reali per evitare il 403
+  const isRaw = /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(url) || url.includes('sunshine');
+  
+  const headers = isRaw ? {
+    'User-Agent': UA,
+    'Referer': ref || 'https://geil.to/',
+    'Origin': ref ? ref.replace(/\/$/,'') : 'https://geil.to',
+    'Accept': '*/*'
+  } : browserHeaders(ref || 'https://vavoo.to/');
+
+  // Primo tentativo
+  let r = await fetchT(url, { headers }, 8000);
+  
+  // 🔥 SECONDO TENTATIVO: Se dà 403 e è HTTP, proviamo la versione HTTPS
+  if (r.status === 403 && url.startsWith('http://')) {
+    const httpsUrl = url.replace('http://', 'https://');
+    r = await fetchT(httpsUrl, { headers }, 8000);
+  }
+  
+  return r;
 }
 
 // ============================================================================
@@ -249,28 +262,28 @@ async function live(u, P, legacy) {
   });
 
   const provs = {
-    vavoo: async (force = false) => {
+    vavoo: async () => {
       if (!c.vavoo && !c.vid6 && !c.vid7) return null;
-      const vu = await vavooResolveDual(c.slug, c.vid6, c.vid7, force);
+      const vu = await vavooResolveDual(c.slug, c.vid6, c.vid7);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
-        if (!r.ok) { if(!force) return provs.vavoo(true); return null; }
-        return rewriteAny(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to');
+        const r = await fetchStream(vu, 'https://geil.to/');
+        if (!r.ok) { vavooURLCache.delete(c.slug); return null; }
+        return rewriteAny(await r.text(), vu, P, 'https://geil.to/', 'https://geil.to');
       }
       return R('redirect vavoo', 302, { Location: vu, ...CORS() });
     },
-    ntv: async (force = false) => {
+    ntv: async () => {
       if (!c.ntv) return null;
-      const pl = await ntvPlaylist(c.ntv, force);
+      const pl = await ntvPlaylist(c.ntv);
       return rewriteAny(pl.txt, pl.base, P, pl.ref, '');
     },
-    daddy: async (force = false) => {
+    daddy: async () => {
       if (!c.daddy) return null;
-      const du = await daddyResolve(c.daddy, force);
+      const du = await daddyResolve(c.daddy);
       if (!du || !/\.m3u8/i.test(du)) return null;
-      const r = await fetchT(du, { headers: browserHeaders('https://thedaddy.li/') }, 8000);
-      if (!r.ok) { if(!force) return provs.daddy(true); return null; }
+      const r = await fetchStream(du, 'https://thedaddy.li/');
+      if (!r.ok) { daddyCache.delete(c.daddy); return null; }
       const processed = rewriteAny(await r.text(), du, P, 'https://thedaddy.li/', '');
       return ['#EXTVLCOPT:http-referrer=https://thedaddy.li/', '#EXTVLCOPT:http-user-agent=' + UA].concat(processed.split('\n')).join('\n');
     }
@@ -280,18 +293,15 @@ async function live(u, P, legacy) {
     const fn = provs[p];
     if (!fn) continue;
     try {
-      const res = await fn(false);
-      if (res) {
-        if (res instanceof Response) return res;
-        return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
-      }
+      const res = await fn();
+      if (res) return R(res, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', ...CORS() });
     } catch (e) { /* continua al prossimo provider */ }
   }
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
 // ============================================================================
-// REWRITE HLS (FIX SCHERMO GRIGIO + DELAY MINIMO)
+// REWRITE HLS
 // ============================================================================
 function rewriteAny(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
@@ -300,8 +310,7 @@ function rewriteAny(txt, baseUrl, P, ref, origin) {
 }
 
 function parseMediaPl(txt) {
-  let upSeq = 0, upTarget = 4, map = null, isMaster = false, version = 3;
-  const keys = [];
+  let upSeq = 0, upTarget = 4, map = null, isMaster = false;
   const segs = [];
   let pending = null, disc = false, brange = null;
   for (const raw of String(txt).split(/\r?\n/)) {
@@ -309,11 +318,9 @@ function parseMediaPl(txt) {
     if (!line) continue;
     if (line.startsWith('#EXT-X-STREAM-INF')) { isMaster = true; break; }
     if (line.startsWith('#EXTM3U')) continue;
-    if (line.startsWith('#EXT-X-VERSION:')) { version = parseInt(line.split(':')[1]) || 3; continue; }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
-    if (line.startsWith('#EXT-X-KEY')) { keys.push(line); continue; }
     if (line.startsWith('#EXT-X-DISCONTINUITY')) { disc = true; continue; }
     if (line.startsWith('#EXT-X-BYTERANGE')) { brange = line; continue; }
     if (line.startsWith('#EXTINF')) {
@@ -324,7 +331,7 @@ function parseMediaPl(txt) {
     if (line.startsWith('#')) continue;
     if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
-  return { upSeq, upTarget, map, keys, segs, isMaster, version };
+  return { upSeq, upTarget, map, segs, isMaster };
 }
 
 function absSegUrl(url, baseUrl) {
@@ -336,7 +343,7 @@ function absSegUrl(url, baseUrl) {
 }
 
 function proxUrl(abs, P, ref, origin) {
-  const bust = Math.floor(Date.now() / 2000) * 2000;
+  const bust = Math.floor(Date.now() / 60000) * 60000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -362,39 +369,25 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
-  // Mantieni ultimi 3 segmenti (Delay Minimo)
-  const kept = p.segs.slice(-3);
+  const kept = p.segs.slice(-6);
   const dropped = p.segs.length - kept.length;
 
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:' + (p.version || 3),
+    '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
   ];
-
-  // FIX: Riscrive il tag EXT-X-MAP (Inizializzazione fMP4)
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
   }
-
-  // FIX: Riscrive i tag EXT-X-KEY (Chiavi di decifratura AES)
-  for (const k of p.keys) {
-    out.push(k.replace(/URI="([^"]+)"/g, (m, uri) => 'URI="' + proxUrl(absSegUrl(uri, baseUrl), P, ref, origin) + '"'));
-  }
-
-  // FIX: Tag per forzare il player vicino al live
-  const dur = kept.reduce((a, b) => a + b.dur, 0) || p.upTarget;
-  out.push('#EXT-X-START:TIME-OFFSET=-' + Math.ceil(dur) + ',PRECISE=YES');
-
   kept.forEach((s, idx) => {
     if (s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
     if (s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url, baseUrl), P, ref, origin));
   });
-
   return out.join('\n');
 }
 
@@ -404,39 +397,25 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
 async function seg(u) {
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
-  const h = browserHeaders(ref);
-  const o = u.searchParams.get('o'); if (o) h['Origin'] = o;
-  const range = u.searchParams.get('range'); if (range) h['Range'] = range;
-
-  if (ref.includes('thedaddy')) { h['Referer'] = 'https://thedaddy.li/'; h['Origin'] = 'https://thedaddy.li'; }
+  const o = u.searchParams.get('o');
+  
+  const r = await fetchStream(target, ref);
+  if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
 
   if (/\.m3u8(\?|$)/i.test(target)) {
-    const r = await fetchT(target, { headers: h, cf: { cacheTtl: 0 } }, 10000);
-    if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
     const txt = await r.text();
     const baseDir = target.substring(0, target.lastIndexOf('/') + 1) || target;
     const out = rewriteAny(txt, baseDir, u.origin, ref, o || '');
     return R(out, 200, { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache', ...CORS() });
   }
 
-  // FIX: Inoltra l'header Range alla richiesta upstream (evita blocchi a 30 min)
-  if (u.req && u.req.headers.has('Range')) {
-     h['Range'] = u.req.headers.get('Range');
-  }
-
-  // FIX: Cache breve (2s) per evitare loop infiniti e segmenti vecchi
-  const r = await fetchT(target, { headers: h, cf: { cacheTtl: 2, cacheEverything: true } }, 15000);
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
-    'access-control-allow-origin': '*', 
-    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+    'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': 'public, max-age=2',
-    'accept-ranges': 'bytes'
+    'cache-control': 'public, max-age=60'
   };
   const cl = r.headers.get('content-length'); if (cl) hh['content-length'] = cl;
-  const cr = r.headers.get('content-range'); if (cr) hh['content-range'] = cr;
-  
   return new Response(r.body, { status: r.status, headers: hh });
 }
 
@@ -464,7 +443,7 @@ async function diag(u) {
   if (c.vavoo || c.vid6 || c.vid7) await tryP('VAVOO', async () => {
     const vu = await vavooResolveDual(c.slug, c.vid6, c.vid7);
     if (!vu) throw new Error('non risolto');
-    const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
+    const r = await fetchStream(vu, 'https://geil.to/');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -472,7 +451,7 @@ async function diag(u) {
   if (c.daddy) await tryP('DADDY', async () => {
     const du = await daddyResolve(c.daddy);
     if (!du) throw new Error('non risolto');
-    const r = await fetchT(du, { headers: browserHeaders('https://thedaddy.li/') }, 8000);
+    const r = await fetchStream(du, 'https://thedaddy.li/');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -516,9 +495,6 @@ function debug() {
 // ============================================================================
 // UTILS
 // ============================================================================
-const logs = [];
-function log(m) { logs.push(new Date().toISOString().slice(11, 19) + ' ' + m); if (logs.length > 40) logs.shift(); }
-
 function uso(P) { return [CONFIG.VERSION, '', 'uso:', '  /live?ch=<slug>            Stream', '  /diag?ch=canale              Diagnostica', '  /probe?ch=canale             Test rapido', '  /ch?q=ricerca                Lista canali', '  /debug                       Info sistema', ''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function CORS() { return { 'access-control-allow-origin': '*' }; }
@@ -541,7 +517,6 @@ async function fetchT(url, opt, ms) {
 export default {
   async fetch(req) {
     const u = new URL(req.url);
-    u.req = req; // Passa la request al contesto per leggere l'header Range
     const P = u.origin;
     const path = u.pathname;
     if (req.method === 'HEAD' || req.method === 'OPTIONS')
@@ -563,4 +538,4 @@ export default {
     }
   }
 };
-// ███ FINE TVNOW-CF v1.1 ███
+// ███ FINE TVNOW-CF v1.2 ███
