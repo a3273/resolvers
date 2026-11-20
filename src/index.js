@@ -1,25 +1,25 @@
 // ============================================================================
-// TVNOW-CF v9.5 — STRATEGIA 4 STADI ANTI-SCHERMO GRIGIO
+// TVNOW-CF v9.6 — DECODER RESET + STRATEGIA 4 STADI
 // ============================================================================
-// 1. Priorità assoluta a H.264 720p → 480p → qualsiasi H.264
-// 2. Fallback automatico risoluzioni: 720p → 480p → 1080p
-// 3. Ordine provider forzato (NTV→Daddy→Vavoo) per F1 e Tennis
-// 4. Log di conferma della variante inviata al player
+// 1. Fallback automatico risoluzioni: 720p → 480p → 1080p
+// 2. Ordine provider forzato (NTV→Daddy→Vavoo) per F1/Tennis
+// 3. Caccia aggressiva a H.264 720p nelle Master Playlist
+// 4. 🔥 INIEZIONE #EXT-X-DISCONTINUITY: forza il reset del decoder all'avvio 
+//    per prevenire schermo grigio su Media Playlist dirette (NTV F1/Tennis)
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.5',
+  VERSION: 'TVNOW-CF v9.6',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
-    'Priorità H.264 720p/480p',
     'Fallback automatico 720→480→1080',
     'Ordine provider forzato (F1/Tennis)',
-    'Log variante inviata al player',
+    'Priorità assoluta a H.264 720p',
+    '🔥 Decoder Reset (Discontinuity injection)',
     'Dual-ID Vavoo (6)/(7)',
     'Health Check Auto-Switch',
-    'Keyframe Window 8s',
     'Cache Bust 5s',
     'Segment Proxy',
     'Debug Endpoints'
@@ -281,34 +281,16 @@ function codecIsH264(codecs){ return !!codecs && String(codecs).toLowerCase().in
 function codecIsHEVC(codecs){ return !!codecs && (String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1')); }
 function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
 
-// ============================================================================
-// STADIO 1: NUOVA FUNZIONE SELEZIONE VARIANTE — PRIORITÀ 720p H.264
-// ============================================================================
 function selectVariantSmart(variants, maxRes){
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
   log(`🔍 Trovate ${h264.length} varianti H.264 su ${variants.length} totali`);
 
-  // 🥇 PRIMA: CERCHIAMO H.264 A 720p
-  let best720 = h264.find(v => {
-    const h = getResHeight(v.attrs.RESOLUTION);
-    return h >= 680 && h <= 740;
-  });
-  if(best720){
-    log('✅ SCELTA PRIMARIA: H.264 720p');
-    return best720;
-  }
+  let best720 = h264.find(v => { const h = getResHeight(v.attrs.RESOLUTION); return h >= 680 && h <= 740; });
+  if(best720){ log('✅ SCELTA PRIMARIA: H.264 720p'); return best720; }
 
-  // 🥈 POI: H.264 480p
-  let best480 = h264.find(v => {
-    const h = getResHeight(v.attrs.RESOLUTION);
-    return h >= 440 && h <= 520;
-  });
-  if(best480){
-    log('✅ SCELTA: H.264 480p');
-    return best480;
-  }
+  let best480 = h264.find(v => { const h = getResHeight(v.attrs.RESOLUTION); return h >= 440 && h <= 520; });
+  if(best480){ log('✅ SCELTA: H.264 480p'); return best480; }
 
-  // 🥉 POI: H.264 QUALSIASI RISOLUZIONE ENTRO maxRes
   const eligibleH264 = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
   if(eligibleH264.length > 0){
     const sorted = eligibleH264.sort((a,b) => getResHeight(b.attrs.RESOLUTION) - getResHeight(a.attrs.RESOLUTION));
@@ -316,7 +298,6 @@ function selectVariantSmart(variants, maxRes){
     return sorted[0];
   }
 
-  // ⚠️ SOLO SE NESSUN H.264 TROVATO
   log('❌ NESSUNA VARIANTE H.264 TROVATA → RISCHIO SCHERMO GRIGIO');
   const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
   if(hevc.length > 0){
@@ -328,7 +309,6 @@ function selectVariantSmart(variants, maxRes){
     return hevc[0];
   }
 
-  // 🟡 ULTIMO FALLBACK
   if(variants.length === 0) return null;
   const eligibleAll = variants.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
   if(eligibleAll.length > 0){
@@ -339,9 +319,6 @@ function selectVariantSmart(variants, maxRes){
 
 let lastPl={key:'',txt:'',t:0};
 
-// ============================================================================
-// STADIO 2 & 3: FALLBACK AUTOMATICO 720→480→1080 + ORDINE FORZATO
-// ============================================================================
 async function live(u, P, legacy) {
   countReq('live');
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
@@ -446,9 +423,6 @@ async function live(u, P, legacy) {
   return R('ERRORE: provider KO per ' + c.name + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// ============================================================================
-// STADIO 4: LOG DI CONFERMA VARIANTE INVIATA
-// ============================================================================
 async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) return null;
@@ -462,7 +436,6 @@ async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug
       return null;
     }
     
-    // 🟣 STADIO 4: Log di conferma
     log(`📤 INVIATO A TELEVIZO: Risoluzione=${getResHeight(chosen.attrs.RESOLUTION)}p | Codecs=${chosen.attrs.CODECS}`);
     
     const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
@@ -523,14 +496,29 @@ function proxUrl(abs,P,ref,origin){
 
 function rewriteMediaPl(txt,baseUrl,P,ref,origin){
   const p=parseMediaPl(txt);
-  if(p.isMaster||!p.segs.length) return null;
+  if(p.isMaster||!p.segs.length) return null; 
   const maxSegs=8;
   const kept=p.segs.slice(-maxSegs);
   const dropped=p.segs.length-kept.length;
   const out=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-TARGETDURATION:'+p.upTarget,'#EXT-X-MEDIA-SEQUENCE:'+(p.upSeq+dropped)];
-  if(p.map){ const mu=(p.map.match(/URI="([^"]+)"/)||[])[1]; if(mu) out.push('#EXT-X-MAP:URI="'+proxUrl(absSegUrl(mu,baseUrl),P,ref,origin)+'"'); }
+  
+  // 🔥 COLPO DI GENIO: Forza il reset del decoder all'avvio. 
+  // Risolve lo schermo grigio su F1/Tennis (NTV) causato da join a metà keyframe o codec HEVC.
+  let needsDisc = true;
+  
+  if(p.map){ 
+    const mu=(p.map.match(/URI="([^"]+)"/)||[])[1]; 
+    if(mu) out.push('#EXT-X-MAP:URI="'+proxUrl(absSegUrl(mu,baseUrl),P,ref,origin)+'"'); 
+  }
+  
   kept.forEach((s,idx)=>{
-    if(s.disc&&idx>0) out.push('#EXT-X-DISCONTINUITY');
+    if(s.disc && needsDisc) {
+      // La discontinuità è già nel segmento, non aggiungerne una extra
+    } else if (needsDisc) {
+      out.push('#EXT-X-DISCONTINUITY');
+    }
+    needsDisc = false; // Reset fatto, non servire più per i successivi
+    
     out.push(s.extinf);
     if(s.brange) out.push(s.brange);
     out.push(proxUrl(absSegUrl(s.url,baseUrl),P,ref,origin));
@@ -691,11 +679,11 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v9.5 ===');
+  L.push('=== LOGICA v9.6 ===');
   L.push('1. Ordine forzato NTV→Daddy→Vavoo per F1/Tennis');
   L.push('2. Fallback automatico: 720p → 480p → 1080p');
   L.push('3. Priorità assoluta a H.264 (720p prima di tutto)');
-  L.push('4. HEVC solo come ultima spiaggia (rischio schermo grigio)');
+  L.push('4. 🔥 Iniezione #EXT-X-DISCONTINUITY per reset decoder (anti schermo grigio)');
   return L.join('\n');
 }
 
@@ -825,4 +813,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.5 ███
+// ███ FINE TVNOW-CF v9.6 ███
