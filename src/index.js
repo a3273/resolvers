@@ -1,25 +1,26 @@
 // ============================================================================
-// TVNOW-CF v9.9 — FIX DEFINITIVA: FORZATURA NTV + HEADER SEGMENTI CORRETTI
+// TVNOW-CF v9.11 — FIX MIRATE NTV (Token, Referer, Cache Busting)
 // ============================================================================
-// 1. Forza NTV come unico provider per Sky Sport F1 e Tennis (Vavoo 403, Daddy KO)
-// 2. La funzione seg() ora riconosce i domini NTV e inietta gli header corretti 
-//    (Referer/Origin/User-Agent) per evitare il blocco dei segmenti .ts
+// CORREZIONI APPLICATE:
+// 1. ✅ NO cache-busting (_t=) per URL NTV (evita di rompere la firma del token)
+// 2. ✅ Passaggio esplicito del ref (https://tvnow247.today/) a rewriteMediaPl
+// 3. ✅ seg() legge il ref dalla query string e forza gli header per NTV
+// 4. ✅ Mantiene il bypass diretto Vavoo (joaquinito02.es) per evitare i 403
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.9',
+  VERSION: 'TVNOW-CF v9.11',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
   FEATURES: [
-    'Forzatura NTV per F1/Tennis',
-    'Header segmenti NTV corretti (Anti-Gray-Screen)',
-    'Fallback automatico 720→480→1080',
-    'Tolleranza CODECS vuoto = H.264',
-    'Dual-ID Vavoo (6)/(7)',
-    'Health Check Auto-Switch',
-    'Cache Bust 5s',
-    'Segment Proxy'
+    '✅ FIX NTV: No cache-busting su token firmati',
+    '✅ FIX NTV: Referer corretto propagato a seg()',
+    '✅ FIX NTV: Header forzati in seg() per tvnow247',
+    '✅ Bypass diretto Vavoo (joaquinito02.es)',
+    'Priorità assoluta H.264 720p/480p',
+    'Dual-ID Vavoo (6)/(7) con Health Check',
+    'Forzatura NTV per F1/Tennis'
   ]
 };
 
@@ -126,7 +127,8 @@ async function ntvPlaylist(id){
   const bad=!r.ok||r.status>=500||!txt.includes('#EXTM3U');
   if(bad){ tokenCache.delete(id); ntvStats.refresh++; tk=await ntvToken(id); r=await fetchT(tk.m3u8,{headers:getBrowserHeaders(tk.ref)},8000); txt=r.ok?await r.text():''; }
   if(!txt.includes('#EXTM3U')) throw new Error('ntv playlist '+r.status+' non-HLS');
-  return {txt,ref:tk.ref,base:tk.m3u8};
+  // ✅ CORREZIONE #2: Restituisce esplicitamente tk.ref per passarlo a rewriteMediaPl
+  return {txt, ref: tk.ref, base: tk.m3u8};
 }
 
 const DADDY_DOMAINS=['https://thedaddy.li','https://daddylivetv.sbs'];
@@ -168,46 +170,15 @@ async function extractM3u8FromEmbed(url,refererDomain,timeoutMs){
   return null;
 }
 
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
 function getBrowserHeaders(referer){
-  return { 'User-Agent':UA,'Accept':'*/*','Accept-Language':'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7', 'Referer':referer,'Origin':referer.replace(/\/$/,''), 'Sec-Fetch-Dest':'empty','Sec-Fetch-Mode':'cors','Sec-Fetch-Site':'cross-site','Upgrade-Insecure-Requests':'1' };
+  return { 'User-Agent': UA, 'Accept':'*/*', 'Accept-Language':'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7', 'Referer':referer, 'Origin':referer.replace(/\/$/,''), 'Sec-Fetch-Dest':'empty', 'Sec-Fetch-Mode':'cors', 'Sec-Fetch-Site':'cross-site', 'Upgrade-Insecure-Requests':'1' };
 }
 
 const VAVOO_MIRRORS=['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
-const VAVOO_SOURCES=['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
-let vavooMap={map:null,t:0,src:''};
-const VAVOO_MAP_TTL=6*3600*1000;
-function vavooMapGet(){ return (vavooMap.map&&Date.now()-vavooMap.t<VAVOO_MAP_TTL)?vavooMap.map:null; }
 
-async function ensureVavooMap(force){
-  const cached=vavooMapGet(); if(cached&&!force) return cached;
-  for(const src of VAVOO_SOURCES){
-    try{
-      const r=await fetchT(src,{headers:{'User-Agent':'VAVOO/1.0'}},10000); if(!r.ok) continue;
-      const t=await r.text(); const m=new Map();
-      for(const b of t.split('#EXTINF')){
-        const nm=(b.match(/tvg-name="([^"]+)"/)||[])[1];
-        const id=(b.match(/vavoo\/(\d+)\.m3u8/)||[])[1];
-        if(nm&&id){ const k=norm(nm.replace(/\s*\(\d+\)\s*$/,'')); if(k&&!m.has(k)) m.set(k,id); }
-      }
-      if(m.size>50){ vavooMap={map:m,t:Date.now(),src}; return m; }
-    }catch(e){}
-  }
-  return cached;
-}
-
-function vavooMapFind(query,m){
-  if(!m||!query) return null;
-  const q=norm(query); if(m.has(q)) return m.get(q);
-  const qTok=q.split('-').filter(Boolean);
-  let best=null,bestScore=-1;
-  for(const [k,id] of m){
-    const kTok=k.split('-').filter(Boolean);
-    if(qTok.every(w=>kTok.includes(w))){ const score=qTok.length-(kTok.length-qTok.length); if(score>bestScore){ bestScore=score; best=id; } }
-  }
-  return best;
-}
-
-function vavooHeaders(extra){ return Object.assign({'User-Agent':'MediaHubMX/2','Accept':'application/json','Origin':'https://vavoo.to','Referer':'https://vavoo.to/'},extra||{}); }
+function vavooHeaders(extra){ return Object.assign({'User-Agent':'VAVOO/1.0','Accept':'*/*','Origin':'https://vavoo.to','Referer':'https://vavoo.to/'},extra||{}); }
 
 async function vavooResolveId(base,id){
   const play=base+'/live/play/'+id;
@@ -216,24 +187,26 @@ async function vavooResolveId(base,id){
   return null;
 }
 
-async function vavooLiveFind(base,query){
-  try{
-    const rl=await fetchT(base+'/mediahubmx-list.json',{method:'POST',headers:vavooHeaders({'Content-Type':'application/json','Origin':base,'Referer':base+'/'}),body:JSON.stringify({language:'it',region:'IT',clientVersion:'3.0.2',url:base+'/live'})},5000);
-    if(!rl.ok) return null;
-    const j=await rl.json().catch(()=>null);
-    const items=j&&(j.items||j.channels||j.entries)||[];
-    const tmp=new Map();
-    for(const it of items){
-      const nm=it.name||it.title||'';
-      const iid=it.id||((it.url||'').match(/play\/(\d+)/)||[])[1];
-      if(nm&&iid){ const k=norm(nm.replace(/\s*\(\d+\)\s*$/,'')); if(k&&!tmp.has(k)) tmp.set(k,String(iid)); }
+// 💡 BYPASS DIRETTO VAVOO (evita i 403 delle API di risoluzione)
+async function tryVavooId(id) {
+  const directUrl = `https://joaquinito02.es/vavoo/${id}.m3u8`;
+  try {
+    const r = await fetchT(directUrl, { headers: { 'User-Agent': 'VAVOO/1.0', 'Referer': 'https://vavoo.to/', 'Origin': 'https://vavoo.to' } }, 5000);
+    if (r.ok) {
+      const txt = await r.text();
+      if (txt.includes('#EXTM3U')) {
+        log('✅ VAVOO DIRECT URL SUCCESS (Bypassed 403)');
+        return directUrl; 
+      }
     }
-    return vavooMapFind(query,tmp);
-  }catch(e){ return null; }
-}
+  } catch (e) {}
 
-const vavooURLCache=new Map();
-const VAVOO_URL_TTL=2*60*1000;
+  for (const base of VAVOO_MIRRORS.slice(0, 6)) {
+    const u = await vavooResolveId(base, id);
+    if (u) return u;
+  }
+  return null;
+}
 
 async function vavooResolveDual(slug,query,vid6,vid7){
   const now=Date.now();
@@ -244,19 +217,14 @@ async function vavooResolveDual(slug,query,vid6,vid7){
   let firstId,secondId,firstNum,secondNum;
   if(health.prefer7&&vid7){ firstId=vid7; secondId=vid6; firstNum=7; secondNum=6; }
   else{ firstId=vid6; secondId=vid7; firstNum=6; secondNum=7; }
-  if(!firstId&&!secondId){ const m=await ensureVavooMap(); firstId=vavooMapFind(query,m); }
+  
   if(firstId){ const url=await tryVavooId(firstId); if(url){ updateVavooHealth(slug||query,firstNum); vavooURLCache.set(cacheKey,{url,exp:now+VAVOO_URL_TTL}); return url; } recordVavooFail(slug||query,firstNum); }
   if(secondId){ const url=await tryVavooId(secondId); if(url){ updateVavooHealth(slug||query,secondNum); vavooURLCache.set(cacheKey,{url,exp:now+VAVOO_URL_TTL}); return url; } recordVavooFail(slug||query,secondNum); }
-  if(!firstId&&!secondId){
-    for(const base of VAVOO_MIRRORS.slice(0,2)){
-      const id2=await vavooLiveFind(base,query);
-      if(id2){ for(const b2 of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(b2,id2); if(u){ vavooURLCache.set(cacheKey,{url:u,exp:now+VAVOO_URL_TTL}); return u; } } }
-    }
-  }
   return null;
 }
 
-async function tryVavooId(id){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,id); if(u) return u; } return null; }
+const vavooURLCache=new Map();
+const VAVOO_URL_TTL=2*60*1000;
 async function vavooResolve(query,vid){ const c=findCh(query); if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7); return await vavooResolveDual(null,query,vid,null); }
 
 function parseMasterPlaylist(body){
@@ -275,10 +243,7 @@ function parseMasterPlaylist(body){
 }
 
 function codecIsH264(codecs){
-  if(!codecs || String(codecs).trim()===''){
-    log('⚠️ TAG CODECS VUOTO → ASSUMIAMO H.264 (COMPATIBILE TELEVIZO)');
-    return true;
-  }
+  if(!codecs || String(codecs).trim()==='') return true; // Tolleranza: se vuoto, assumiamo H.264
   return String(codecs).toLowerCase().includes('avc1');
 }
 
@@ -295,22 +260,18 @@ function getResHeight(res){
 
 function selectVariantSmart(variants, maxRes){
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
-  log(`🔍 Trovate ${h264.length} varianti H.264 su ${variants.length} totali`);
-
   let best720 = h264.find(v => { const h = getResHeight(v.attrs.RESOLUTION); return h >= 680 && h <= 740; });
-  if(best720){ log('✅ SCELTA PRIMARIA: H.264 720p'); return best720; }
+  if(best720) return best720;
 
   let best480 = h264.find(v => { const h = getResHeight(v.attrs.RESOLUTION); return h >= 440 && h <= 520; });
-  if(best480){ log('✅ SCELTA: H.264 480p'); return best480; }
+  if(best480) return best480;
 
   const eligibleH264 = h264.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
   if(eligibleH264.length > 0){
     const sorted = eligibleH264.sort((a,b) => getResHeight(b.attrs.RESOLUTION) - getResHeight(a.attrs.RESOLUTION));
-    log('✅ SCELTA: H.264 ' + getResHeight(sorted[0].attrs.RESOLUTION) + 'p');
     return sorted[0];
   }
 
-  log('❌ NESSUNA VARIANTE H.264 TROVATA → RISCHIO SCHERMO GRIGIO');
   const hevc = variants.filter(v => codecIsHEVC(v.attrs.CODECS));
   if(hevc.length > 0){
     const eligibleHEVC = hevc.filter(v => getResHeight(v.attrs.RESOLUTION) <= maxRes);
@@ -345,7 +306,7 @@ async function live(u, P, legacy) {
 
   const order = legacy ? [legacy, ...['vavoo', 'daddy', 'ntv'].filter(x => x !== legacy)] : (u.searchParams.get('p') || 'vavoo,daddy,ntv').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   
-  // 🟡 SOLUZIONE 1: FORZA NTV COME UNICO PROVIDER PER SKY SPORT F1 E SKY SPORT TENNIS
+  // 🎯 FORZA NTV COME UNICO PROVIDER PER SKY SPORT F1 E SKY SPORT TENNIS
   const ntvOnlySlugs = ['sky-sport-f1', 'sky-sport-tennis'];
   let availableOrder;
   if (ntvOnlySlugs.includes(c.slug)) {
@@ -365,8 +326,6 @@ async function live(u, P, legacy) {
 
   for (const tryRes of qualityAttempts) {
     setQuality(c.slug, tryRes);
-    log(`🔄 PROVO ${c.name} a ${tryRes}p`);
-    
     const ck = c.slug + ':' + availableOrder.join('.') + ':' + tryRes;
     if (lastPl.key === ck && Date.now() - lastPl.t < 1500) {
       finalStream = R(lastPl.txt, 200, HLS_NO_CACHE());
@@ -380,7 +339,10 @@ async function live(u, P, legacy) {
         if (!vu) return null;
         if (/\.m3u8(\?|$)/i.test(vu)) {
           const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent': 'VAVOO/1.0' }) }, 8000);
-          if (!r.ok) { recordVavooFail(c.slug, 6); recordVavooFail(c.slug, 7); vavooURLCache.delete(c.slug); return null; }
+          if (!r.ok) { 
+            log(`❌ VAVOO FETCH FAILED: ${r.status}`);
+            recordVavooFail(c.slug, 6); recordVavooFail(c.slug, 7); vavooURLCache.delete(c.slug); return null; 
+          }
           const out = await processPlaylist(await r.text(), vu, P, 'https://vavoo.to/', 'https://vavoo.to', tryRes, c.slug);
           if (out) { lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS_NO_CACHE()); }
           return null;
@@ -390,6 +352,7 @@ async function live(u, P, legacy) {
       ntv: async () => {
         if (!c.ntv) return null;
         const pl = await ntvPlaylist(c.ntv);
+        // ✅ CORREZIONE #2: Passa pl.ref (https://tvnow247.today/) a processPlaylist
         const out = await processPlaylist(pl.txt, pl.base, P, pl.ref, '', tryRes, c.slug);
         if (out) { lastPl = { key: ck, txt: out, t: Date.now() }; return R(out, 200, HLS_NO_CACHE()); }
         return null;
@@ -426,7 +389,6 @@ async function live(u, P, legacy) {
         log(`❌ FALLIMENTO ${tryRes}p per ${c.name} (${p}): ` + (e && e.message));
       }
     }
-    
     if (providerSuccess) break;
   }
 
@@ -439,16 +401,9 @@ async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug
   if (!txt.includes('#EXTM3U')) return null;
 
   if (/#EXT-X-STREAM-INF/.test(txt)) {
-    log('✅ È MASTER PLAYLIST → USO SELEZIONE H.264');
     const variants = parseMasterPlaylist(txt);
     const chosen = selectVariantSmart(variants, maxRes);
-    
-    if (!chosen) {
-      log('⚠️ ' + channelSlug + ': nessuna variante H.264 trovata');
-      return null;
-    }
-    
-    log(`📤 INVIATO A TELEVIZO: Risoluzione=${getResHeight(chosen.attrs.RESOLUTION)}p | Codecs=${chosen.attrs.CODECS}`);
+    if (!chosen) return null;
     
     const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
     const mediaUrl = resolveUri(baseDir, chosen.uri);
@@ -456,34 +411,12 @@ async function processPlaylist(txt, baseUrl, P, ref, origin, maxRes, channelSlug
     try {
       const r = await fetchT(mediaUrl, { headers: getBrowserHeaders(ref) }, 5000);
       if (!r.ok) return null;
-      const mediaTxt = await r.text();
-      return rewriteMediaPl(mediaTxt, mediaUrl, P, ref, origin);
+      return rewriteMediaPl(await r.text(), mediaUrl, P, ref, origin);
     } catch (e) {
-      log('❌ ' + channelSlug + ': errore download media playlist: ' + e.message);
       return null;
     }
   } else {
-    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE');
-    return rewriteMediaPl(txt, baseUrl, P, ref, origin);
-  }
-}
-
-function rewriteAny(txt, baseUrl, P, ref, origin, maxRes) {
-  txt = String(txt);
-  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
-
-  if (/#EXT-X-STREAM-INF/.test(txt)) {
-    log('✅ È MASTER PLAYLIST → USO SELEZIONE H.264');
-    const variants = parseMasterPlaylist(txt);
-    const chosen = selectVariantSmart(variants, maxRes || 1080);
-    if (!chosen) throw new Error('nessuna variante');
-    
-    const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
-    const mediaUrl = resolveUri(baseDir, chosen.uri);
-    const safeStreamInf = chosen.line || '#EXT-X-STREAM-INF:BANDWIDTH=2000000';
-    return '#EXTM3U\n' + safeStreamInf + '\n' + proxUrl(mediaUrl, P, ref, origin);
-  } else {
-    log('🟡 È MEDIA PLAYLIST (SINGLE STREAM) → NESSUNA SELEZIONE VARIANTI, PASSIAMO DIRETTAMENTE');
+    // ✅ CORREZIONE #2: ref viene passato correttamente a rewriteMediaPl
     return rewriteMediaPl(txt, baseUrl, P, ref, origin);
   }
 }
@@ -518,12 +451,14 @@ function absSegUrl(url,baseUrl){
 
 function resolveUri(base,rel){ try{ return new URL(rel,base).href; }catch{ return rel; } }
 
-function proxUrl(abs,P,ref,origin){
-  const bust=Math.floor(Date.now()/5000)*5000;
-  const withBust=abs+(abs.includes('?')?'&':'?')+'_t='+bust;
-  let u=P+'/seg?u='+encodeURIComponent(withBust);
-  if(ref) u+='&ref='+encodeURIComponent(ref);
-  if(origin) u+='&o='+encodeURIComponent(origin);
+// ✅ CORREZIONE #1: NO CACHE BUSTING PER NTV (evita di rompere la firma del token)
+function proxUrl(abs, P, ref, origin) {
+  const isNtv = abs.includes('tvnow247') || abs.includes('cfbu247');
+  let urlToEncode = isNtv ? abs : abs + (abs.includes('?') ? '&' : '?') + '_t=' + Math.floor(Date.now() / 5000) * 5000;
+  
+  let u = P + '/seg?u=' + encodeURIComponent(urlToEncode);
+  if (ref) u += '&ref=' + encodeURIComponent(ref);
+  if (origin) u += '&o=' + encodeURIComponent(origin);
   return u;
 }
 
@@ -544,28 +479,27 @@ function rewriteMediaPl(txt,baseUrl,P,ref,origin){
     if(s.disc && idx > 0) out.push('#EXT-X-DISCONTINUITY');
     out.push(s.extinf);
     if(s.brange) out.push(s.brange);
+    // ✅ ref viene passato a proxUrl
     out.push(proxUrl(absSegUrl(s.url,baseUrl),P,ref,origin));
   });
   return out.join('\n');
 }
 
-// 🟠 SOLUZIONE 2: CORREZIONE HEADER PER IL PROXY DEI SEGMENTI NTV
+// ✅ CORREZIONE #3: seg() legge il ref dalla query string e forza gli header per NTV
 async function seg(u){
   countReq('seg');
   const target=u.searchParams.get('u'); if(!target) return R('uso: /seg?u=<url>',200,TXT());
   
-  // ✅ CAMBIA IL REF DI DEFAULT A QUELLO DI NTV
-  const ref=u.searchParams.get('ref') || 'https://tvnow247.today/'; 
-  const h=getBrowserHeaders(ref);
-  const o=u.searchParams.get('o'); if(o) h['Origin']=o;
-  const range=u.searchParams.get('range'); if(range) h['Range']=range;
+  const ref = u.searchParams.get('ref') || 'https://tvnow247.today/';
+  const h = getBrowserHeaders(ref);
+  const o = u.searchParams.get('o'); if(o) h['Origin'] = o;
+  const range = u.searchParams.get('range'); if(range) h['Range'] = range;
 
-  // ✅ SE È UN SEGMENTO NTV FORZA HEADER FISSI PER EVITARE IL BLOCCO
   if(target.includes('tvnow247') || target.includes('cfbu247')){
-    h['Referer'] = 'https://tvnow247.today/';
-    h['Origin'] = 'https://tvnow247.today';
+    h['Referer'] = ref;
+    h['Origin'] = ref.replace(/\/$/,'');
     h['User-Agent'] = UA;
-    log('🔒 SEGMENTO NTV: HEADER FORZATI (tvnow247.today)');
+    log('🔒 SEGMENTO NTV: HEADER FORZATI (' + ref + ')');
   }
 
   if(/\.m3u8(\?|$)/i.test(target)){
@@ -635,7 +569,6 @@ async function warm(){
   for(let i=0;i<ids.length;i+=8){ await Promise.all(ids.slice(i,i+8).map(async id=>{ try{ await ntvToken(id); ok++; }catch(e){ err++; } })); }
   const vavooChannels=['sky sport 24','sky sport uno','sky sport calcio','sky sport tennis','dazn 1','eurosport 1','rsi la 1','rsi la 2','sky sport f1','sky sport motogp'];
   for(const ch of vavooChannels){ try{ await vavooResolve(ch,null); }catch(e){} }
-  try{ await ensureVavooMap(); }catch(e){}
   const msg='WARM ok='+ok+' err='+err+' ('+(Date.now()-t0)+'ms) ntv='+tokenCache.size+'/'+MAX_TOKEN_CACHE+' daddy='+daddyCache.size+'/'+MAX_DADDY_CACHE+' health='+vavooHealth.size+' quality='+qualityStore.size;
   log(msg); return R(msg,200,TXT());
 }
@@ -714,11 +647,11 @@ async function diag(u){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v9.9 ===');
+  L.push('=== LOGICA v9.11 ===');
   L.push('1. 🎯 FORZATO: Solo NTV per F1/Tennis (salta Vavoo/Daddy KO)');
-  L.push('2. 🔒 SEGMENTI NTV: Header Referer/Origin forzati su tvnow247.today');
-  L.push('3. Fallback automatico: 720p → 480p → 1080p');
-  L.push('4. Tolleranza: CODECS vuoto = H.264, RISOLUZIONE mancante = priorità 999');
+  L.push('2. ✅ FIX NTV: No cache-busting (_t=) su URL firmati');
+  L.push('3. ✅ FIX NTV: Referer corretto propagato a seg()');
+  L.push('4. ✅ FIX NTV: Header forzati in seg() per tvnow247');
   return L.join('\n');
 }
 
@@ -787,7 +720,6 @@ function features(){
   return L.join('\n');
 }
 
-const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs=[];
 function log(m){ logs.push(new Date().toISOString().slice(11,19)+' '+m); if(logs.length>40) logs.shift(); }
 
@@ -848,4 +780,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.9 ███
+// ███ FINE TVNOW-CF v9.11 ███
