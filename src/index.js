@@ -1,13 +1,17 @@
 // ============================================================================
-// TVNOW-CF v9.2.1 — COMPLETO, CORREZIONI SCHERMO GRIGIO + AVVIO VELOCE
+// TVNOW-CF v9.3 — FIX CRITICO HLS "UNDEFINED" + QUALITY-LOCK
+// ============================================================================
+// GENIUS FIX: Preserva la riga #EXT-X-STREAM-INF originale invece di 
+// ricostruirla con variabili undefined (causa principale dello schermo nero 
+// sui canali Cinema che omettono metadata nel master playlist).
 // ============================================================================
 
 const CONFIG = {
-  VERSION: 'TVNOW-CF v9.2.1',
+  VERSION: 'TVNOW-CF v9.3',
   DELAY_TARGET: 27, DELAY_MIN: 25, PREF_SEGS: 3, MIN_SEGS: 2,
   RES_LADDER: [1080, 720, 480, 360, 240],
   QUALITY_TTL: 30 * 60 * 1000,
-  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 3/5s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints']
+  FEATURES: ['1080p H.264 default', 'Quality-Lock auto-fallback', 'HEVC blocked', 'Dual-ID Vavoo (6)/(7)', 'Health Check Auto-Switch', 'Keyframe Window 3/5s', 'No EXT-X-START', 'Cache Bust 5s', 'Multi-Provider Fallback', 'Segment Proxy', 'Debug Endpoints', 'FIX: No undefined HLS tags']
 };
 
 const CHANNELS = [
@@ -141,7 +145,6 @@ async function extractM3u8FromEmbed(url,refererDomain,timeoutMs){
   const r=await fetchT(url,{headers:getBrowserHeaders(refererDomain+'/'),cf:{cacheTtl:300,cacheEverything:true}},timeoutMs);
   if(!r.ok) return null;
   const html=await r.text();
-  // FIX: Sostituite le smart quotes con virgolette standard per evitare errori di sintassi
   let m3u8=html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
   if(m3u8) return m3u8[1];
   const iframe=html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
@@ -213,7 +216,6 @@ async function vavooLiveFind(base,query){
     const tmp=new Map();
     for(const it of items){
       const nm=it.name||it.title||'';
-      // FIX: Chiusura corretta della regex e dell'array match
       const iid=it.id||((it.url||'').match(/play\/(\d+)/)||[])[1];
       if(nm&&iid){ const k=norm(nm.replace(/\s*\(\d+\)\s*$/,'')); if(k&&!tmp.has(k)) tmp.set(k,String(iid)); }
     }
@@ -248,6 +250,9 @@ async function vavooResolveDual(slug,query,vid6,vid7){
 async function tryVavooId(id){ for(const base of VAVOO_MIRRORS.slice(0,6)){ const u=await vavooResolveId(base,id); if(u) return u; } return null; }
 async function vavooResolve(query,vid){ const c=findCh(query); if(c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7); return await vavooResolveDual(null,query,vid,null); }
 
+// ============================================================================
+// VARIANT SELECTOR & PARSER (IMMUNE TO UNDEFINED)
+// ============================================================================
 function parseMasterPlaylist(body){
   const lines=body.split(/\r?\n/);
   const variants=[]; let current=null;
@@ -257,15 +262,16 @@ function parseMasterPlaylist(body){
       const attrs={}; const attrStr=line.substring('#EXT-X-STREAM-INF:'.length);
       const re=/([A-Z-]+)=("[^"]*"|[^,]+)/g; let m;
       while((m=re.exec(attrStr))!==null) attrs[m[1]]=m[2].replace(/^"|"$/g,'');
-      current={attrs,index:variants.length};
+      current={attrs, line:line, index:variants.length}; // GENIUS: Save original line
     } else if(current&&line&&!line.startsWith('#')){ current.uri=line; variants.push(current); current=null; }
   }
   return variants;
 }
 
-function codecIsH264(codecs){ return !!codecs && codecs.split(',').some(c=>c.trim().startsWith('avc1')); }
-function codecIsHEVC(codecs){ return !!codecs && codecs.split(',').some(c=>c.trim().startsWith('hvc1')||c.trim().startsWith('hev1')); }
-function getResHeight(res){ if(!res) return 0; const m=res.match(/x(\d+)/i); return m?parseInt(m[1]):0; }
+// GENIUS FIX: Immuni a undefined/null
+function getResHeight(res){ if(!res) return 0; const m=String(res).match(/(\d+)p/i) || String(res).match(/x(\d+)/i); return m ? parseInt(m[1]) : 0; }
+function codecIsH264(codecs){ return !!codecs && String(codecs).toLowerCase().includes('avc1'); }
+function codecIsHEVC(codecs){ return !!codecs && (String(codecs).toLowerCase().includes('hvc1') || String(codecs).toLowerCase().includes('hev1')); }
 
 function selectVariantSmart(variants, maxRes){
   const h264 = variants.filter(v => codecIsH264(v.attrs.CODECS));
@@ -345,18 +351,27 @@ async function live(u,P,legacy){
   return R('ERRORE: provider KO ('+availableOrder.join(' -> ')+') per '+c.name+'. /probe?ch='+c.slug,200,TXT());
 }
 
-function rewriteAny(txt,baseUrl,P,ref,origin,maxRes){
-  txt=String(txt);
-  if(!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
-  if(/#EXT-X-STREAM-INF/.test(txt)){
-    const variants=parseMasterPlaylist(txt);
-    const chosen=selectVariantSmart(variants,maxRes||1080);
-    if(!chosen) throw new Error('nessuna variante');
-    const baseDir=baseUrl.substring(0,baseUrl.lastIndexOf('/')+1);
-    const mediaUrl=resolveUri(baseDir,chosen.uri);
-    return '#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION='+chosen.attrs.RESOLUTION+',CODECS='+chosen.attrs.CODECS+'\n'+proxUrl(mediaUrl,P,ref,origin);
+// ============================================================================
+// REWRITE HLS (GENIUS FIX APPLIED HERE)
+// ============================================================================
+function rewriteAny(txt, baseUrl, P, ref, origin, maxRes) {
+  txt = String(txt);
+  if (!txt.includes('#EXTM3U')) throw new Error('risposta non-HLS');
+  if (/#EXT-X-STREAM-INF/.test(txt)) {
+    const variants = parseMasterPlaylist(txt);
+    const chosen = selectVariantSmart(variants, maxRes || 1080);
+    if (!chosen) throw new Error('nessuna variante');
+    
+    const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+    const mediaUrl = resolveUri(baseDir, chosen.uri);
+    
+    // 💡 GENIUS FIX: Usa la riga originale (#EXT-X-STREAM-INF:...) invece di ricostruirla.
+    // Questo previene l'output di "RESOLUTION=undefined" che manda in crash i player.
+    const safeStreamInf = chosen.line || '#EXT-X-STREAM-INF:BANDWIDTH=2000000';
+    
+    return '#EXTM3U\n' + safeStreamInf + '\n' + proxUrl(mediaUrl, P, ref, origin);
   }
-  return rewriteMediaPl(txt,baseUrl,P,ref,origin);
+  return rewriteMediaPl(txt, baseUrl, P, ref, origin);
 }
 
 function parseMediaPl(txt){
@@ -584,6 +599,7 @@ async function diag(u){
   L.push('4. &reset=1 → torna a 1080p');
   L.push('5. &res=720 → forza manualmente 720p');
   L.push('6. TTL 30min: poi torna a 1080p');
+  L.push('7. 💡 FIX: Preserva tag HLS originali (niente "undefined")');
   return L.join('\n');
 }
 
@@ -727,4 +743,4 @@ export default {
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
-// ███ FINE TVNOW-CF v9.2.1 ███
+// ███ FINE TVNOW-CF v9.3 ███
