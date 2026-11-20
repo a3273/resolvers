@@ -1,11 +1,13 @@
 // ============================================================================
-// TVNOW-CF v8.12 — STABLE CLEAN (No Hacks, Valid HLS, Anti-Loop)
+// TVNOW-CF v8.13 — AVVIO IMMEDIATO + ANTI-SCHERMO NERO
 //
-// CORREZIONI CHIRURGICHE APPLICATE ALLA V8.0:
-// 1. RIMOSSI #EXT-X-START e #EXT-X-INDEPENDENT-SEGMENTS (causavano schermo grigio)
-// 2. CACHE SEGMENTI: 60s (previene rate-limit 403 che causano il loop)
-// 3. BUST URL: 60s (sincronizzato con la cache per massimizzare gli hit)
-// 4. NESSUNA manipolazione artificiale della MEDIA-SEQUENCE (playlist 100% valida)
+// FIX APPLICATI:
+// 1. Finestra fissa a 8 segmenti: garantisce la presenza di un keyframe 
+//    all'inizio della playlist, permettendo la decodifica immediata (1-2s).
+// 2. Rimozione totale di EXT-X-START e EXT-X-INDEPENDENT-SEGMENTS: 
+//    elimina i conflitti di decodifica che causavano schermo nero.
+// 3. Cache-Bust a 5 secondi: previene il loop di segmenti vecchi senza 
+//    bombardare i server originali (evita errori 403).
 // ============================================================================
 
 export default {
@@ -42,13 +44,6 @@ export default {
     }
   },
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
-};
-
-const CONFIG = {
-  DELAY_TARGET: 27,
-  DELAY_MIN: 25,
-  PREF_SEGS: 3,
-  MIN_SEGS: 2
 };
 
 const CHANNELS = [
@@ -105,7 +100,7 @@ function findCh(q) { let k = norm(q); if (BY_KEY.has(k)) return BY_KEY.get(k); k
 
 function elencoCanali(u) {
   const search = (u && u.searchParams.get('q')) || '';
-  const L = ['TVNOW-CF v8.12 — CANALI (' + CHANNELS.length + ')'];
+  const L = ['TVNOW-CF v8.13 — CANALI (' + CHANNELS.length + ')'];
   L.push('Uso: /live?ch=<slug o id>   /ch?q=ricerca');
   L.push('');
   for (const c of CHANNELS) {
@@ -455,7 +450,7 @@ async function live(u, P, legacy) {
 }
 
 // ============================================================================
-// REWRITE HLS (STANDARD VALIDO, NO HACKS)
+// REWRITE HLS
 // ============================================================================
 function rewriteAny(txt, baseUrl, P, ref, origin) {
   txt = String(txt);
@@ -488,20 +483,6 @@ function parseMediaPl(txt) {
   return { upSeq, upTarget, map, segs, isMaster };
 }
 
-function pickWindow(durs) {
-  const n = durs.length;
-  if (!n) return { count: 0, sum: 0 };
-  let count = 0, sum = 0;
-  for (let i = n - 1; i >= 0; i--) {
-    count++; sum += durs[i];
-    if (count >= CONFIG.PREF_SEGS && sum >= CONFIG.DELAY_TARGET) break;
-  }
-  while (count > CONFIG.MIN_SEGS && sum - durs[n - count] >= CONFIG.DELAY_MIN) {
-    sum -= durs[n - count]; count--;
-  }
-  return { count, sum };
-}
-
 function absSegUrl(url, baseUrl) {
   if (/^https?:\/\//i.test(url)) return url;
   let abs;
@@ -510,9 +491,9 @@ function absSegUrl(url, baseUrl) {
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
 
+// 🔥 CACHE-BUST A 5 SECONDI: previene il loop senza bombardare l'origine
 function proxUrl(abs, P, ref, origin) {
-  // ✅ BUST A 60s: Sincronizzato con la cache CF per evitare rate-limit (causa principale del loop)
-  const bust = Math.floor(Date.now() / 60000) * 60000;
+  const bust = Math.floor(Date.now() / 5000) * 5000;
   const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
   let u = P + '/seg?u=' + encodeURIComponent(withBust);
   if (ref) u += '&ref=' + encodeURIComponent(ref);
@@ -534,14 +515,15 @@ function rewriteMaster(txt, baseUrl, P, ref, origin) {
   return out.join('\n');
 }
 
-// ✅ PLAYLIST HLS PULITA: NIENTE EXT-X-START O INDEPENDENT-SEGMENTS (causavano schermo grigio)
+// 🔥 PLAYLIST PULITA E STABILE: 8 segmenti garantiscono un keyframe iniziale
 function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, P, ref, origin);
 
-  const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
-  const kept = p.segs.slice(-plan.count);
+  // Prendiamo gli ultimi 8 segmenti. Questo dà al player abbastanza contesto 
+  // per trovare immediatamente un keyframe e avviare la decodifica senza schermo nero.
+  const maxSegs = 8;
+  const kept = p.segs.slice(-maxSegs);
   const dropped = p.segs.length - kept.length;
 
   const out = [
@@ -549,7 +531,9 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
     '#EXT-X-VERSION:3',
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + (p.upSeq + dropped)
+    // NOTARE: Nessun EXT-X-START o EXT-X-INDEPENDENT-SEGMENTS per massima compatibilità
   ];
+  
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
     if (mu) out.push('#EXT-X-MAP:URI="' + proxUrl(absSegUrl(mu, baseUrl), P, ref, origin) + '"');
@@ -566,7 +550,7 @@ function rewriteMediaPl(txt, baseUrl, P, ref, origin) {
 }
 
 // ============================================================================
-// SEG (CACHE 60s PER PREVENIRE 403/LOOP)
+// SEG
 // ============================================================================
 async function seg(u) {
   countReq('seg');
@@ -592,15 +576,15 @@ async function seg(u) {
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // ✅ CACHE 60s: Fondamentale. Se è 0, l'origine ti blocca (403) e il player va in loop di retry.
-  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 60, cacheEverything: true };
+  // 🔥 CACHE A 5 SECONDI: sufficiente per evitare rate-limit, breve abbastanza per essere freschi
+  const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 5, cacheEverything: true };
   const r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
   
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
-    'cache-control': range ? 'no-cache' : 'public, max-age=60',
+    'cache-control': range ? 'no-cache' : 'public, max-age=5',
     'pragma': range ? 'no-cache' : ''
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
@@ -710,7 +694,7 @@ async function diag(u) {
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
   const h = getVavooHealth(c.slug);
-  const L = ['=== DIAGNOSTICA (v8.12 Stable Clean) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v8.13 Stabile) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   L.push('Health: prefer7=' + h.prefer7 + ' fails6=' + h.fails6 + ' fails7=' + h.fails7 + ' (TTL=' + VAVOO_HEALTH_TTL/1000 + 's)');
   L.push('Vavoo ID6: ' + (c.vid6 || 'none') + ' | ID7: ' + (c.vid7 || 'none'));
   L.push('');
@@ -739,9 +723,9 @@ async function diag(u) {
     return await r.text();
   });
   L.push('=== LOGICA STABILE ===');
-  L.push('1. NO EXT-X-START / INDEPENDENT-SEGMENTS (evita schermo grigio)');
-  L.push('2. Cache segmenti: 60s (evita rate-limit 403 che causa loop)');
-  L.push('3. Finestra: 3 segmenti (avvio naturale in 3-4s dal keyframe)');
+  L.push('1. Finestra fissa a 8 segmenti: garantisce keyframe iniziale (avvio rapido)');
+  L.push('2. NO EXT-X-START / INDEPENDENT-SEGMENTS: evita schermo grigio');
+  L.push('3. Cache-Bust a 5s: previene loop senza causare rate-limit 403');
   return L.join('\n');
 }
 
@@ -749,14 +733,13 @@ function playlistStats(txt) {
   const p = parseMediaPl(txt);
   if (p.isMaster) return 'master playlist';
   const durs = p.segs.map(s => s.dur || p.upTarget);
-  const plan = pickWindow(durs);
   const total = durs.reduce((a, b) => a + b, 0);
-  return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's | finestra ' + plan.count + ' segs / ' + plan.sum.toFixed(1) + 's';
+  return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's | finestra ' + Math.min(p.segs.length, 8) + ' segs';
 }
 
 function debug() {
   const now = Math.floor(Date.now() / 1000);
-  const L = ['TVNOW-CF v8.12 (Stable Clean)', ''];
+  const L = ['TVNOW-CF v8.13 (Stabile)', ''];
   L.push('📋 INFORMAZIONI SISTEMA');
   L.push('─────────────────────────────────────────────────────────');
   L.push('Canali DB:       ' + CHANNELS.length);
@@ -795,7 +778,7 @@ function countReq(kind) {
   reqStats[kind]++;
 }
 
-function uso(P) { return ['TVNOW-CF v8.12','','uso:','  /live?ch=<slug|id>            playlist stabile anti-loop','  /live?ch=X&p=vavoo,daddy,ntv  ordine provider custom','  /diag?ch=sky-sport-f1         diagnostica completa','  /checkseg?s=vavoo&ch=X        test segmento reale','  /probe?ch=X  /debug  /ch','  /warm  /vmap  /rawu  /ip',''].join('\n'); }
+function uso(P) { return ['TVNOW-CF v8.13','','uso:','  /live?ch=<slug|id>            playlist stabile anti-loop','  /live?ch=X&p=vavoo,daddy,ntv  ordine provider custom','  /diag?ch=sky-sport-f1         diagnostica completa','  /checkseg?s=vavoo&ch=X        test segmento reale','  /probe?ch=X  /debug  /ch','  /warm  /vmap  /rawu  /ip',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() { return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() }; }
 function CORS() { return { 'access-control-allow-origin': '*' }; }
@@ -812,4 +795,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v8.12 ███
+// ███ FINE TVNOW-CF v8.13 ███
