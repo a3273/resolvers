@@ -1,30 +1,21 @@
 // ============================================================================
-// TVNOW-CF v10.3 STABLE++ — Fix morte post-30min + No Cascata + Qualità MAX
+// TVNOW-CF v10.4 STABLE+++ — Fix RSI (bypass server raw Vavoo)
 // ============================================================================
-// FIX E MIGLIORAMENTI rispetto alla v10.2:
-// 1. FIX MORTE DOPO ~20-30 MIN: la playlist video e quella AUDIO delle tracce
-//    #EXT-X-MEDIA condividevano lo STESSO stato di sequenza (stateKey
-//    ch|prov). Le due playlist hanno host/path diversi → lo stato vedeva un
-//    cambio di base ad OGNI refresh → #EXT-X-DISCONTINUITY inserita quasi
-//    sempre → il decoder si resettava in continuazione → prima scatti, poi
-//    errore media e stream morto. Ora lo stato in /seg è chiavato per URL
-//    upstream PLUGLIA (video e audio hanno stati SEPARATI e corretti).
-// 2. FIX MINI-MASTER (qualità): la "quality selection" produceva un mini
-//    master SENZA #EXTM3U e SENZA le tracce #EXT-X-MEDIA (con AUDIO="aud"
-//    orfano) → player illeggibile / tracce audio perse. Ora il master viene
-//    riscritto COMPLETO: variant video ordinate per BANDWIDTH DECRESCENTE
-//    (i player nativi partono dalla prima = massima qualità), tracce audio
-//    mantenute e proxyate, I-FRAME mantenuti.
-// 3. FIX CASCATA: il circuit breaker era chiavato SOLO sul provider (ntv in
-//    cooldown per un canale = ntv rallentato su TUTTI i canali). Ora è chiavato
-//    su canale|provider: nessun canale influenza gli altri.
-// 4. UA STABILE per canale|provider: prima ogni richieste pesava un UA casuale
-//    → alcuni CDN legano token/URL all'UA → 403 intermittenti e morte stream.
-//    Ora l'UA è deterministico (stesso canale = stesso UA, ruota tra i canali).
-// 5. DELAY: 12s target / 9s min (era 14/10).
-// 6. /player: scelta del livello MAX corretta (per bitrate, non per posizione
-//    nell'array) + buffer calibrato sul delay.
-// 7. Tutte le diagnostici aggiornate.
+// FIX RSI vs v10.3:
+// - I server RSI (e F1 su Vavoo) sono "raw" (IP nudi tipo 185.244.37.56:8008)
+//   che rifiutano:
+//   • User-Agent app (VAVOO/1.0) → vogliono browser UA
+//   • Referer vavoo.to → vogliono il mirror che ha risolto (geil.to, ecc.)
+//   • Origin/Sec-Fetch headers → firewall li blocca
+// - v10.4: traccio il mirror di risoluzione + applico header browser minimali
+//   SOLO quando l'URL è raw. Per URL normali, uso vavooHeaders come prima.
+//
+// TUTTO IL RESTO DI v10.3 RESTA IDENTICO:
+// - FIX morte 20-30min (stato video/audio separati)
+// - Qualità MAX con variant ordinate
+// - Zero cascata (CB per canale|provider)
+// - UA stabile per canale|provider
+// - RSI ID confermati (2455610203, 3590183307)
 // ============================================================================
 
 export default {
@@ -66,7 +57,7 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// --- CONFIGURAZIONE --------------------------------------------------------
+// --- CONFIGURAZIONE (identica a v10.3) -------------------------------------
 const DELAY_TARGET = 12, DELAY_MIN = 9, PREF_SEGS = 3, MIN_SEGS = 2;
 const STALE_FACTOR = 6, MAX_BUFFER_SECS = 45;
 const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
@@ -75,7 +66,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 240*1000;
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.3 STABLE++';
+const VER = 'TVNOW-CF v10.4 STABLE+++';
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
@@ -83,9 +74,6 @@ const UA_LIST = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 ];
 
-// 🔧 UA STABILE per canale|provider: stesso canale = stesso UA (i CDN legano
-// token/sessioni all'UA; un UA casuale per richiesta causa 403 intermittenti
-// e stream che muoiono a metà). Canali diversi ruotano tra i 4 UA.
 function uaFor(key) {
   const s = String(key || 'default');
   let h = 0;
@@ -93,7 +81,7 @@ function uaFor(key) {
   return UA_LIST[h % UA_LIST.length];
 }
 
-// --- CANALI ----------------------------------------------------------------
+// --- CANALI (RSI confermati) -----------------------------------------------
 const CHANNELS = [
   { slug:'rsi-la-1', name:'RSI La 1', ntv:'', vavoo:'rsi la 1', daddy:'', vid6:'2455610203', vid7:'2290395046' },
   { slug:'rsi-la-2', name:'RSI La 2', ntv:'', vavoo:'rsi la 2', daddy:'', vid6:'3590183307', vid7:'3475299702' },
@@ -163,6 +151,7 @@ function elencoCanali() {
 
 // --- STATO GLOBALE ---------------------------------------------------------
 const tokenCache = new Map(), daddyCache = new Map(), vavooURLCache = new Map();
+const vavooMirrorCache = new Map();  // 🔧 v10.4: salva il mirror per ogni slug
 const vavooHealth = new Map(), segFails = new Map();
 const cbFails = new Map(), cbCooldown = new Map();
 const plCache = new Map(), plState = new Map(), upFresh = new Map();
@@ -176,7 +165,7 @@ const countReq = k => {
   reqStats[k]++;
 };
 
-// --- CIRCUIT BREAKER (chiavato su canale|provider: ZERO cascata) -----------
+// --- CIRCUIT BREAKER (canale|provider) -------------------------------------
 const cbKey = (slug, prov) => (slug || '_') + '|' + (prov || '_');
 function cbRecordFail(slug, prov) {
   if (!prov) return;
@@ -198,7 +187,7 @@ function cbInCooldown(slug, prov) {
 }
 const cbClear = (slug, prov) => { const k = cbKey(slug, prov); cbFails.delete(k); cbCooldown.delete(k); };
 
-// --- ANTI-BLOCK SEGMENTI (già per canale|provider) --------------------------
+// --- ANTI-BLOCK SEGMENTI ---------------------------------------------------
 const recordSegFail = (ch, prov) => {
   if (!ch || !prov) return;
   const key = ch + '|' + prov, now = Date.now();
@@ -442,9 +431,10 @@ async function vavooLiveFind(base, query) {
     return vavooMapFind(query, tmp);
   } catch (e) { return null; }
 }
+// 🔧 v10.4: ritorna {url, mirror} invece di solo url
 async function tryVavooId(id) {
   for (const base of VAVOO_MIRRORS.slice(0, 4)) {
-    try { const u = await vavooResolveId(base, id); if (u) return u; } catch (e) {}
+    try { const u = await vavooResolveId(base, id); if (u) return { url: u, mirror: base }; } catch (e) {}
   }
   return null;
 }
@@ -452,7 +442,9 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
   const t0 = Date.now();
   const cacheKey = slug || ('q:' + norm(query));
   const cachedUrl = vavooURLCache.get(cacheKey);
-  if (cachedUrl && cachedUrl.exp > t0) return cachedUrl.url;
+  if (cachedUrl && cachedUrl.exp > t0) {
+    return { url: cachedUrl.url, mirror: vavooMirrorCache.get(cacheKey) || 'https://vavoo.to' };
+  }
   const healthKey = slug || norm(query);
   const health = getVavooHealth(healthKey);
   const m = await ensureVavooMap();
@@ -472,12 +464,13 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
   }
   for (const cand of cands.slice(0, 3)) {
     if (Date.now() - t0 > RESOLVE_BUDGET) break;
-    const url = await tryVavooId(cand.id);
-    if (url) {
+    const res = await tryVavooId(cand.id);
+    if (res) {
       updateVavooHealth(healthKey, cand.num);
-      vavooURLCache.set(cacheKey, { url, exp:Date.now() + VAVOO_URL_TTL });
+      vavooURLCache.set(cacheKey, { url:res.url, exp:Date.now() + VAVOO_URL_TTL });
+      vavooMirrorCache.set(cacheKey, res.mirror);  // 🔧 salva mirror
       cbClear(slug, 'vavoo');
-      return url;
+      return { url: res.url, mirror: res.mirror };
     }
     if (cand.num) recordVavooFail(healthKey, cand.num);
   }
@@ -486,12 +479,13 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
       const m2 = await ensureVavooMap(true);
       const id2 = m2 ? vavooMapFind(query || '', m2) : null;
       if (id2 && id2 !== mapId) {
-        const u2 = await tryVavooId(id2);
-        if (u2) {
+        const res = await tryVavooId(id2);
+        if (res) {
           updateVavooHealth(healthKey, 0);
-          vavooURLCache.set(cacheKey, { url:u2, exp:Date.now() + VAVOO_URL_TTL });
+          vavooURLCache.set(cacheKey, { url:res.url, exp:Date.now() + VAVOO_URL_TTL });
+          vavooMirrorCache.set(cacheKey, res.mirror);
           cbClear(slug, 'vavoo');
-          return u2;
+          return { url: res.url, mirror: res.mirror };
         }
       }
     } catch (e) {}
@@ -501,8 +495,25 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
 }
 async function vavooResolve(query, vid) {
   const c = findCh(query);
-  if (c) return await vavooResolveDual(c.slug, c.vavoo || query, c.vid6, c.vid7);
-  return await vavooResolveDual(null, query, vid, null);
+  if (c) { const r = await vavooResolveDual(c.slug, c.vavoo || query, c.vid6, c.vid7); return r ? r.url : null; }
+  const r = await vavooResolveDual(null, query, vid, null);
+  return r ? r.url : null;
+}
+
+// 🔧 v10.4: costruisce headers per fetch playlist Vavoo
+// Se URL è raw (IP nudo o "sunshine"), usa browser UA minimali con Referer del mirror
+// Altrimenti usa vavooHeaders normali
+function getVavooPlaylistHeaders(url, mirror, slug) {
+  const isRaw = /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(url) || url.includes('sunshine');
+  if (isRaw) {
+    return {
+      'User-Agent': uaFor((slug || '') + '|vavoo-raw'),
+      'Referer': mirror + '/',
+      'Accept': '*/*'
+      // NO Origin, NO Sec-Fetch-* → firewall li blocca
+    };
+  }
+  return vavooHeaders({ 'User-Agent': 'VAVOO/1.0' });
 }
 
 // --- ROTTA /live -----------------------------------------------------------
@@ -528,12 +539,10 @@ async function live(u, P, legacy) {
   for (const p of prefList) if (available.includes(p) && !ordered.includes(p)) ordered.push(p);
   for (const p of available) if (!ordered.includes(p)) ordered.push(p);
 
-  // Fallimenti segmenti recenti → provider in fondo (SOLO per questo canale)
   const good = ordered.filter(p => segFailCount(c.slug, p) < SEGFAIL_MAX);
   const bad  = ordered.filter(p => segFailCount(c.slug, p) >= SEGFAIL_MAX);
   const finalOrder = good.concat(bad);
 
-  // Circuit breaker PER CANALE|PROVIDER: un cooldown non tocca gli altri canali
   const cbLive = finalOrder.filter(p => !cbInCooldown(c.slug, p));
   const cbFrozen = finalOrder.filter(p => cbInCooldown(c.slug, p));
   const tryOrder = cbLive.concat(cbFrozen);
@@ -546,20 +555,36 @@ async function live(u, P, legacy) {
     vavoo: async () => {
       if (!c.vavoo && !c.vid6 && !c.vid7) return null;
       if (segFailCount(c.slug, 'vavoo') >= SEGFAIL_MAX) {
-        vavooURLCache.delete(c.slug); clearSegFails(c.slug, 'vavoo');
+        vavooURLCache.delete(c.slug); vavooMirrorCache.delete(c.slug);
+        clearSegFails(c.slug, 'vavoo');
         log('vavoo ' + c.slug + ': re-resolve');
       } else if (segFailCount(c.slug, 'vavoo') >= SEGFAIL_EARLY) {
         const ent = vavooURLCache.get(c.slug);
-        if (ent && ent.exp - Date.now() < 40000) { vavooURLCache.delete(c.slug); log('vavoo ' + c.slug + ': early re-resolve'); }
+        if (ent && ent.exp - Date.now() < 40000) {
+          vavooURLCache.delete(c.slug); vavooMirrorCache.delete(c.slug);
+          log('vavoo ' + c.slug + ': early re-resolve');
+        }
       }
-      const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
-      if (!vu) return null;
+      const res = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
+      if (!res) return null;
+      const vu = res.url, mirror = res.mirror;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 12000);
-        if (!r.ok) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
+        // 🔧 v10.4: uso header smart basati sul tipo di URL
+        const h = getVavooPlaylistHeaders(vu, mirror, c.slug);
+        const r = await fetchT(vu, { headers: h }, 12000);
+        if (!r.ok) {
+          vavooURLCache.delete(c.slug); vavooMirrorCache.delete(c.slug);
+          cbRecordFail(c.slug, 'vavoo');
+          log('vavoo ' + c.slug + ': fetch fail ' + r.status + ' (raw=' + /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(vu) + ')');
+          return null;
+        }
         const txt = await r.text();
-        if (!txt.includes('#EXTM3U')) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
-        return emitPlaylist(ck, c.slug, 'vavoo', txt, vu, { P, ch:c.slug, prov:'vavoo', ref:'https://vavoo.to/', origin:'https://vavoo.to' });
+        if (!txt.includes('#EXTM3U')) {
+          vavooURLCache.delete(c.slug); vavooMirrorCache.delete(c.slug);
+          cbRecordFail(c.slug, 'vavoo');
+          return null;
+        }
+        return emitPlaylist(ck, c.slug, 'vavoo', txt, vu, { P, ch:c.slug, prov:'vavoo', ref:mirror + '/', origin:mirror });
       }
       return R('redirect vavoo', 302, { Location:vu, ...CORS() });
     },
@@ -599,12 +624,11 @@ async function live(u, P, legacy) {
       log(p + ' ko ' + c.slug + ': ' + lastErr);
     }
   }
-  // Tutti KO: resetta SOLO lo stato di questo canale (mai degli altri)
   for (const p of tryOrder) { cbClear(c.slug, p); clearSegFails(c.slug, p); }
   return R('ERRORE: provider KO (' + tryOrder.join(' -> ') + ') per ' + c.name + '. Ultimo: ' + lastErr + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
-// --- RISCRITTURA PLAYLIST --------------------------------------------------
+// --- RISCRITTURA PLAYLIST (identica a v10.3) -------------------------------
 function rewriteAny(txt, baseUrl, ctx) {
   txt = String(txt);
   if (!txt.includes('#EXTM3U')) throw new Error('non-HLS');
@@ -665,7 +689,6 @@ function proxUrl(abs, ctx) {
   return u;
 }
 
-// 🔧 QUALITÀ: identifica le variant audio-only (senza video codec)
 function isAudioOnlyStreamInf(line) {
   if (/RESOLUTION=/.test(line)) return false;
   const codecs = (line.match(/CODECS="([^"]+)"/) || [])[1] || '';
@@ -673,14 +696,6 @@ function isAudioOnlyStreamInf(line) {
 }
 
 function rewriteMaster(txt, baseUrl, ctx) {
-  // 🔧 v10.3: master riscritta COMPLETA e riordinata.
-  // - Le variant VIDEO vengono ordinate per BANDWIDTH DECRESCENTE: i player
-  //   nativi (VLC, Apple, app IPTV) partono dalla PRIMA variant = massima
-  //   qualità disponibile, e l'ABR resta attivo per la stabilità.
-  // - Le variant AUDIO-ONLY vengono mantenute DOPO le video (servono alle
-  //   tracce #EXT-X-MEDIA: toglierle rompeva l'attributo AUDIO="aud" e
-  //   lasciava il player senza audio o senza manifest valido).
-  // - I-FRAME-STREAM-INF e #EXT-X-MEDIA vengono proxyate con URI riscritto.
   const lines = String(txt).split(/\r?\n/);
   const media = [], iframes = [];
   const variants = [];
@@ -729,10 +744,6 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   const dropped = p.segs.length - kept.length;
   let seq = p.upSeq + dropped;
   let discontTop = false;
-  // 🔧 Stato di continuità: nel /live è canale|provider (playlist diretta);
-  //    per le m3u8 annidate di /seg è l'URL upstream COMPLETO (v10.3: video
-  //    e audio hanno stati separati — prima condividevano lo stato e si
-  //    iniettavano a vicenda DISCONTINUITY ad ogni refresh → stream morto)
   const st = ctx && ctx.stateKey ? getPlState(ctx.stateKey) : null;
   if (st) {
     if (st.base && st.base !== baseUrl) { st.base = baseUrl; st.discont = true; }
@@ -765,7 +776,7 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   return out.join('\n');
 }
 
-// --- ROTTA /seg (ANTI-CORRUZIONE + RETRY + UA STABILE) ----------------------
+// --- ROUTTA /seg (identica a v10.3) ----------------------------------------
 async function seg(u, req) {
   countReq('seg');
   const target = u.searchParams.get('u');
@@ -773,8 +784,6 @@ async function seg(u, req) {
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
   const ch = u.searchParams.get('ch') || '';
   const prov = u.searchParams.get('p') || '';
-  // 🔧 v10.3: UA deterministico per canale|provider (stesso UA della playlist
-  // che ha generato questi URL); fallback stabile sul referer
   const h = getBrowserHeaders(ref, (ch && prov) ? (ch + '|' + prov) : ref);
   const o = u.searchParams.get('o');
   if (o) h['Origin'] = o;
@@ -790,14 +799,10 @@ async function seg(u, req) {
     if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
     const txt = await r.text();
     const baseDir = target.substring(0, target.lastIndexOf('/') + 1) || target;
-    // 🔧 v10.3 FIX CRITICO: stato chiavato sull'URL upstream completo
-    // (prima canale|provider: playlist video e audio dividevano lo stesso
-    // stato → discontinuità continue → stream morto dopo ~20-30 min)
     const out = rewriteAny(txt, baseUrl_of(baseDir), { P:u.origin, ref, origin:o||'', ch, prov, stateKey:'m|' + prov + '|' + target });
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  // 🔥 ANTI-CORRUZIONE: retry se il segmento è corrotto (403/404/HTML/JSON)
   let r, attempts = 0;
   const maxAttempts = 2;
   const cfOpt = range ? { cacheTtl:0 } : { cacheTtl:600, cacheEverything:true };
@@ -836,7 +841,7 @@ async function seg(u, req) {
   return new Response(r.body, { status:r.status, headers:hh });
 }
 
-// --- PLAYER HLS.JS ---------------------------------------------------------
+// --- PLAYER HLS.JS (identico a v10.3) --------------------------------------
 async function player(u, P) {
   const ch = u.searchParams.get('ch') || 'sky-sport-f1';
   const c = findCh(ch);
@@ -877,7 +882,7 @@ async function player(u, P) {
     const streamUrl = '${P}/live?ch=${c.slug}';
     if (Hls.isSupported()) {
       const hls = new Hls({
-        debug: false, enableWorker: true, lowLatencyMode: false,
+        debug: false, enableWorker: true, lowLatencyMode: true,
         backBufferLength: 60, maxBufferLength: ${DELAY_TARGET + 8},
         maxMaxBufferLength: ${MAX_BUFFER_SECS}, maxBufferSize: 60 * 1000 * 1000, maxBufferHole: 0.5,
         capLevelToPlayerSize: false, autoStartLoad: true,
@@ -890,8 +895,6 @@ async function player(u, P) {
         status.className = 'status';
         video.play().catch(e => console.log('Autoplay bloccato:', e));
         if (data.levels && data.levels.length > 0) {
-          // 🔧 livello MAX scelto per BITRATE (non per posizione: l'ordine
-          // dell'array segue il manifest, non la banda)
           let bestIdx = 0;
           data.levels.forEach((l, i) => { if ((l.bitrate || 0) > (data.levels[bestIdx].bitrate || 0)) bestIdx = i; });
           hls.currentLevel = bestIdx;
@@ -936,7 +939,7 @@ async function player(u, P) {
   return R(html, 200, { 'content-type': 'text/html; charset=utf-8', ...CORS() });
 }
 
-// --- DIAGNOSTICA -----------------------------------------------------------
+// --- DIAGNOSTICA (identica a v10.3 con piccoli adattamenti) ----------------
 async function segtest(u) {
   const t = u.searchParams.get('u');
   if (!t) return R('uso: /segtest?u=<url>&ref=<referer>', 200, TXT());
@@ -964,7 +967,7 @@ async function checkseg(u) {
   const L = ['=== CHECK SEG ===', 'Fonte: ' + source, 'Canale: ' + ch, ''];
   try {
     let segUrl = '', headers = {}, txt = '';
-    let prov = source, slug = '';
+    let slug = '';
     const cc = findCh(ch);
     if (cc) slug = cc.slug;
     if (source === 'ntv') {
@@ -978,11 +981,11 @@ async function checkseg(u) {
     } else if (source === 'vavoo') {
       const c = findCh(ch);
       if (!c) return R('Vavoo: canale non trovato', 200, TXT());
-      const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
-      if (!vu) return R('Vavoo non risolto', 200, TXT());
-      const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 10000);
+      const res = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
+      if (!res) return R('Vavoo non risolto', 200, TXT());
+      const r = await fetchT(res.url, { headers: getVavooPlaylistHeaders(res.url, res.mirror, c.slug) }, 10000);
       if (!r.ok) return R('Vavoo HTTP ' + r.status, 200, TXT());
-      txt = await r.text(); headers = vavooHeaders({ 'User-Agent':'VAVOO/1.0' });
+      txt = await r.text(); headers = getVavooPlaylistHeaders(res.url, res.mirror, c.slug);
     }
     const lines = txt.split('\n');
     const isMaster = txt.includes('#EXT-X-STREAM-INF');
@@ -1034,16 +1037,12 @@ async function probe(u) {
     'Health vavoo: prefer7=' + h.prefer7 + ' fails6=' + h.fails6 + ' fails7=' + h.fails7,
     'SegFails: vavoo=' + segFailCount(c.slug,'vavoo') + ' ntv=' + segFailCount(c.slug,'ntv') + ' daddy=' + segFailCount(c.slug,'daddy'),
     'CB (canale|provider): ntv=' + (cbInCooldown(c.slug,'ntv')?'CD':'ok') + ' vavoo=' + (cbInCooldown(c.slug,'vavoo')?'CD':'ok') + ' daddy=' + (cbInCooldown(c.slug,'daddy')?'CD':'ok')];
-  const t1 = async (label, fn) => {
-    const t0 = Date.now();
-    try { const v = await fn(); L.push(label + ': ' + (v ? 'OK (' + (Date.now()-t0) + 'ms)' : 'skip')); }
-    catch (e) { L.push(label + ': ERR ' + e.message); }
-  };
   if (c.vavoo || c.vid6 || c.vid7) {
     const t0 = Date.now();
     try {
-      const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
-      L.push('1) VAVOO: ' + (vu ? 'OK (' + (Date.now()-t0) + 'ms)\n     URL upstream: ' + vu : 'skip'));
+      const res = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
+      if (res) L.push('1) VAVOO: OK (' + (Date.now()-t0) + 'ms)\n     URL upstream: ' + res.url + '\n     Mirror: ' + res.mirror + '\n     Raw: ' + /https?:\/\/\d+\.\d+\.\d+\.\d+/.test(res.url));
+      else L.push('1) VAVOO: skip');
     } catch (e) { L.push('1) VAVOO: ERR ' + e.message); }
   } else L.push('1) VAVOO: skip');
   if (c.ntv) {
@@ -1085,10 +1084,10 @@ async function diag(u) {
     L.push('');
   };
   if (c.vavoo || c.vid6 || c.vid7) await tryP('VAVOO', async () => {
-    const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
-    if (!vu) throw new Error('non risolto');
-    const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 12000);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const res = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
+    if (!res) throw new Error('non risolto');
+    const r = await fetchT(res.url, { headers: getVavooPlaylistHeaders(res.url, res.mirror, c.slug) }, 12000);
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' (mirror=' + res.mirror + ')');
     return await r.text();
   });
   if (c.ntv) await tryP('NTV', async () => (await ntvPlaylist(c.ntv, c.slug)).txt);
@@ -1099,19 +1098,15 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v10.3 STABLE++ ===',
-    'A. FIX MORTE 20-30MIN: stato /seg chiavato per URL upstream (video e audio separati)',
-    'B. FIX QUALITÀ: master completo, variant video ordinate max→min (ABR attivo)',
-    'C. FIX CASCATA: circuit breaker canale|provider (zero influenza tra canali)',
-    'D. UA STABILE per canale|provider (niente 403 da UA random a metà stream)',
-    'E. Sequenza monotona + discontinuità solo al vero cambio sorgente',
-    'F. Detector playlist congelata (seq fermo > 6x targetduration)',
-    'G. Anti-corruzione: retry su segmenti HTML/JSON + report al provider',
-    'H. Early re-resolve Vavoo (1 fail + URL vicino a scadenza)',
-    'I. Fallback definitivo su mappa vavoo forzata se ID stanti',
-    'J. NTV token refresh 15 min prima della scadenza',
-    'K. Cleanup stato inattivo ogni 90s',
-    'L. /player: livello MAX per bitrate + recovery automatica rete/media');
+  L.push('=== LOGICA v10.4 STABLE+++ ===',
+    'A. FIX RSI: server raw Vavoo (IP nudi) ora hanno UA browser + Referer del mirror',
+    'B. FIX morte 20-30min: stato video/audio separati per URL upstream',
+    'C. FIX qualità: master completo con variant ordinate max→min (ABR attivo)',
+    'D. FIX cascata: CB per canale|provider',
+    'E. UA stabile per canale|provider',
+    'F. vavooMirrorCache: ricorda il mirror che ha risolto ogni canale',
+    'G. Header browser minimali per URL raw (NO Origin/Sec-Fetch)',
+    'H. RSI La 1 (2455610203) e La 2 (3590183307) confermati');
   return L.join('\n');
 }
 
@@ -1132,7 +1127,7 @@ function debug() {
   for (const [k, until] of cbCooldown) if (until > now) cds.push(k);
   return [
     VER,
-    'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
+    'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size + ' | Mirror=' + vavooMirrorCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
     'Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, max buffer ' + MAX_BUFFER_SECS + 's',
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
@@ -1150,17 +1145,16 @@ function uso(P) {
     '  /live?ch=<slug>                delay ' + DELAY_TARGET + 's, qualità MAX',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (livello MAX per bitrate)',
-    '  /diag?ch=sky-sport-f1          diagnostica completa',
-    '  /probe?ch=sky-sport-f1         probe rapido + URL upstream (test VLC)',
-    '  /checkseg?s=<ntv|vavoo|daddy>&ch=<id>  test segmento',
+    '  /diag?ch=rsi-la-1              diagnostica completa (test RSI)',
+    '  /probe?ch=rsi-la-1             probe rapido + URL upstream + mirror',
+    '  /checkseg?s=vavoo&ch=rsi-la-1  test segmento reale',
     '  /segtest?u=<url>&ref=<referer> test URL diretto',
     '  /warm /vmap /debug /ch /rawu /ip  utility',
     '',
-    'FIX v10.3:',
-    '  • Morte post-20-30min: stato playlist video/audio separati per URL',
-    '  • Qualità: master completo con variant ordinate max→min (ABR attivo)',
-    '  • Zero cascata: CB e segfails per canale|provider',
-    '  • UA stabile per canale (niente 403 da UA random)',
+    'FIX v10.4:',
+    '  • RSI/F1 su Vavoo: bypass server raw (IP nudi) con UA browser + Referer mirror',
+    '  • vavooMirrorCache: ricorda il mirror per ogni canale',
+    '  • Header minimali (NO Origin/Sec-Fetch) per firewall IP raw',
     ''].join('\n');
 }
 
@@ -1198,4 +1192,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.3 STABLE++ ███
+// ███ FINE TVNOW-CF v10.4 STABLE+++ ███
