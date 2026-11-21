@@ -1,4 +1,41 @@
 // ============================================================================
+// TVNOW-CF v9.2 — FIX AUDIO-ONLY + DELAY 10s + ANTI-BLOCK PROATTIVO
+//
+// NOVITÀ rispetto alla v9.1:
+// 12. FIX DEFINITIVO "SOLO AUDIO": #EXT-X-VERSION non è più hard-coded a 3.
+//     v9.1 forzava VERSION:3 sempre → su stream fMP4/CMAF (con #EXT-X-MAP)
+//     il player strict (iOS/Safari/Smart TV) scarta la track video perché la
+//     init segment richiede VERSION 6+. L'audio MPEG-TS passa lo stesso →
+//     audio sì, video nero. Ora la VERSION viene letta da upstream e alzata
+//     a 6 quando è presente #EXT-X-MAP. Questo è il bug reale di tutti i
+//     canali HD di NTV/DADDY che davano schermo nero.
+// 13. FILTRO VARIANT SOLO-AUDIO: le #EXT-X-STREAM-INF senza RESOLUTION= vengono
+//     rimosse dalla master. Certi player le pescano per primo (bandwidth low)
+//     e fermano il video. Tengono solo variant con video.
+// 14. RANGE HEADER FORWARD: il Range: bytes=... del player (iOS/Safari) ora
+//     viene forwardato a upstream → 206 partial content, niente più stalli
+//     su segmenti fMP4.
+// 15. DELAY ABBASSATO a 10s (target) / 8s (min), PREF_SEGS 2: era 16s/12s/3.
+//     Sotto 8s il buffer è troppo sottile, 10s è il sweet spot per HLS live.
+// 16. ANTI-BLOCK PROATTIVO: refresh token NTV con margine 5 min (era 15),
+//     TTL cache URL vavoo 75s (era 120), early re-resolve quando segFails>=1
+//     E URL scade in <30s. Il 30-min death era causato da URL firmati che
+//     morivano mentre il player aveva ancora la playlist cached.
+// 17. HTML DETECTION su 200: alcune CDN rispondono 200 + text/html invece di
+//     4xx. /seg ora rileva content-type text/html come fallimento e ritenta.
+// 18. CLEANUP STATO STALE: upFresh / plState / vavooHealth auto-evict dopo
+//     10 min di inattività → niente memory leak tra cold start.
+//
+// ENDPOINT UTILI PER DIAGNOSI:
+//   /probe?ch=sky-sport-f1            stato rapido dei 3 provider
+//   /diag?ch=sky-sport-f1             diagnostica completa
+//   /checkseg?s=vavoo&ch=sky-sport-f1 verifica byte reali di un segmento
+//   /segtest?u=<url>&ref=<referer>   test URL diretto senza modifiche
+//   /debug                            stato interno, segfail, log
+//
+// ----------------------------------------------------------------------------
+// STORIA PRECEDENTE (v8.9 → v9.1):
+// ============================================================================
 // TVNOW-CF v9.1 — AUTO-HEAL + DELAY RIDOTTO + FIX SCHERMO NERO + FIX SOLO-AUDIO
 //
 // NOVITÀ rispetto alla v8.9:
@@ -53,7 +90,7 @@ export default {
       if (path === '/ntv') return await live(u, P, 'ntv');
       if (path === '/vavoo') return await live(u, P, 'vavoo');
       if (path === '/daddy') return await live(u, P, 'daddy');
-      if (path === '/seg') return await seg(u);
+      if (path === '/seg') return await seg(u, req);
       if (path === '/warm') return await warm();
       if (path === '/rawu') return await rawu(u);
       if (path === '/vmap') return R(await vmap(), 200, TXT());
@@ -79,20 +116,28 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// ⏱ DELAY: ridotto. 16s è il minimo prudente per HLS con segmenti ~2s:
-// sotto i 12s il player resta senza buffer e iniza a "saltare".
+// ⏱ DELAY v9.2: 10s target / 8s min / PREF_SEGS 2. Sotto 8s il buffer è
+// troppo sottile e il player inizia a saltare. 10s è il minimo stabile
+// per HLS live con segmenti da 2s.
 // ---------------------------------------------------------------------------
-const DELAY_TARGET  = 16;
-const DELAY_MIN     = 12;
-const PREF_SEGS     = 3;
+const DELAY_TARGET  = 10;
+const DELAY_MIN     = 8;
+const PREF_SEGS     = 2;
 const MIN_SEGS      = 2;
 
 // 🔧 AUTO-HEAL
 const STALE_FACTOR   = 4;                 // TARGETDURATION x 4 senza nuovi segs = provider morto
 const SEGFAIL_TTL    = 3 * 60 * 1000;     // memoria fallimenti segmenti
 const SEGFAIL_MAX    = 2;                 // fallimenti prima di de-priorizzare un provider
-const PL_CACHE_TTL   = 2500;              // cache risposta playlist
-const RESOLVE_BUDGET = 12000;             // max ms per risolvere un provider vavoo
+const SEGFAIL_EARLY  = 1;                 // v9.2: early re-resolve anche con 1 fail se URL scade presto
+const PL_CACHE_TTL   = 1500;              // v9.2: cache playlist più corta (era 2500) per delay minore
+const RESOLVE_BUDGET = 10000;             // v9.2: budget più stretto (era 12000)
+const STATE_STALE_TTL = 10 * 60 * 1000;   // v9.2: cleanup stato dopo 10 min di inattività
+
+// v9.2: refresh token NTV proattivo (margine 5 min invece di 15)
+const NTV_REFRESH_MARGIN = 300;           // secondi prima della scadenza → refresh
+// v9.2: cache URL vavoo più corta per evitare 30-min death
+const VAVOO_URL_TTL_V92 = 75 * 1000;      // 75s invece di 120s
 
 // 🔥 DUAL-ID: ogni canale ha vid6 (precedente priorità) e vid7 (fallback).
 // Nella v9.0 la mappa live ha SEMPRE priorità: gli ID hard-coded sono solo
@@ -215,6 +260,26 @@ function clearSegFails(ch, prov) {
   if (ch && prov) segFails.delete(ch + '|' + prov);
 }
 
+// v9.2: cleanup stato stale per evitare memory leak su isolati Cloudflare
+// long-lived. Ogni ~10 min le entry non toccate vengono evict. Richiamato
+// all'inizio di /live (cheap: O(n) sulle Map, n piccolo).
+let lastCleanup = 0;
+function cleanupStaleState() {
+  const now = Date.now();
+  if (now - lastCleanup < 60 * 1000) return; // max 1/min
+  lastCleanup = now;
+  const cutoff = now - STATE_STALE_TTL;
+  for (const [k, v] of plState) {
+    if (!v.lastT || v.lastT < cutoff) plState.delete(k);
+  }
+  for (const [k, v] of upFresh) {
+    if (!v.t || v.t < cutoff) upFresh.delete(k);
+  }
+  for (const [k, h] of vavooHealth) {
+    if (!h.t || h.t < cutoff) vavooHealth.delete(k);
+  }
+}
+
 // ============================================================================
 // 🔧 STATO PLAYLIST per canale: continuità sequenza + rilevamento congelamento
 // ============================================================================
@@ -224,7 +289,7 @@ const upFresh = new Map();  // 'slug|prov' -> { seq, t }
 
 function getPlState(key) {
   let st = plState.get(key);
-  if (!st) { st = { lastSeq: -1, lastUpSeq: -1, base: '', discont: false }; plState.set(key, st); }
+  if (!st) { st = { lastSeq: -1, lastUpSeq: -1, base: '', discont: false, t: Date.now() }; plState.set(key, st); }
   return st;
 }
 
@@ -265,8 +330,11 @@ let ntvStats = { resolve: 0, refresh: 0, err: 0 };
 const MAX_TOKEN_CACHE = 50;
 
 async function ntvToken(id) {
+  // v9.2: refresh proattivo con margine 5 min (NTV_REFRESH_MARGIN, era 900=15min).
+  // Margine largo causava il refresh ogni ~30min durante il playback → salto visibile.
+  // Ora il refresh avviene molto prima della scadenza reale, in modo invisibile.
   const now = Date.now() / 1000; const c = tokenCache.get(id);
-  if (c && c.exp - now > 900) return c;
+  if (c && c.exp - now > NTV_REFRESH_MARGIN) return c;
   if (tokenCache.size > MAX_TOKEN_CACHE) {
     const keys = Array.from(tokenCache.keys());
     for (let i = 0; i < keys.length - MAX_TOKEN_CACHE; i++) tokenCache.delete(keys[i]);
@@ -425,9 +493,9 @@ async function vavooLiveFind(base, query) {
   } catch (e) { return null; }
 }
 
-// 🔧 Cache URL risolte Vavoo (2 min)
+// 🔧 Cache URL risolte Vavoo (v9.2: 75s invece di 120s per evitare 30-min death)
 const vavooURLCache = new Map();
-const VAVOO_URL_TTL = 2 * 60 * 1000;
+const VAVOO_URL_TTL = VAVOO_URL_TTL_V92;
 function vavooDrop(query, vid) { vavooURLCache.delete(vid ? 'v' + vid : 'q:' + norm(query)); }
 
 // 🔧 RISOLUZIONE DUAL con priorità MAPPA LIVE → vid6/vid7 (health check) → ricerca live
@@ -518,6 +586,7 @@ async function vavooResolveRaw(query, vid) {
 // ============================================================================
 async function live(u, P, legacy) {
   countReq('live');
+  cleanupStaleState(); // v9.2: evict stato stale ogni ~1 min
   const q = u.searchParams.get('ch') || u.searchParams.get('c') || '';
   if (!q) return R('uso: /live?ch=<slug|id>\n\n' + elencoCanali(), 200, TXT());
   const c = findCh(q);
@@ -551,6 +620,15 @@ async function live(u, P, legacy) {
         vavooURLCache.delete(c.slug);
         clearSegFails(c.slug, 'vavoo');
         log('vavoo ' + c.slug + ': URL scaduto, re-resolve');
+      } else if (segFailCount(c.slug, 'vavoo') >= SEGFAIL_EARLY) {
+        // v9.2: early re-resolve. Un solo fallimento può essere un preavviso
+        // di token in scadenza: se l'URL cached ha meno di 30s di vita,
+        // forzalo subito invece di aspettare il 2° fail.
+        const ent = vavooURLCache.get(c.slug);
+        if (ent && ent.exp - Date.now() < 30000) {
+          vavooURLCache.delete(c.slug);
+          log('vavoo ' + c.slug + ': early re-resolve (URL <30s vita)');
+        }
       }
       const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
       if (!vu) return null;
@@ -601,7 +679,9 @@ function rewriteAny(txt, baseUrl, ctx) {
 }
 
 function parseMediaPl(txt) {
-  let upSeq = 0, upTarget = 4, map = null, isMaster = false, endlist = false;
+  // v9.2: parse anche VERSION upstream. Hardcodare 3 rompe #EXT-X-MAP
+  // (fMP4/CMAF) sui player strict → audio senza video.
+  let upSeq = 0, upTarget = 4, upVersion = 1, map = null, isMaster = false, endlist = false;
   const segs = [];
   let pending = null, disc = false, brange = null, pdt = null;
   for (const raw of String(txt).split(/\r?\n/)) {
@@ -609,6 +689,7 @@ function parseMediaPl(txt) {
     if (!line) continue;
     if (line.startsWith('#EXT-X-STREAM-INF')) { isMaster = true; break; }
     if (line.startsWith('#EXTM3U')) continue;
+    if (line.startsWith('#EXT-X-VERSION:')) { upVersion = parseInt(line.split(':')[1]) || 1; continue; }
     if (line.startsWith('#EXT-X-TARGETDURATION:')) { upTarget = parseInt(line.split(':')[1]) || 4; continue; }
     if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) { upSeq = parseInt(line.split(':')[1]) || 0; continue; }
     if (line.startsWith('#EXT-X-MAP')) { map = line; continue; }
@@ -629,7 +710,7 @@ function parseMediaPl(txt) {
     if (line.startsWith('#')) continue;
     if (pending) { pending.url = line; segs.push(pending); pending = null; }
   }
-  return { upSeq, upTarget, map, segs, isMaster, endlist };
+  return { upSeq, upTarget, upVersion, map, segs, isMaster, endlist };
 }
 
 function pickWindow(durs) {
@@ -666,8 +747,21 @@ function proxUrl(abs, ctx) {
   return u;
 }
 
+// v9.2: skipVariant è true quando la riga #EXT-X-STREAM-INF corrente è una
+// variante solo-audio (no RESOLUTION= e no codec video). In quel caso la
+// riga URI successiva non viene proxy-ata, così il player non può pescarla.
+function isAudioOnlyStreamInf(line) {
+  if (!/RESOLUTION=/.test(line)) {
+    const codecs = (line.match(/CODECS="([^"]+)"/) || [])[1] || '';
+    // video codec tipici: avc, hevc, hvc, vp9, av1
+    if (!/(avc|hevc|hvc|vp09|av01)/i.test(codecs)) return true;
+  }
+  return false;
+}
+
 function rewriteMaster(txt, baseUrl, ctx) {
   const out = [];
+  let skipNext = false; // v9.2: variant solo-audio da saltare
   for (const raw of String(txt).split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
@@ -679,10 +773,15 @@ function rewriteMaster(txt, baseUrl, ctx) {
       const mu = line.match(/URI="([^"]+)"/);
       if (mu && (line.startsWith('#EXT-X-MEDIA') || line.startsWith('#EXT-X-I-FRAME-STREAM-INF')))
         out.push(line.replace(/URI="[^"]+"/, 'URI="' + proxUrl(absSegUrl(mu[1], baseUrl), ctx) + '"'));
-      else
+      else if (line.startsWith('#EXT-X-STREAM-INF') && isAudioOnlyStreamInf(line)) {
+        // v9.2: salta questa variante solo-audio e la sua riga URI
+        skipNext = true;
+        continue;
+      } else
         out.push(line);
       continue;
     }
+    if (skipNext) { skipNext = false; continue; }
     out.push(proxUrl(absSegUrl(line, baseUrl), ctx));
   }
   return out.join('\n');
@@ -714,12 +813,18 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
     }
     st.lastSeq = seq;
     st.lastUpSeq = p.upSeq;
+    st.t = Date.now(); // v9.2: timestamp per cleanup stale
     if (st.discont && kept.length) { discontTop = true; st.discont = false; }
   }
 
+  // v9.2: VERSION preservata da upstream. Se c'è #EXT-X-MAP (fMP4/CMAF)
+  // serve almeno 6, altrimenti i player strict (iOS/Safari/Smart TV)
+  // scartano la track video e mostrano SOLO AUDIO. Era il bug principale.
+  let version = p.upVersion || 1;
+  if (p.map && version < 6) version = 6;
   const out = [
     '#EXTM3U',
-    '#EXT-X-VERSION:3',
+    '#EXT-X-VERSION:' + version,
     '#EXT-X-TARGETDURATION:' + p.upTarget,
     '#EXT-X-MEDIA-SEQUENCE:' + seq
   ];
@@ -744,15 +849,21 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
 // ============================================================================
 // ROTTA /seg — con retry, report fallimenti e riscrittura m3u8 annidate
 // ============================================================================
-async function seg(u) {
+async function seg(u, req) {
   countReq('seg');
   const target = u.searchParams.get('u'); if (!target) return R('uso: /seg?u=<url>', 200, TXT());
   const ref = u.searchParams.get('ref') || 'https://thedaddy.li/';
   const h = getBrowserHeaders(ref);
   const o = u.searchParams.get('o');
   if (o) h['Origin'] = o;
-  const range = u.searchParams.get('range');
-  if (range) h['Range'] = range;
+  // v9.2: forward Range header del player (iOS/Safari inviano Range: bytes=...
+  // sui segmenti fMP4 per partial content). Se non forwardato, upstream risponde
+  // 200 senza content-range e il player smette di scaricare il video.
+  const rangeParam = u.searchParams.get('range');
+  const playerRange = req && req.headers ? req.headers.get('Range') : null;
+  if (rangeParam) h['Range'] = rangeParam;
+  else if (playerRange) h['Range'] = playerRange;
+  const range = h['Range'] || null;
   const ch = u.searchParams.get('ch') || '';
   const prov = u.searchParams.get('p') || '';
 
@@ -773,21 +884,28 @@ async function seg(u) {
   const cfOpt = range ? { cacheTtl: 0 } : { cacheTtl: 300, cacheEverything: true };
   let r = await fetchT(target, { headers: h, cf: cfOpt }, 15000);
 
+  // v9.2: HTML detection su 200. Alcune CDN rispondono 200 + text/html invece di
+  // 4xx quando il token è scaduto. Tratta come fallimento e ritenta bypass cache.
+  const isHtmlBody = r.ok && /^(text\/html|application\/json)/i.test(r.headers.get('content-type') || '');
+
   // 🔧 ANTI-BLOCCO SEGMENTI: errore upstream (403/404/410/5xx, spesso cache CF
   // con una risposta vecchia) → retry immediato bypassando la cache
-  if (!r.ok && !range) {
+  if ((!r.ok || isHtmlBody) && !range) {
     recordSegFail(ch, prov);
     r = await fetchT(target, { headers: h, cf: { cacheTtl: 0, cacheEverything: false } }, 15000);
-    if (!r.ok) return R('upstream ' + r.status, r.status, TXT());
-  } else if (!r.ok) {
+    const html2 = r.ok && /^(text\/html|application\/json)/i.test(r.headers.get('content-type') || '');
+    if (!r.ok || html2) return R('upstream ' + r.status + (html2 ? ' (html body)' : ''), r.status, TXT());
+  } else if (!r.ok || isHtmlBody) {
     recordSegFail(ch, prov);
-    return R('upstream ' + r.status, r.status, TXT());
+    return R('upstream ' + r.status + (isHtmlBody ? ' (html body)' : ''), r.status, TXT());
   }
 
   const hh = {
     'content-type': r.headers.get('content-type') || 'video/mp2t',
     'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin',
+    'access-control-expose-headers': 'Content-Length, Content-Range, Accept-Ranges',
+    'accept-ranges': 'bytes',
     'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0'
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range'); if (cl) hh['content-length'] = cl; if (cr) hh['content-range'] = cr;
@@ -808,11 +926,11 @@ async function segtest(u) {
     L.push('Dimensione: ' + bytes.length + ' bytes');
     L.push('Primi 16 bytes: ' + Array.from(bytes.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' '));
     if (bytes.length >= 8) {
-      if (bytes[0] === 0x47) L.push('✅ Formato: MPEG-TS - COMPATIBILE');
-      else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') L.push('✅ Formato: fMP4 - COMPATIBILE');
+      if (bytes[0] === 0x47) L.push('OK Formato: MPEG-TS - COMPATIBILE');
+      else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') L.push('OK Formato: fMP4 - COMPATIBILE');
       else {
         const text = String.fromCharCode(...bytes.slice(0, 100));
-        L.push(text.includes('<html') || text.includes('<!DOCTYPE') ? '❌ Formato: HTML - NON È VIDEO' : '❓ Formato: SCONOSCIUTO');
+        L.push(text.includes('<html') || text.includes('<!DOCTYPE') ? 'ERR Formato: HTML - NON È VIDEO' : 'WARN Formato: SCONOSCIUTO');
       }
     }
     return R(L.join('\n'), 200, TXT());
@@ -860,7 +978,7 @@ async function checkseg(u) {
     let isMaster = txt.includes('#EXT-X-STREAM-INF');
 
     if (isMaster) {
-      L.push('⚠️  È una Master Playlist.');
+      L.push('Master Playlist.');
       for(let i=0; i<lines.length; i++) {
         if(!lines[i].startsWith('#') && lines[i].trim().length > 0) {
           segUrl = lines[i].trim();
@@ -878,7 +996,7 @@ async function checkseg(u) {
 
     if (!segUrl) return R('Nessun URL trovato nella playlist', 200, TXT());
     if (!segUrl.startsWith('http')) {
-        L.push('⚠️  URL relativo trovato.');
+        L.push('URL relativo trovato.');
         return R(L.join('\n'), 200, TXT());
     }
 
@@ -901,15 +1019,15 @@ async function checkseg(u) {
 
     if (bytes.length >= 4) {
       if (bytes[0] === 0x47) {
-        L.push('✅ Formato: MPEG-TS - COMPATIBILE');
+        L.push('OK Formato: MPEG-TS - COMPATIBILE');
       } else if (String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]) === 'ftyp') {
-        L.push('✅ Formato: fMP4 - COMPATIBILE');
+        L.push('OK Formato: fMP4 - COMPATIBILE');
       } else {
         const text = String.fromCharCode(...bytes.slice(0, 100));
         if (text.includes('<html') || text.includes('<!DOCTYPE')) {
-          L.push('❌ Formato: HTML - NON È VIDEO');
+          L.push('ERR Formato: HTML - NON È VIDEO');
         } else {
-          L.push('❓ Formato: SCONOSCIUTO');
+          L.push('WARN Formato: SCONOSCIUTO');
         }
       }
     }
@@ -972,7 +1090,7 @@ async function diag(u) {
   const c = findCh(q);
   if (!c) return 'Canale non trovato: ' + q;
   const h = getVavooHealth(c.slug);
-  const L = ['=== DIAGNOSTICA (v9.0 Auto-Heal) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
+  const L = ['=== DIAGNOSTICA (v9.2 Auto-Heal) ===', 'Canale: ' + c.name + ' (slug: ' + c.slug + ')', ''];
   L.push('Health: prefer7=' + h.prefer7 + ' fails6=' + h.fails6 + ' fails7=' + h.fails7 + ' (TTL=' + VAVOO_HEALTH_TTL/1000 + 's)');
   L.push('Vavoo ID6: ' + (c.vid6 || 'none') + ' | ID7: ' + (c.vid7 || 'none'));
   L.push('SegFails (3 min): vavoo=' + segFailCount(c.slug, 'vavoo') + ' ntv=' + segFailCount(c.slug, 'ntv') + ' daddy=' + segFailCount(c.slug, 'daddy'));
@@ -1004,12 +1122,14 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== LOGICA AUTO-HEAL v9.1 ===');
+  L.push('=== LOGICA AUTO-HEAL v9.2 ===');
   L.push('1. Mappa live vavoo con priorità: ID stanci non bloccano più il canale');
   L.push('2. Segmenti falliti (403/404/HTML) → segnalati e il provider va in fondo');
   L.push('3. Playlist congelata (seq fermo > 4x targetduration) → provider scartato');
   L.push('4. Al failover/change host: discontinuità automatica, lo stream riprende');
-  L.push('5. Tracce audio #EXT-X-MEDIA riscritte (fix solo-audio) + niente _t sugli URL');
+  L.push('5. Tracce audio #EXT-X-MEDIA riscritte + niente _t sugli URL');
+  L.push('6. v9.2: VERSION preservata (auto-upgrade a 6 con #EXT-X-MAP)');
+  L.push('7. v9.2: Range header forward + HTML body detection + early re-resolve');
   return L.join('\n');
 }
 
@@ -1024,7 +1144,7 @@ function playlistStats(txt) {
     + ' | delay ~' + Math.min(plan.sum, DELAY_TARGET).toFixed(0) + 's';
 }
 
-const VER = 'TVNOW-CF v9.1 (Auto-Heal + Delay 16s + Fix Solo-Audio)';
+const VER = 'TVNOW-CF v9.2 (Fix Audio-Only + Delay 10s + Anti-Block Proattivo)';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const logs = [];
 function log(m) { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 40) logs.shift(); }
@@ -1051,7 +1171,7 @@ function debug() {
   return L.join('\n');
 }
 
-function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con auto-heal e delay 16s','  /diag?ch=sky-sport-f1           diagnostica completa','  /probe?ch=sky-sport-f1          probe rapido + URL upstream (test in VLC)','  /checkseg?s=vavoo&ch=sky-sport-f1  test segmento reale','  /segtest?u=<url>&ref=<referer>  test URL diretto senza modifiche','  /warm  /vmap  /debug  /ch  /rawu  /ip',''].join('\n'); }
+function uso(P) { return [VER,'','uso:','  /live?ch=<slug|id>            playlist con auto-heal e delay 10s','  /diag?ch=sky-sport-f1           diagnostica completa','  /probe?ch=sky-sport-f1          probe rapido + URL upstream (test in VLC)','  /checkseg?s=vavoo&ch=sky-sport-f1  test segmento reale','  /segtest?u=<url>&ref=<referer>  test URL diretto senza modifiche','  /warm  /vmap  /debug  /ch  /rawu  /ip',''].join('\n'); }
 function TXT() { return { 'content-type': 'text/plain; charset=utf-8', ...CORS() }; }
 function HLS_NO_CACHE() {
   return { 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0', ...CORS() };
@@ -1070,4 +1190,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v9.0 ███
+// ███ FINE TVNOW-CF v9.2 ███
