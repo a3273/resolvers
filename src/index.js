@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v11.3 — Worker completo con debug, probe, UI + Daddy ottimizzato
+// TVNOW-CF v11.4 — Worker completo con UI root + debug + Daddy ottimizzato
 // ============================================================================
 
 const CHANNELS = [
@@ -54,7 +54,7 @@ let cacheHits = 0;
 const deployTime = Date.now();
 
 // ============================================================================
-// HELPER FUNCTIONS
+// HELPER
 // ============================================================================
 
 function findCh(query) {
@@ -104,7 +104,7 @@ async function resolveVavoo(id) {
 }
 
 // ============================================================================
-// PROVIDER DADDY - Risoluzione m3u8 da thedaddy.li
+// PROVIDER DADDY
 // ============================================================================
 
 async function resolveDaddyM3u8(channelId) {
@@ -147,7 +147,7 @@ async function resolveDaddyM3u8(channelId) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-proxy - m3u8 ottimizzata
+// ENDPOINT /daddy-proxy
 // ============================================================================
 
 async function daddyProxy(u, origin) {
@@ -229,7 +229,7 @@ async function daddyProxy(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-seg - Proxy segmenti
+// ENDPOINT /daddy-seg
 // ============================================================================
 
 async function daddySeg(u) {
@@ -302,7 +302,7 @@ async function daddyPrefetch(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /live - Flusso principale
+// ENDPOINT /live
 // ============================================================================
 
 async function live(req, u) {
@@ -459,7 +459,7 @@ async function stats() {
 // ENDPOINT /channels
 // ============================================================================
 
-async function channels() {
+async function channelsList() {
   return new Response(JSON.stringify(CHANNELS, null, 2), { headers: JSON_H() });
 }
 
@@ -470,14 +470,93 @@ async function channels() {
 async function health() {
   return new Response(JSON.stringify({
     status: 'ok',
-    version: '11.3',
+    version: '11.4',
     channels: CHANNELS.length,
     timestamp: new Date().toISOString()
   }, null, 2), { headers: JSON_H() });
 }
 
 // ============================================================================
-// ROUTER PRINCIPALE
+// UI ROOT - Pagina HTML semplice
+// ============================================================================
+
+function ui(origin) {
+  const channelsHtml = CHANNELS.map(ch => {
+    const badges = [];
+    if (ch.ntv) badges.push('<span class="badge badge-ntv">NTV</span>');
+    if (ch.vavoo) badges.push('<span class="badge badge-vavoo">Vavoo</span>');
+    if (ch.daddy) badges.push('<span class="badge badge-daddy">Daddy</span>');
+    
+    return `
+      <div class="channel">
+        <div class="channel-name">${ch.name}</div>
+        <div class="channel-slug">${ch.slug}</div>
+        <div class="providers">${badges.join('')}</div>
+        <div class="actions">
+          <a href="${origin}/live?ch=${ch.slug}" class="btn btn-play" target="_blank">▶ Play</a>
+          <a href="${origin}/probe?ch=${ch.slug}" class="btn btn-test" target="_blank">🔍 Test</a>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return new Response(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TVNow-CF v11.4</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0a; color: #eee; font: 14px -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
+    h1 { color: #4CAF50; margin-bottom: 6px; }
+    .subtitle { color: #888; margin-bottom: 20px; font-size: 13px; }
+    .nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
+    .nav a { background: #161616; border: 1px solid #333; color: #eee; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 12px; }
+    .nav a:hover { background: #2196F3; border-color: #2196F3; }
+    .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .channel { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 12px; }
+    .channel-name { font-weight: 700; margin-bottom: 4px; }
+    .channel-slug { font-size: 11px; color: #888; margin-bottom: 8px; font-family: monospace; }
+    .providers { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .badge { padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+    .badge-ntv { background: #1a2a4a; color: #6cf; }
+    .badge-vavoo { background: #2a1a4a; color: #c6f; }
+    .badge-daddy { background: #1a4a2a; color: #6f6; }
+    .actions { display: flex; gap: 6px; }
+    .btn { padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 11px; font-weight: 600; }
+    .btn-play { background: #4CAF50; color: #fff; }
+    .btn-play:hover { background: #45a049; }
+    .btn-test { background: #2196F3; color: #fff; }
+    .btn-test:hover { background: #1976D2; }
+    .footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid #333; font-size: 11px; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>📺 TVNow-CF v11.4</h1>
+  <div class="subtitle">Worker streaming con NTV, Vavoo e Daddy ottimizzato</div>
+  
+  <div class="nav">
+    <a href="${origin}/health">🩺 Health</a>
+    <a href="${origin}/stats">📊 Stats</a>
+    <a href="${origin}/channels">📋 Channels JSON</a>
+    <a href="${origin}/daddy-prefetch">⚡ Prefetch</a>
+  </div>
+
+  <h2 style="margin-bottom:12px;">Canali (${CHANNELS.length})</h2>
+  <div class="channels">
+    ${channelsHtml}
+  </div>
+
+  <div class="footer">
+    TVNow-CF v11.4 · ${CHANNELS.length} canali · Daddy ottimizzato con cache + proxy segmenti
+  </div>
+</body>
+</html>`, { headers: HTML() });
+}
+
+// ============================================================================
+// ROUTER
 // ============================================================================
 
 export default {
@@ -487,10 +566,10 @@ export default {
     const path = u.pathname;
     
     try {
-      if (path === '/') return await health();
+      if (path === '/') return ui(u.origin);
       if (path === '/health') return await health();
       if (path === '/live') return await live(req, u);
-      if (path === '/channels') return await channels();
+      if (path === '/channels') return await channelsList();
       if (path === '/stats') return await stats();
       if (path === '/probe') return await probe(u);
       if (path === '/debug') return await debug(u);
