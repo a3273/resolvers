@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.8 — DELAY MINIMO PER PROVIDER + STABILITA' LUNGA + CANALI INDIPENDENTI
+// TVNOW-CF v10.9 — DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
@@ -70,6 +70,22 @@
 //    in background al primo poll di ogni canale (ntv token / vavoo resolve /
 //    daddy edge gia' in cache): quando cambi canale o il provider primario cade,
 //    il fallback e' gia' pronto, non si parte da zero.
+//
+// FIX v10.9 (DELAY 70-80s TORNATO: m3u8 upstream IN CACHE CDN CON URL FISSA!):
+// MISURA REALE sul worker: la playlist NTV (URL identica, token valido) torna
+// MEDIA-SEQUENCE 37034 FISSA per minuti; con un solo parametro _bust in piu'
+// torna 37060 (+26 segmenti ~ 105s piu' fresca). Quindi una cache CDN a monte
+// (chiave = URL) che serve le m3u8 STANTIE: le nostre finestre da
+// 16-28s si applicavano a una playlist gia' vecchia di 1-2 minuti e il ritardo
+// percepito saliva a 70-80s. (Prima Daddy era primario e la sua edge URL non
+// attraversava quella cache; con Daddy edge in 403 i canali cadono su NTV e
+// il problema e' esploso. Il 403 stesso potrebbe essere una risposta finita in cache.)
+// R. ANTI-CACHE CDN SULLE PLAYLIST: OGNI fetch m3u8 upstream usa plBust()
+//    (parametro _b con finestra 2s, allineata al single-flight: N spettatori
+//    nello stesso poll = STESSA URL = 1 sola richiesta) + cf:{cacheTtl:0}
+//    (bypass della cache edge CF sulla risposta). I SEGMENTI NON si toccano:
+//    sono file immutabili, la cache 30s resta il risparmio richieste.
+//    Resolve/token/estrattori dei provider: ZERO modifiche (restano v10.4).
 // ============================================================================
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
@@ -138,7 +154,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 240*1000;
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.8 FINAL';
+const VER = 'TVNOW-CF v10.9 ANTI-CDN-M3U8';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -383,13 +399,25 @@ function segCacheKey(abs) {
 
 // Single-flight + freschezza 4s per le playlist upstream: N viewer / poll
 // ravvicinati sullo stesso stream = UNA sola richiesta all'origine.
+// v10.9 R: ANTI-CACHE CDN. Le m3u8 upstream vengono serve STANTIE da una
+// cache intermedia che fa chiave sull'URL (misurato: seq 37034 fisso per
+// minuti, con _bust diventa 37060). Ogni fetch playlist quindi:
+//  1) aggiunge _b con finestra 2s (stessa URL dentro la finestra -> single-flight
+//     resta valido, N viewer = 1 fetch; URL diversa tra finestre -> sempre fresca)
+//  2) bypassa la cache edge CF (cacheTtl:0) sulla RISPOSTA playlist
+// I segmenti sono file IMMUTABILI: lì le cache 30s/120s sono volute (risparmio richieste).
+const PL_BUST_MS = 2000;
+function plBust(url) {
+  const b = Math.floor(Date.now() / PL_BUST_MS) * PL_BUST_MS;
+  return url + (url.includes('?') ? '&' : '?') + '_b=' + b;
+}
 function fetchUpstreamPl(key, url, headers, timeoutMs) {
   const now = Date.now();
   const e = plFetchCache.get(key);
   if (e && e.txt && now - e.t < PLAYLIST_FRESH_MS) return Promise.resolve(e.txt);
   if (e && e.inflight) return e.inflight;
   const p = (async () => {
-    const r = await fetchT(url, { headers }, timeoutMs);
+    const r = await fetchT(plBust(url), { headers, cf: { cacheTtl: 0, cacheEverything: false } }, timeoutMs);
     const txt = r.ok ? await r.text() : '';
     if (!txt.includes('#EXTM3U')) throw new Error('upstream ' + r.status);
     return txt;
@@ -507,12 +535,12 @@ async function ntvToken(id, slug) {
 }
 async function ntvPlaylist(id, slug) {
   let tk = await ntvToken(id, slug);
-  let r = await fetchT(tk.m3u8, { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv') }, 12000);
+  let r = await fetchT(plBust(tk.m3u8), { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
   let txt = r.ok ? await r.text() : '';
   if (!r.ok || r.status >= 500 || !txt.includes('#EXTM3U')) {
     tokenCache.delete(id); ntvStats.refresh++;
     tk = await ntvToken(id, slug);
-    r = await fetchT(tk.m3u8, { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv') }, 12000);
+    r = await fetchT(plBust(tk.m3u8), { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
     txt = r.ok ? await r.text() : '';
   }
   if (!txt.includes('#EXTM3U')) throw new Error('ntv playlist ' + r.status + ' non-HLS');
@@ -785,7 +813,8 @@ async function live(u, P, legacy) {
       const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 12000);
+        // v10.9 R: playlist vavoo -> bust 2s + bypass cache CF
+        const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
         if (!r.ok) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
         const txt = await r.text();
         if (!txt.includes('#EXTM3U')) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
@@ -818,7 +847,8 @@ async function live(u, P, legacy) {
       if (!du) {
         du = await daddyResolve(c.daddy, c.slug, true);
         if (!du || !/\.m3u8/i.test(du)) return null;
-        const r = await fetchT(du, { headers: dh }, 12000);
+        // v10.9 R: anche la playlist del fallback embed -> bust 2s + bypass CF
+        const r = await fetchT(plBust(du), { headers: dh, cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
         txt = r.ok ? await r.text() : '';
         if (!txt.includes('#EXTM3U')) { daddyCache.delete(c.daddy); cbRecordFail(c.slug, 'daddy'); return null; }
       }
@@ -1230,7 +1260,7 @@ async function checkseg(u) {
     } else if (source === 'daddy') {
       const du = await daddyResolve(ch, slug);
       if (!du) return R('Daddy non risolto', 200, TXT());
-      const r = await fetchT(du, { headers: getBrowserHeaders('https://dembed.st/', slug + '|daddy') }, 10000);
+      const r = await fetchT(plBust(du), { headers: getBrowserHeaders('https://dembed.st/', slug + '|daddy'), cf: { cacheTtl: 0, cacheEverything: false } }, 10000);
       if (!r.ok) return R('Daddy HTTP ' + r.status, 200, TXT());
       txt = await r.text(); headers = getBrowserHeaders('https://dembed.st/', slug + '|daddy');
     } else if (source === 'vavoo') {
@@ -1238,7 +1268,7 @@ async function checkseg(u) {
       if (!c) return R('Vavoo: canale non trovato', 200, TXT());
       const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
       if (!vu) return R('Vavoo non risolto', 200, TXT());
-      const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 10000);
+      const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 10000);
       if (!r.ok) return R('Vavoo HTTP ' + r.status, 200, TXT());
       txt = await r.text(); headers = vavooHeaders({ 'User-Agent':'VAVOO/1.0' });
     }
@@ -1340,7 +1370,7 @@ async function diag(u) {
   if (c.vavoo || c.vid6 || c.vid7) await tryP('VAVOO', async () => {
     const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
     if (!vu) throw new Error('non risolto');
-    const r = await fetchT(vu, { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }) }, 12000);
+    const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -1348,7 +1378,7 @@ async function diag(u) {
   if (c.daddy) await tryP('DADDY', async () => {
     const du = await daddyResolve(c.daddy, c.slug);
     if (!du) throw new Error('non risolto');
-    const r = await fetchT(du, { headers: getBrowserHeaders('https://dembed.st/', c.slug + '|daddy') }, 12000);
+    const r = await fetchT(plBust(du), { headers: getBrowserHeaders('https://dembed.st/', c.slug + '|daddy'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -1359,7 +1389,8 @@ async function diag(u) {
     'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg x 17s + trim EXT-X-START)',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
-    'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).');
+    'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
+    'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.');
   L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
     'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
     'catena embed solo come fallback dopo un edge-fail (memo 60s).',
@@ -1392,7 +1423,7 @@ function debug() {
     VER,
     'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
-    'Delay/provider: ntv ' + PROV_DELAY.ntv.target + 's | daddy ' + PROV_DELAY.daddy.target + 's | vavoo ' + PROV_DELAY.vavoo.target + 's | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
+    'Delay/provider: ntv ' + PROV_DELAY.ntv.target + 's | daddy ' + PROV_DELAY.daddy.target + 's | vavoo ' + PROV_DELAY.vavoo.target + 's | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
     'CB cooldown attivi: ' + (cds.join(', ') || 'nessuno'),
     'SegFails: ' + (sf.join(', ') || 'nessuno'),
@@ -1448,8 +1479,10 @@ async function rawu(u) {
   if (!t) return R('uso: /rawu?u=<url>', 200, TXT());
   const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/', 'rawu');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
+  // v10.9: diagnostici RAW senza cache: m3u8 -> bust + bypass CF (vede il vero origin)
+  const tgt = /\.m3u8(\?|$)/i.test(t) ? plBust(t) : t;
   let r;
-  try { r = await fetchT(t, { headers:h, redirect:'follow' }, 20000); }
+  try { r = await fetchT(tgt, { headers:h, cf: { cacheTtl: 0, cacheEverything: false }, redirect:'follow' }, 20000); }
   catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); }
   let body = '';
   try { body = await r.text(); } catch (e) { body = '(no body)'; }
@@ -1465,4 +1498,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.8 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.9 DELAY-FIX ███
