@@ -1,116 +1,9 @@
 // ============================================================================
-// TVNOW-CF v10.10 — DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
+// TVNOW-CF v10.11 — HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
 // playlist/segmenti, che era la causa del ritardo.
-//
-// CAUSE DEL RITARDO 70s TROVATE NELLA v10.4:
-// 1. CACHE EDGE SEGMENTI 600s SENZA BUST: in /seg c'era cacheTtl:600 e in
-//    proxUrl il bust _t era stato rimosso. Con nomi file fissi/token ruotati
-//    (tipico di queste origini) la CF può servire un segmento lungo fino a 10
-//    minuti: il player riceve un "live edge" vecchio e variabile. Da qui
-//    scene ripetute + ritardo percepito di 60-120s. (v8.7 lo sapeva: bust 15s)
-// 2. cache-control: public, max-age=600 verso il PLAYER: le TV app mettono in
-//    cache lato client -> stessi segmenti serviti due volte, latenza che non scende.
-// 3. PL_CACHE_TTL 4000ms: fino a 4s di ritardo gratis ad ogni poll.
-// 4. /player senza liveSyncDuration/liveMaxLatencyDuration: hls.js non
-//    rincorre mai la live edge, il buffer cresce senza limite.
-//
-// FIX v10.5:
-// A. Bust _t stabile 30s su ogni URL segmento + cacheTtl edge 30s: freshness
-//    garantita, quota origin protetta (riuso per 30s tra poll e tra spettatori)
-// B. cache-control verso il player: max-age=30 (non 600)
-// C. PL_CACHE_TTL: 2000ms
-// D. Finestra adattiva sulle durate REALI (EXTINF), target 27s, min 25s:
-//    playlist annuncio stabile, il player non esce mai dalla finestra quindi
-//    non si risincronizza (le risincronizzazioni erano un'altra fonte di drift)
-// E. /player: liveSyncDuration=25, liveMaxLatencyDuration=40,
-//    maxLiveSyncPlaybackRate=1.5 (se resta indietro, accelera e rientra)
-//
-// FIX v10.6 (delay bloccato 25-30s per OGNI canale e provider + stabilita'):
-// F. EXT-X-START:TIME-OFFSET dinamico (PRECISE=YES): quando la finestra
-//    minimizzata supera i 27s (es. Vavoo 2x17s = 34s), il player parte dentro
-//    la window cosi' il delay EFFETTIVO e' ~25-28s su ogni canale/provider.
-//    Se un device specifico da schermo grigio, metti EXT_START_TRIM = false.
-// G. PREFETCH del segmento piu' nuovo in background (ctx.waitUntil): quando il
-//    player lo chiede e' gia' in cache edge CF -> meno microscatti.
-// H. Orditine provider ADATTIVO per canale: chi e' andato in errore di recente
-//    su QUEL canale scende in coda (provScore), chi ha funzionato sale.
-//    Ogni canale e' indipendente: stati, cache, score, CB e segfail sono tutti
-//    chiavi <canale>|<provider> — un canale rotto non tocca gli altri.
-//
-// FIX v10.7 (PRESERVAZIONE RICHIESTE, flusso daddy-channels):
-// I. RISOLUZIONE DADDY A COSTO ZERO: le URL edge stabili del repo daddy-channels
-//    (edge.wedd48c.top/premium<ID>/index.m3u8, senza token nella URL) sono la
-//    PRIMA via di risoluzione: zero richieste di estrazione embed (prima 2-6
-//    richieste, iframes inclusi, a ogni scadenza). La catena embed resta
-//    SOLO come fallback se l'edge URL fallisce (memo 60s di edge-fail).
-// L. CACHE API NORMALIZZATA PER SEGMENTO: il token ruota ogni 120s, quindi le
-//    URL dei segmenti (e la cache edge) cambiavano ogni 120s. Ora i segmenti
-//    sono anche nella Workers Cache API con chiave URL PRIVA dei parametri
-//    rotanti (token/s/e/sig/auth/...): la cache sopravvive alla rotazione,
-//    viewer multipli e rotazioni successive condividono lo stesso download.
-// M. SINGLE-FLIGHT PLAYLIST UPSTREAM: i fetch della playlist upstream
-//    (daddy + playlist annidate via /seg) sono deduplicati con finestra di
-//    freschezza 4s: N viewer sullo stesso canale = 1 richiesta upstream.
-// N. Il prefetch (v10.6 G) popola la Cache API normalizzata (stessa chiave).
-//
-// FIX v10.8 (DEFINITIVA: delay minimo per provider + stabilita' lunga):
-// O. DELAY PER PROVIDER (non piu' uniforme 27s): ogni provider e' portato al
-//    SUO minimo stabile, calcolato su TARGETDURATION/durate reali:
-//    - NTV (7s/seg):     21s   (3 seg; i 14s con 2 seg sono spec-risk decoder)
-//    - DADDY (4-6s/seg): 16-18s (3-5 seg)
-//    - VAVOO (17s/seg):  ~28s  (2 seg = 34s, trimmato via EXT-X-START)
-//    Nessun provider e' piu' limitato dagli altri.
-// P. ANTI-ROTTURA POST-30MIN: cleanup completo anche di plCache, vavooURLCache
-//    e segFails (prima crescevano senza bound) + memoria sotto controllo durante
-//    lo zapping: zero leak, l'isolate vive a lungo e se riparte riparte pulito.
-// Q. ANTI-AFFATICAMENTO ZAPPING: i provider di ripiego vengono PRE-RISCALDATI
-//    in background al primo poll di ogni canale (ntv token / vavoo resolve /
-//    daddy edge gia' in cache): quando cambi canale o il provider primario cade,
-//    il fallback e' gia' pronto, non si parte da zero.
-//
-// FIX v10.9 (DELAY 70-80s TORNATO: m3u8 upstream IN CACHE CDN CON URL FISSA!):
-// MISURA REALE sul worker: la playlist NTV (URL identica, token valido) torna
-// MEDIA-SEQUENCE 37034 FISSA per minuti; con un solo parametro _bust in piu'
-// torna 37060 (+26 segmenti ~ 105s piu' fresca). Quindi una cache CDN a monte
-// (chiave = URL) che serve le m3u8 STANTIE: le nostre finestre da
-// 16-28s si applicavano a una playlist gia' vecchia di 1-2 minuti e il ritardo
-// percepito saliva a 70-80s. (Prima Daddy era primario e la sua edge URL non
-// attraversava quella cache; con Daddy edge in 403 i canali cadono su NTV e
-// il problema e' esploso. Il 403 stesso potrebbe essere una risposta finita in cache.)
-// R. ANTI-CACHE CDN SULLE PLAYLIST: OGNI fetch m3u8 upstream usa plBust()
-//    (parametro _b con finestra 2s, allineata al single-flight: N spettatori
-//    nello stesso poll = STESSA URL = 1 sola richiesta) + cf:{cacheTtl:0}
-//    (bypass della cache edge CF sulla risposta). I SEGMENTI NON si toccano:
-//    sono file immutabili, la cache 30s resta il risparmio richieste.
-//    Resolve/token/estrattori dei provider: ZERO modifiche (restano v10.4).
-//
-// FIX v10.10 (RSI KO + freeze a 1-1.5min + lancio istantaneo):
-// S. BUST INTELLIGENTE: l'origin Vavoo ha URL FIRMATE e rifiuta parametri
-//    extra con 403 (verificato live). fetchPlaylistSmart(): prova con bust ->
-//    se 403/400 riprova SENZA bust e banna il bust per QUELL'HOST 30min.
-//    Risultato: NTV resta bustato (prova fatta: seq 37034 fisso -> 37060 con
-//    _b), Vavoo torna vivo su /rawu pulito + bypass cache CF.
-// T. ROTAZIONE URI VAVOO 240s -> 120s: la URL vavoo non bustabile e' anche la
-//    chiave cache CDN della sua playlist: ruotandola ogni 120s la playlist non
-//    resta congelata (la rotazione parte PRIMA che il player esaurisca i 34s
-//    di finestra) -> il freeze a 1-2 min sparisce.
-// U. DELAY PIU' BASSO CON DURATE REALI MISURATE: NTV reali ~4.2s/seg (non 7s):
-//    ntv 15s/12s -> 3-4 seg = 13-17s; daddy 16s/13s -> 3-4 seg = 15-18s;
-//    vavoo resta 28s (imposta dalla durata 17s dei seg, essenziale stabile).
-//    Player: liveSync 16, liveMax 30, catch-up 1.5x.
-// V. LANCIO TUTTI I CANALI IN 3-4s: warm progressivo CON CURSORE: a ogni
-//    /live il worker pre-riscalda in background i PROSSIMI 2 canali non ancora
-//    caldi (token NTV + URL edge Daddy + resolve Vavoo): dopo ~15 accessi
-//    TUTTI i 29 canali sono pronti; zapping + prima apertura istantanei e
-//    entro i limiti subrequest di Cloudflare (batch da 2 canali = ~3-5 subrequests).
-// W. RSI + CANALI RISOLTI COME IP: l'API a volte restituisce l'origin come IP
-//    literal (http://IP:porta) -> Cloudflare risponde 1003. Stesso path(blob)
-//    riscritto sullo host CDN a dominio = 200. vavooFixIpUrl() normalizza con
-//    apprendimento dell'ultimo host CDN valido (default incluso).
-// ============================================================================
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
 let MODULE_CTX = null;
@@ -119,6 +12,7 @@ const bg = fn => { try { if (MODULE_CTX && MODULE_CTX.waitUntil) MODULE_CTX.wait
 export default {
   async fetch(req, env, ctx) {
     MODULE_CTX = ctx || null;
+    heartbeat();
     const u = new URL(req.url);
     const P = u.origin;
     const path = u.pathname;
@@ -160,9 +54,9 @@ export default {
 // DELAY MINIMO PER PROVIDER (v10.8): calcolato sulle durate REALI (EXTINF /
 // TARGETDURATION misurate sulle fonti), ognuno al proprio floor stabile:
 const PROV_DELAY = {
-  ntv:   { target: 15, min: 12 },  // v10.10 U: durate reali ~4.2s -> 3-4 seg = 13-17s (era 21)
-  daddy: { target: 16, min: 13 },  // v10.10 U: seg 4-6s -> 3-4 seg = 15-18s (era 18)
-  vavoo: { target: 28, min: 27 }   // seg ~17s -> 2 seg (34s) + trim EXT-X-START -> ~28s
+  ntv:   { target: 13, min: 11 },  // v10.11 Y: durate reali ~4.2s -> 3 seg = 12.6-14s
+  daddy: { target: 14, min: 11 },  // v10.11 Y: seg 4-6s -> 3-4 seg = 12-15s
+  vavoo: { target: 25, min: 24 }   // v10.11 Y: seg 12-17s -> 2-3 seg (24-51s) + trim EXT-X-START -> ~24-25s
 };
 const PROV_PREF_SEGS = 3, MIN_SEGS = 2;
 const delayCfg = prov => PROV_DELAY[prov] || { target: 24, min: 20 };
@@ -178,7 +72,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.10 READY';
+const VER = 'TVNOW-CF v10.11 UPTIME';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -541,6 +435,23 @@ async function warmSeg(abs, ctx) {
     const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + (Math.floor(Date.now() / BUST_MS) * BUST_MS);
     await fetchSegmentWithCache(withBust, h, null);
   } catch (e) {}
+}
+
+// --- v10.11 X: HEARTBEAT 5 MIN (uptime: canali sempre pronti) ---------------
+// Il worker non si sveglia da solo, ma basta che arrivi QUALSIASI richiesta
+// (anche il poll di un player o /seg) per far girare l'heartbeat: se sono
+// passati >= 5 min dal tick precedente, riscalda in background altri 6 canali
+// del cursore (token NTV / resolve Vavoo / daddy costa 0). Dopo ore senza
+// spettatori i canali restano pronti: primo avvio ~1s, zapping istantaneo.
+// (batch 6 = ~10-18 subrequests: dentro i limiti Cloudflare per invocazione)
+const HEARTBEAT_MS = 5 * 60 * 1000;
+let lastHeartbeat = 0;
+function heartbeat() {
+  const now = Date.now();
+  if (now - lastHeartbeat < HEARTBEAT_MS) return;
+  lastHeartbeat = now;
+  log('heartbeat: warm 6 canali (cursor ' + warmCursor + ')');
+  warmNext(6);
 }
 
 // --- v10.10 V: WARM PROGRESSIVO CON CURSORE (tutti i canali pronti in pochi accessi) ---
@@ -1240,7 +1151,7 @@ async function player(u, P) {
 <body>
   <div class="controls">
     <div class="title">📺 ${c.name}</div>
-    <div>Player: HLS.js | Delay 16-28s (per provider) | Quality: MAX</div>
+    <div>Player: HLS.js | Delay ~12-25s (per provider) | Quality: MAX</div>
     <div id="status" class="status loading">⏳ Caricamento...</div>
     <div id="quality"></div>
     <div id="buffer"></div>
@@ -1256,11 +1167,11 @@ async function player(u, P) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
         backBufferLength: 20,
-        // v10.10 U: sync sul floor piu' basso con durate reali: NTV ~13-17s,
-        // Daddy ~15-18s; sopra i 30s accelera a 1.5x e rientra. Vavoo parte
-        // dal trim EXT-X-START (28s) e resta nella finestra senza inseguire.
-        liveSyncDuration: 16,
-        liveMaxLatencyDuration: 30,
+        // v10.11 Y: sync ancora sul floor piu' basso: NTV ~12.6-14s, Daddy
+        // ~12-15s; sopra i 26s accelera a 1.5x e rientra. Vavoo parte dal
+        // trim EXT-X-START (~24-25s) e resta dentro senza inseguire.
+        liveSyncDuration: 14,
+        liveMaxLatencyDuration: 26,
         maxLiveSyncPlaybackRate: 1.5,
         maxBufferLength: 20,
         maxMaxBufferLength: ${MAX_BUFFER_SECS},
@@ -1479,14 +1390,15 @@ async function diag(u) {
   });
   L.push('=== FATTORI DI DELAY (v10.8: target per provider) ===',
     'delay totale = ritardo interno della FONTE + finestra (per provider) + buffer del player',
-    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3-4 seg x ~4.2s)   <- il provider con il delay minore',
-    'DADDY: target ' + PROV_DELAY.daddy.target + 's (3-5 seg x 4-6s)',
-    'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg x 17s + trim EXT-X-START)',
+    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3 seg x ~4.2s, ~12.6-14s)   <- il provider con il delay minore',
+    'DADDY: target ' + PROV_DELAY.daddy.target + 's (3-4 seg x 4-6s, ~12-15s)',
+    'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2-3 seg 12-17s + trim EXT-X-START)',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
     'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
     'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.',
-    'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.');
+    'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.',
+    'v10.11: heartbeat uptime 5 min (canali sempre pronti) + delay: ntv ~13s, daddy ~14s, vavoo ~25s.');
   L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
     'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
     'catena embed solo come fallback dopo un edge-fail (memo 60s).',
@@ -1521,6 +1433,7 @@ function debug() {
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
     'Delay/provider: ntv ' + PROV_DELAY.ntv.target + 's | daddy ' + PROV_DELAY.daddy.target + 's | vavoo ' + PROV_DELAY.vavoo.target + 's | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
     'Smart bust: host senza bust (URL firmate): ' + (Array.from(noBustHosts.keys()).join(', ') || 'nessuno') + ' | warm cursor: ' + warmCursor + '/' + CHANNELS.length,
+    'Heartbeat: ' + (lastHeartbeat ? 'ultimo tick ' + Math.round((now - lastHeartbeat)/1000) + 's fa (ogni 5 min riscalda 6 canali)' : 'non avviato'),
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
     'CB cooldown attivi: ' + (cds.join(', ') || 'nessuno'),
     'SegFails: ' + (sf.join(', ') || 'nessuno'),
@@ -1534,7 +1447,7 @@ function debug() {
 function uso(P) {
   return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay ~25-30s',
+    '  /live?ch=<slug>                delay ~12-25s (per provider)',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
@@ -1556,6 +1469,12 @@ function uso(P) {
     '  • Cache API segmenti con chiave senza token: sopravvive alla rotazione 120s',
     '  • Single-flight playlist upstream 4s: N viewer = 1 fetch origine',
     '  • Prefetch popola la Cache API normalizzata',
+    'FIX v10.8 - v10.11 (definitiva):',
+    '  • Delay per provider sulle durate reali: ntv ~13s, daddy ~14s, vavoo ~25s',
+    '  • Anti-cache CDN sulle m3u8 (bust intelligente su URL firmate): playlist sempre fresca',
+    '  • URL Vavoo 120s + fix host IP (Cloudflare error 1003): RSI e canali piccoli stanno su',
+    '  • Heartbeat 5 min + warm progressivo con cursore: tutti i canali pronti, zapping istantaneo',
+    '  • Guardie anti-freeze su TUTTI i provider + cleanup memoria completo (niente morti a 30min)',
     ''].join('\n');
 }
 
@@ -1598,4 +1517,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.10 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.11 DELAY-FIX ███
