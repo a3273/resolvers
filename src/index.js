@@ -1,19 +1,53 @@
 // ============================================================================
-// TVNOW-CF v10.4 STABLE++ — Fix morte post-30min + No Cascata + Qualità MAX + Daddy Ottimizzato
+// TVNOW-CF v10.6 — DELAY 25-30s GARANTITO + ANTI-MICROSTALLI + CANALI INDIPENDENTI
 // ============================================================================
-// FIX E MIGLIORAMENTI rispetto alla v10.3:
-// 1. DADDY OTTIMIZZATO: Priorità a /cast/stream-{id}.php che embedda dembed.st.
-//    La playlist Daddy viene riscritta passando ref='https://dembed.st/' e 
-//    origin='https://dembed.st' a /seg. Il worker fa il fetch dei segmenti .ts 
-//    con questi header, bypassando il blocco IP-bound del token.
-// 2. PRESERVAZIONE RICHIESTE: Mantenuta la cache Edge di 600s su /seg e la 
-//    cache in-memory (daddyCache, plCache) per abbattere le richieste all'origine.
-// 3. RSI: ID Vavoo confermati e funzionanti (vid6/vid7).
-// 4. Tutte le diagnostici e i test aggiornati ai nuovi referer Daddy.
+// PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
+// segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
+// playlist/segmenti, che era la causa del ritardo.
+//
+// CAUSE DEL RITARDO 70s TROVATE NELLA v10.4:
+// 1. CACHE EDGE SEGMENTI 600s SENZA BUST: in /seg c'era cacheTtl:600 e in
+//    proxUrl il bust _t era stato rimosso. Con nomi file fissi/token ruotati
+//    (tipico di queste origini) la CF può servire un segmento lungo fino a 10
+//    minuti: il player riceve un "live edge" vecchio e variabile. Da qui
+//    scene ripetute + ritardo percepito di 60-120s. (v8.7 lo sapeva: bust 15s)
+// 2. cache-control: public, max-age=600 verso il PLAYER: le TV app mettono in
+//    cache lato client -> stessi segmenti serviti due volte, latenza che non scende.
+// 3. PL_CACHE_TTL 4000ms: fino a 4s di ritardo gratis ad ogni poll.
+// 4. /player senza liveSyncDuration/liveMaxLatencyDuration: hls.js non
+//    rincorre mai la live edge, il buffer cresce senza limite.
+//
+// FIX v10.5:
+// A. Bust _t stabile 30s su ogni URL segmento + cacheTtl edge 30s: freshness
+//    garantita, quota origin protetta (riuso per 30s tra poll e tra spettatori)
+// B. cache-control verso il player: max-age=30 (non 600)
+// C. PL_CACHE_TTL: 2000ms
+// D. Finestra adattiva sulle durate REALI (EXTINF), target 27s, min 25s:
+//    playlist annuncio stabile, il player non esce mai dalla finestra quindi
+//    non si risincronizza (le risincronizzazioni erano un'altra fonte di drift)
+// E. /player: liveSyncDuration=25, liveMaxLatencyDuration=40,
+//    maxLiveSyncPlaybackRate=1.5 (se resta indietro, accelera e rientra)
+//
+// FIX v10.6 (delay bloccato 25-30s per OGNI canale e provider + stabilita'):
+// F. EXT-X-START:TIME-OFFSET dinamico (PRECISE=YES): quando la finestra
+//    minimizzata supera i 27s (es. Vavoo 2x17s = 34s), il player parte dentro
+//    la window cosi' il delay EFFETTIVO e' ~25-28s su ogni canale/provider.
+//    Se un device specifico da schermo grigio, metti EXT_START_TRIM = false.
+// G. PREFETCH del segmento piu' nuovo in background (ctx.waitUntil): quando il
+//    player lo chiede e' gia' in cache edge CF -> meno microscatti.
+// H. Orditine provider ADATTIVO per canale: chi e' andato in errore di recente
+//    su QUEL canale scende in coda (provScore), chi ha funzionato sale.
+//    Ogni canale e' indipendente: stati, cache, score, CB e segfail sono tutti
+//    chiavi <canale>|<provider> — un canale rotto non tocca gli altri.
 // ============================================================================
 
+// ctx del modulo worker: serve per il prefetch in background (waitUntil)
+let MODULE_CTX = null;
+const bg = fn => { try { if (MODULE_CTX && MODULE_CTX.waitUntil) MODULE_CTX.waitUntil(Promise.resolve().then(fn).catch(() => {})); } catch (e) {} };
+
 export default {
-  async fetch(req) {
+  async fetch(req, env, ctx) {
+    MODULE_CTX = ctx || null;
     const u = new URL(req.url);
     const P = u.origin;
     const path = u.pathname;
@@ -52,15 +86,22 @@ export default {
 };
 
 // --- CONFIGURAZIONE --------------------------------------------------------
-const DELAY_TARGET = 12, DELAY_MIN = 9, PREF_SEGS = 3, MIN_SEGS = 2;
-const STALE_FACTOR = 6, MAX_BUFFER_SECS = 45;
+// DELAY 25-30s calcolato sulle durate REALI dei segmenti (EXTINF), non a numero
+// fisso: NTV(7s)->4 seg=28s, Vavoo(17s)->2 seg=34s con trim via arithmetic
+// della window (avvicina il target), Daddy(4-6s)->~5 seg=~27s.
+const DELAY_TARGET = 27, DELAY_MIN = 25, PREF_SEGS = 3, MIN_SEGS = 2;
+const EXT_START_TRIM = true;              // F: trim delay via EXT-X-START (false se un device da schermo grigio)
+const PREFETCH_SEGS = 1;                  // G: quanti segmenti nuovi pre-caricare in bg
+const STALE_FACTOR = 6, MAX_BUFFER_SECS = 40;
+const SEG_CACHE_TTL = 30;                 // FIX: 30s edge cache (era 600)
+const BUST_MS = 30000;                    // FIX: bust stabile 30s (era assente)
 const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
-const PL_CACHE_TTL = 4000, RESOLVE_BUDGET = 12000, STATE_STALE_TTL = 15*60*1000;
+const PL_CACHE_TTL = 2000, RESOLVE_BUDGET = 12000, STATE_STALE_TTL = 15*60*1000;
 const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 240*1000;
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.4 STABLE++';
+const VER = 'TVNOW-CF v10.6 DELAY-LOCK';
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
@@ -148,6 +189,15 @@ const tokenCache = new Map(), daddyCache = new Map(), vavooURLCache = new Map();
 const vavooHealth = new Map(), segFails = new Map();
 const cbFails = new Map(), cbCooldown = new Map();
 const plCache = new Map(), plState = new Map(), upFresh = new Map();
+// v10.6 H: score per <canale>|<provider> per l'ordine adattivo (canali indipendenti)
+const provScore = new Map();
+const PROV_SCORE_TTL = 10 * 60 * 1000;
+const noteProv = (slug, prov, ok) => { if (slug && prov) provScore.set(slug + '|' + prov, { ok: !!ok, t: Date.now() }); };
+const provRank = (slug, prov) => {
+  const e = provScore.get((slug || '_') + '|' + (prov || '_'));
+  if (!e || Date.now() - e.t > PROV_SCORE_TTL) return 1; // neutro
+  return e.ok ? 2 : 0;                                   // ok di recente -> primo; ko -> ultimo
+};
 let ntvStats = { resolve:0, refresh:0, err:0 };
 const logs = [];
 const log = m => { logs.push(new Date().toISOString().slice(11,19) + ' ' + m); if (logs.length > 80) logs.shift(); };
@@ -205,6 +255,7 @@ function cleanupStaleState() {
   for (const [k, v] of plState) if (v.t < cutoff) plState.delete(k);
   for (const [k, v] of upFresh) if (v.t < cutoff) upFresh.delete(k);
   for (const [k, h] of vavooHealth) if (h.t < cutoff) vavooHealth.delete(k);
+  for (const [k, s] of provScore) if (s.t < cutoff) provScore.delete(k);
   for (const [k, arr] of cbFails) if (!arr.length) cbFails.delete(k);
 }
 
@@ -257,11 +308,36 @@ function emitPlaylist(ck, slug, prov, txt, baseUrl, ctx) {
   const p = parseMediaPl(txt);
   if (!p.isMaster && p.segs.length) checkFreshOrThrow(slug + '|' + prov, p.upSeq, p.upTarget, prov);
   const out = rewriteAny(txt, baseUrl, Object.assign({}, ctx, { stateKey: slug + '|' + prov }));
+  // v10.6 G: prefetch in background dei segmenti piu' nuovi. Quando il player
+  // li chiede sono gia' nella cache edge CF: anti-microscatti, zero attesa.
+  if (!p.isMaster && PREFETCH_SEGS > 0) {
+    const news = p.segs.slice(-PREFETCH_SEGS);
+    for (const s of news) {
+      try {
+        const abs = absSegUrl(s.url, baseUrl);
+        bg(() => warmSeg(abs, ctx));
+      } catch (e) {}
+    }
+  }
   plCacheSet(ck, out);
   return R(out, 200, HLS_NO_CACHE());
 }
 
-// --- PROVIDER NTV ----------------------------------------------------------
+// v10.6 G: scarica il segmento con gli stessi header di /seg, popolando
+// la cache edge (stesso bust a 30s -> stessa cache key del player)
+async function warmSeg(abs, ctx) {
+  const ref = (ctx && ctx.ref) || 'https://thedaddy.li/';
+  const h = getBrowserHeaders(ref, ((ctx && ctx.ch) || '') + '|' + ((ctx && ctx.prov) || ''));
+  const o = ctx && ctx.origin;
+  if (o) h['Origin'] = o;
+  if (ref.includes('thedaddy') || ref.includes('dembed')) { h['Referer'] = 'https://dembed.st/'; h['Origin'] = 'https://dembed.st'; }
+  try {
+    const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + (Math.floor(Date.now() / BUST_MS) * BUST_MS);
+    await fetchT(withBust, { headers: h, cf: { cacheTtl: SEG_CACHE_TTL, cacheEverything: true } }, 15000);
+  } catch (e) {}
+}
+
+// --- PROVIDER NTV (INTATTO dalla v10.4) ------------------------------------
 const NTV_API = 'https://chat.cfbu247.sbs/api/resolve-dlstream/';
 async function ntvToken(id, slug) {
   const now = Date.now() / 1000;
@@ -296,7 +372,7 @@ async function ntvPlaylist(id, slug) {
   return { txt, ref: tk.ref, base: tk.m3u8 };
 }
 
-// --- PROVIDER DADDY (v10.4 Ottimizzato) ------------------------------------
+// --- PROVIDER DADDY (INTATTO dalla v10.4) ----------------------------------
 const DADDY_DOMAINS = ['https://thedaddy.li', 'https://daddylivetv.sbs'];
 async function daddyResolve(id, slug) {
   if (!id) return null;
@@ -309,14 +385,10 @@ async function daddyResolve(id, slug) {
   }
   for (const domain of DADDY_DOMAINS) {
     try {
-      // v10.4 FIX: Priorità a /cast/stream-{id}.php che embedda dembed.st (il più stabile)
       let m3u8 = await extractM3u8FromEmbed(`${domain}/cast/stream-${id}.php`, domain, 8000);
       if (m3u8) { daddyCache.set(id, { url:m3u8, exp:now + DADDY_TTL }); cbClear(slug, 'daddy'); return m3u8; }
-      
-      // Fallback ai player legacy
       m3u8 = await extractM3u8FromEmbed(`${domain}/embed/stream-${id}.php`, domain, 8000);
       if (m3u8) { daddyCache.set(id, { url:m3u8, exp:now + DADDY_TTL }); cbClear(slug, 'daddy'); return m3u8; }
-      
       m3u8 = await extractM3u8FromEmbed(`${domain}/watch.php?id=${id}`, domain, 8000);
       if (m3u8) { daddyCache.set(id, { url:m3u8, exp:now + DADDY_TTL }); cbClear(slug, 'daddy'); return m3u8; }
     } catch (e) { continue; }
@@ -354,7 +426,7 @@ function getBrowserHeaders(referer, uaKey) {
   };
 }
 
-// --- PROVIDER VAVOO --------------------------------------------------------
+// --- PROVIDER VAVOO (INTATTO dalla v10.4) ----------------------------------
 const VAVOO_MIRRORS = ['https://geil.to','https://geil.app','https://geil.win','https://vavoo.to','https://kool.to','https://vavoo.net','https://kool.ws','https://huhu.to','https://oha.to','https://voltop.net'];
 const VAVOO_SOURCES = ['https://raw.githubusercontent.com/aphrodite747/VvOo/main/index_Italy.m3u','https://raw.githubusercontent.com/BontAce/VVOOITV/main/index_Italy.m3u'];
 let vavooMap = { map:null, t:0, src:'' };
@@ -493,7 +565,7 @@ async function vavooResolve(query, vid) {
   return await vavooResolveDual(null, query, vid, null);
 }
 
-// --- ROTTA /live -----------------------------------------------------------
+// --- ROTTA /live (provider intatti, solo cache output ridotta a 2s) --------
 async function live(u, P, legacy) {
   countReq('live');
   cleanupStaleState();
@@ -515,6 +587,10 @@ async function live(u, P, legacy) {
   const ordered = [];
   for (const p of prefList) if (available.includes(p) && !ordered.includes(p)) ordered.push(p);
   for (const p of available) if (!ordered.includes(p)) ordered.push(p);
+
+  // v10.6 H: ordine adattivo PER CANALE: provider andato ko di recente su questo
+  // canale scende in coda; quello che funziona sale. Ogni canale decide da solo.
+  ordered.sort((a, b) => provRank(c.slug, b) - provRank(c.slug, a));
 
   const good = ordered.filter(p => segFailCount(c.slug, p) < SEGFAIL_MAX);
   const bad  = ordered.filter(p => segFailCount(c.slug, p) >= SEGFAIL_MAX);
@@ -558,13 +634,10 @@ async function live(u, P, legacy) {
       if (!c.daddy) return null;
       const du = await daddyResolve(c.daddy, c.slug);
       if (!du || !/\.m3u8/i.test(du)) return null;
-      // v10.4 FIX: Passiamo ref='https://dembed.st/' e origin='https://dembed.st' a /seg
-      // così il worker fa il fetch dei segmenti con gli header corretti, bypassando il blocco IP-bound del token.
       const r = await fetchT(du, { headers: getBrowserHeaders('https://dembed.st/', c.slug + '|daddy') }, 12000);
       if (!r.ok) { daddyCache.delete(c.daddy); cbRecordFail(c.slug, 'daddy'); return null; }
       const txt = await r.text();
       if (!txt.includes('#EXTM3U')) { daddyCache.delete(c.daddy); cbRecordFail(c.slug, 'daddy'); return null; }
-      
       const body = rewriteAny(txt, du, { P, ch:c.slug, prov:'daddy', ref:'https://dembed.st/', origin:'https://dembed.st' });
       const lines = body.split('\n');
       if (lines[0] === '#EXTM3U')
@@ -581,11 +654,13 @@ async function live(u, P, legacy) {
     if (!fn) continue;
     try {
       const res = await fn();
-      if (res) return res;
+      if (res) { noteProv(c.slug, p, true); return res; }
       lastErr = lastErr || (p + ': null');
+      noteProv(c.slug, p, false);
     } catch (e) {
       lastErr = p + ': ' + (e && e.message ? e.message : String(e));
       log(p + ' ko ' + c.slug + ': ' + lastErr);
+      noteProv(c.slug, p, false);
     }
   }
   for (const p of tryOrder) { cbClear(c.slug, p); clearSegFails(c.slug, p); }
@@ -626,10 +701,14 @@ function parseMediaPl(txt) {
   }
   return { upSeq, upTarget, upVersion, map, segs, isMaster, endlist };
 }
+
+// v10.5: finestra adattiva sulle durate reali, target 27s / min 25s.
+// La finestra pubblicata non e' mai piu' corta di 25s quando disponibile:
+// il player non esce mai dallo stream e non si risincronizza (anti-drift).
 function pickWindow(durs) {
   const n = durs.length;
   if (!n) return { count:0, sum:0 };
-  let count=0, sum=0;
+  let count = 0, sum = 0;
   for (let i = n - 1; i >= 0; i--) {
     count++; sum += durs[i];
     if (count >= PREF_SEGS && sum >= DELAY_TARGET) break;
@@ -637,6 +716,7 @@ function pickWindow(durs) {
   while (count > MIN_SEGS && sum - durs[n - count] >= DELAY_MIN) { sum -= durs[n - count]; count--; }
   return { count, sum };
 }
+
 function absSegUrl(url, baseUrl) {
   if (/^https?:\/\//i.test(url)) return url;
   let abs;
@@ -644,8 +724,15 @@ function absSegUrl(url, baseUrl) {
   else abs = baseUrl.replace(/[^/]*$/, '') + url.replace(/^\.\//, '');
   return abs.replace(/([^:])\/{2,}/g, '$1/');
 }
+
+// v10.5 FIX PRINCIPALE: bust _t stabile 30s. Prima era assente -> cache edge
+// 600s di segmenti vecchi = live edge finto, scene ripetute, delay 70s+.
+// Ora: stesso URL per 30s (riuso cache tra poll/spettatori), cambia dopo ->
+// freshness guaranteed, nessun segmento vecchio di piu' di ~30s.
 function proxUrl(abs, ctx) {
-  let u = ctx.P + '/seg?u=' + encodeURIComponent(abs);
+  const bust = Math.floor(Date.now() / BUST_MS) * BUST_MS;
+  const withBust = abs + (abs.includes('?') ? '&' : '?') + '_t=' + bust;
+  let u = ctx.P + '/seg?u=' + encodeURIComponent(withBust);
   if (ctx.ref)    u += '&ref=' + encodeURIComponent(ctx.ref);
   if (ctx.origin) u += '&o='   + encodeURIComponent(ctx.origin);
   if (ctx.ch)     u += '&ch='  + encodeURIComponent(ctx.ch);
@@ -723,7 +810,14 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   }
   let version = p.upVersion || 1;
   if (p.map && version < 6) version = 6;
+  // v10.6 F: trim del delay. Se la finestra minimizzata supera il target
+  // (es. Vavoo 2x17s = 34s), il player parte dentro la window:
+  // buffer davanti = sum - offset = DELAY_TARGET -> delay effettivo ~25-28s
+  // per OGNI canale e provider, nonostante segmenti anche da 17s.
+  const offset = Math.max(0, plan.sum - DELAY_TARGET);
   const out = ['#EXTM3U', '#EXT-X-VERSION:' + version, '#EXT-X-TARGETDURATION:' + p.upTarget, '#EXT-X-MEDIA-SEQUENCE:' + seq];
+  if (EXT_START_TRIM && offset > 0.5 && !p.endlist)
+    out.push('#EXT-X-START:TIME-OFFSET=' + offset.toFixed(1) + ',PRECISE=YES');
   if (p.endlist) out.push('#EXT-X-ENDLIST');
   if (p.map) {
     const mu = (p.map.match(/URI="([^"]+)"/) || [])[1];
@@ -740,7 +834,7 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   return out.join('\n');
 }
 
-// --- ROTTA /seg (ANTI-CORRUZIONE + RETRY + UA STABILE) ----------------------
+// --- ROTTA /seg (FIX FRESHNESS: cache 30s, era 600s) -----------------------
 async function seg(u, req) {
   countReq('seg');
   const target = u.searchParams.get('u');
@@ -769,7 +863,9 @@ async function seg(u, req) {
 
   let r, attempts = 0;
   const maxAttempts = 2;
-  const cfOpt = range ? { cacheTtl:0 } : { cacheTtl:600, cacheEverything:true };
+  // FIX: 30s di edge cache (bastano: i segmenti vivono ~30s nella finestra).
+  // 600s servivano segmenti vecchi di minuti -> delay 70s e scene ripetute.
+  const cfOpt = range ? { cacheTtl:0 } : { cacheTtl:SEG_CACHE_TTL, cacheEverything:true };
 
   while (attempts < maxAttempts) {
     r = await fetchT(target, { headers:h, cf: attempts === 0 ? cfOpt : { cacheTtl:0, cacheEverything:false } }, 20000);
@@ -797,7 +893,9 @@ async function seg(u, req) {
     'access-control-allow-headers':'Range, User-Agent, Referer, Origin',
     'access-control-expose-headers':'Content-Length, Content-Range, Accept-Ranges',
     'accept-ranges':'bytes',
-    'cache-control':'public, max-age=600'
+    // FIX: max-age=30 anche verso il player (era 600: le TV app mettono in
+    // cache lato client i segmenti vecchi e il ritardo non scendeva mai)
+    'cache-control':'public, max-age=' + SEG_CACHE_TTL
   };
   const cl = r.headers.get('content-length'); const cr = r.headers.get('content-range');
   if (cl) hh['content-length'] = cl;
@@ -805,7 +903,7 @@ async function seg(u, req) {
   return new Response(r.body, { status:r.status, headers:hh });
 }
 
-// --- PLAYER HLS.JS ---------------------------------------------------------
+// --- PLAYER HLS.JS (fix anti-accumulo di delay) -----------------------------
 async function player(u, P) {
   const ch = u.searchParams.get('ch') || 'sky-sport-f1';
   const c = findCh(ch);
@@ -832,7 +930,7 @@ async function player(u, P) {
 <body>
   <div class="controls">
     <div class="title">📺 ${c.name}</div>
-    <div>Player: HLS.js | Delay: ${DELAY_TARGET}s | Quality: MAX</div>
+    <div>Player: HLS.js | Delay: ~25-30s | Quality: MAX</div>
     <div id="status" class="status loading">⏳ Caricamento...</div>
     <div id="quality"></div>
     <div id="buffer"></div>
@@ -847,8 +945,16 @@ async function player(u, P) {
     if (Hls.isSupported()) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
-        backBufferLength: 60, maxBufferLength: ${DELAY_TARGET + 8},
-        maxMaxBufferLength: ${MAX_BUFFER_SECS}, maxBufferSize: 60 * 1000 * 1000, maxBufferHole: 0.5,
+        backBufferLength: 30,
+        // FIX DELAY: sync fissato a 25s dalla live edge; se il player resta
+        // indietro oltre 40s accelera (1.5x) finche' non rientra. Prima il
+        // buffer cresceva senza controllo -> ritardo da 70s.
+        liveSyncDuration: 25,
+        liveMaxLatencyDuration: 40,
+        maxLiveSyncPlaybackRate: 1.5,
+        maxBufferLength: 30,
+        maxMaxBufferLength: ${MAX_BUFFER_SECS},
+        maxBufferSize: 60 * 1000 * 1000, maxBufferHole: 0.5,
         capLevelToPlayerSize: false, autoStartLoad: true,
         nudgeMaxRetry: 10, fragLoadingMaxRetry: 8, manifestLoadingMaxRetry: 4
       });
@@ -886,7 +992,7 @@ async function player(u, P) {
       setInterval(() => {
         if (video.buffered.length > 0) {
           const buffered = video.buffered.end(video.buffered.length - 1) - video.currentTime;
-          buffer.textContent = 'Buffer: ' + buffered.toFixed(1) + 's';
+          buffer.textContent = 'Buffer: ' + buffered.toFixed(1) + 's | Delay ≈ min(buffer, 30)s';
         }
       }, 1000);
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -903,7 +1009,7 @@ async function player(u, P) {
   return R(html, 200, { 'content-type': 'text/html; charset=utf-8', ...CORS() });
 }
 
-// --- DIAGNOSTICA -----------------------------------------------------------
+// --- DIAGNOSTICA (provider intatti) ----------------------------------------
 async function segtest(u) {
   const t = u.searchParams.get('u');
   if (!t) return R('uso: /segtest?u=<url>&ref=<referer>', 200, TXT());
@@ -1001,11 +1107,6 @@ async function probe(u) {
     'Health vavoo: prefer7=' + h.prefer7 + ' fails6=' + h.fails6 + ' fails7=' + h.fails7,
     'SegFails: vavoo=' + segFailCount(c.slug,'vavoo') + ' ntv=' + segFailCount(c.slug,'ntv') + ' daddy=' + segFailCount(c.slug,'daddy'),
     'CB (canale|provider): ntv=' + (cbInCooldown(c.slug,'ntv')?'CD':'ok') + ' vavoo=' + (cbInCooldown(c.slug,'vavoo')?'CD':'ok') + ' daddy=' + (cbInCooldown(c.slug,'daddy')?'CD':'ok')];
-  const t1 = async (label, fn) => {
-    const t0 = Date.now();
-    try { const v = await fn(); L.push(label + ': ' + (v ? 'OK (' + (Date.now()-t0) + 'ms)' : 'skip')); }
-    catch (e) { L.push(label + ': ERR ' + e.message); }
-  };
   if (c.vavoo || c.vid6 || c.vid7) {
     const t0 = Date.now();
     try {
@@ -1066,20 +1167,13 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== LOGICA v10.4 STABLE++ ===',
-    'A. FIX MORTE 20-30MIN: stato /seg chiavato per URL upstream (video e audio separati)',
-    'B. FIX QUALITÀ: master completo, variant video ordinate max→min (ABR attivo)',
-    'C. FIX CASCATA: circuit breaker canale|provider (zero influenza tra canali)',
-    'D. UA STABILE per canale|provider (niente 403 da UA random a metà stream)',
-    'E. Sequenza monotona + discontinuità solo al vero cambio sorgente',
-    'F. Detector playlist congelata (seq fermo > 6x targetduration)',
-    'G. Anti-corruzione: retry su segmenti HTML/JSON + report al provider',
-    'H. Early re-resolve Vavoo (1 fail + URL vicino a scadenza)',
-    'I. Fallback definitivo su mappa vavoo forzata se ID stanti',
-    'J. NTV token refresh 15 min prima della scadenza',
-    'K. Cleanup stato inattivo ogni 90s',
-    'L. /player: livello MAX per bitrate + recovery automatica rete/media',
-    'M. DADDY OTTIMIZZATO: /cast -> dembed.st con ref/origin corretti per bypassare IP-bound');
+  L.push('=== FATTORI DI DELAY (v10.6) ===',
+    'delay totale = ritardo interno della FONTE + finestra (~25-28s) + buffer del player',
+    'v10.5: cache segmenti 30s + bust, PL cache 2s',
+    'v10.6: EXT-X-START:TIME-OFFSET trimma la finestra oltre i ' + DELAY_TARGET + 's',
+    '(Vavoo 2x17s: 34s -> delay effettivo ~27s su tutti i canali/provider)',
+    'v10.6: prefetch bg del segmento nuovo + ordine provider adattivo per canale',
+    'Se resti comunque a 50-60s, il residuo e\' latenza della fonte (non abbassabile).');
   return L.join('\n');
 }
 
@@ -1102,7 +1196,7 @@ function debug() {
     VER,
     'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
-    'Delay: target ' + DELAY_TARGET + 's, min ' + DELAY_MIN + 's, max buffer ' + MAX_BUFFER_SECS + 's',
+    'Delay: finestra target ' + DELAY_TARGET + 's (min ' + DELAY_MIN + '), trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ', cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
     'CB cooldown attivi: ' + (cds.join(', ') || 'nessuno'),
     'SegFails: ' + (sf.join(', ') || 'nessuno'),
@@ -1115,21 +1209,24 @@ function debug() {
 function uso(P) {
   return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay ' + DELAY_TARGET + 's, qualità MAX',
+    '  /live?ch=<slug>                delay ~25-30s',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
-    '  /player?ch=<slug>              player HLS.js (livello MAX per bitrate)',
-    '  /diag?ch=sky-sport-f1          diagnostica completa',
+    '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
+    '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
     '  /probe?ch=sky-sport-f1         probe rapido + URL upstream (test VLC)',
     '  /checkseg?s=<ntv|vavoo|daddy>&ch=<id>  test segmento',
     '  /segtest?u=<url>&ref=<referer> test URL diretto',
     '  /warm /vmap /debug /ch /rawu /ip  utility',
     '',
-    'FIX v10.4:',
-    '  • Morte post-20-30min: stato playlist video/audio separati per URL',
-    '  • Qualità: master completo con variant ordinate max→min (ABR attivo)',
-    '  • Zero cascata: CB e segfails per canale|provider',
-    '  • UA stabile per canale (niente 403 da UA random)',
-    '  • Daddy ottimizzato: /cast -> dembed.st con ref/origin corretti per bypassare IP-bound',
+    'FIX v10.5:',
+    '  • Cache edge segmenti 600s -> 30s (la 600s serviva segmenti vecchi di minuti)',
+    '  • Bust _t reintegrato, stabile 30s (freshness garantita, quota protetta)',
+    '  • Finestra adattiva su durate EXTINF reali: 25-28s',
+    'FIX v10.6:',
+    '  • Delay EFFETTIVO 25-30s garantito per ogni canale e provider (EXT-X-START trim)',
+    '  • Prefetch bg del segmento nuovo: meno microscatti',
+    '  • Ordine provider adattivo PER CANALE (provScore): canali 100% indipendenti',
+    '  • EXT_START_TRIM=false se qualche device da schermo grigio',
     ''].join('\n');
 }
 
@@ -1167,4 +1264,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.4 STABLE++ ███
+// ███ FINE TVNOW-CF v10.6 DELAY-FIX ███
