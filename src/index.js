@@ -105,7 +105,11 @@
 //    /live il worker pre-riscalda in background i PROSSIMI 2 canali non ancora
 //    caldi (token NTV + URL edge Daddy + resolve Vavoo): dopo ~15 accessi
 //    TUTTI i 29 canali sono pronti; zapping + prima apertura istantanei e
-//    entro i limiti subrequest di Cloudflare (batch da 2 = ~3 rete/locali).
+//    entro i limiti subrequest di Cloudflare (batch da 2 canali = ~3-5 subrequests).
+// W. RSI + CANALI RISOLTI COME IP: l'API a volte restituisce l'origin come IP
+//    literal (http://IP:porta) -> Cloudflare risponde 1003. Stesso path(blob)
+//    riscritto sullo host CDN a dominio = 200. vavooFixIpUrl() normalizza con
+//    apprendimento dell'ultimo host CDN valido (default incluso).
 // ============================================================================
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
@@ -759,6 +763,22 @@ async function vavooLiveFind(base, query) {
     return vavooMapFind(query, tmp);
   } catch (e) { return null; }
 }
+// v10.10 W: ERROR 1003 DI CLOUDFLARE SUI CANALI "PICCOLI" (RSI ecc.). L'API
+// risolve a volte l'origin come IP LITERAL (http://37.49.229.166:8008/...):
+// e' Cloudflare e rifiuta l'accesso per IP ("error code: 1003" verificato live).
+// Con lo stesso path(blob) sullo host CDN a dominio (stessa rete, 37.49.224.94)
+// la playlist torna 200 subito. Normalizzazione in vavooFixIpUrl() a monte di
+// ogni uso della URL vavoo, con apprendimento dell'ultimo host CDN valido.
+let vavooGoodHost = 'https://7jep2q6xee5pjrv.fu8oefd4v2dvlmaarur6crfp.com';
+function vavooFixIpUrl(u) {
+  const s = String(u || '');
+  if (!/^http:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+\//.test(s)) return s;
+  return s.replace(/^http:\/\/[^/]+\//, vavooGoodHost + '/');
+}
+const noteVavooGoodHost = (u) => {
+  const m = String(u || '').match(/^https:\/\/([^/]+)\//);
+  if (m && !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(m[1])) vavooGoodHost = 'https://' + m[1];
+};
 async function tryVavooId(id) {
   for (const base of VAVOO_MIRRORS.slice(0, 4)) {
     try { const u = await vavooResolveId(base, id); if (u) return u; } catch (e) {}
@@ -789,7 +809,8 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
   }
   for (const cand of cands.slice(0, 3)) {
     if (Date.now() - t0 > RESOLVE_BUDGET) break;
-    const url = await tryVavooId(cand.id);
+    const url = vavooFixIpUrl(await tryVavooId(cand.id));
+    noteVavooGoodHost(url);
     if (url) {
       updateVavooHealth(healthKey, cand.num);
       vavooURLCache.set(cacheKey, { url, exp:Date.now() + VAVOO_URL_TTL });
@@ -803,7 +824,8 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
       const m2 = await ensureVavooMap(true);
       const id2 = m2 ? vavooMapFind(query || '', m2) : null;
       if (id2 && id2 !== mapId) {
-        const u2 = await tryVavooId(id2);
+        const u2 = vavooFixIpUrl(await tryVavooId(id2));
+        noteVavooGoodHost(u2);
         if (u2) {
           updateVavooHealth(healthKey, 0);
           vavooURLCache.set(cacheKey, { url:u2, exp:Date.now() + VAVOO_URL_TTL });
@@ -1463,7 +1485,8 @@ async function diag(u) {
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
     'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
-    'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.');
+    'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.',
+    'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.');
   L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
     'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
     'catena embed solo come fallback dopo un edge-fail (memo 60s).',
