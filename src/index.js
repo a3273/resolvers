@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.11 — HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
+// TVNOW-CF v10.12 — HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
@@ -54,9 +54,9 @@ export default {
 // DELAY MINIMO PER PROVIDER (v10.8): calcolato sulle durate REALI (EXTINF /
 // TARGETDURATION misurate sulle fonti), ognuno al proprio floor stabile:
 const PROV_DELAY = {
-  ntv:   { target: 13, min: 11 },  // v10.11 Y: durate reali ~4.2s -> 3 seg = 12.6-14s
-  daddy: { target: 14, min: 11 },  // v10.11 Y: seg 4-6s -> 3-4 seg = 12-15s
-  vavoo: { target: 25, min: 24 }   // v10.11 Y: seg 12-17s -> 2-3 seg (24-51s) + trim EXT-X-START -> ~24-25s
+  ntv:   { target: 9,  min: 8 },   // v10.12: 2 seg x 4.2s = 8.4s reali (floor meccanico)
+  daddy: { target: 10, min: 8 },   // v10.12: 2 seg x 4-6s = 8-12s
+  vavoo: { target: 21, min: 20 }   // v10.12: 2 seg (24-34s) + trim EXT-X-START -> ~21s
 };
 const PROV_PREF_SEGS = 3, MIN_SEGS = 2;
 const delayCfg = prov => PROV_DELAY[prov] || { target: 24, min: 20 };
@@ -72,7 +72,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.11 UPTIME';
+const VER = 'TVNOW-CF v10.12 MIN-DELAY';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -1151,7 +1151,7 @@ async function player(u, P) {
 <body>
   <div class="controls">
     <div class="title">📺 ${c.name}</div>
-    <div>Player: HLS.js | Delay ~12-25s (per provider) | Quality: MAX</div>
+    <div>Player: HLS.js | Delay ~8-21s (per provider) | Quality: MAX</div>
     <div id="status" class="status loading">⏳ Caricamento...</div>
     <div id="quality"></div>
     <div id="buffer"></div>
@@ -1167,11 +1167,10 @@ async function player(u, P) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
         backBufferLength: 20,
-        // v10.11 Y: sync ancora sul floor piu' basso: NTV ~12.6-14s, Daddy
-        // ~12-15s; sopra i 26s accelera a 1.5x e rientra. Vavoo parte dal
-        // trim EXT-X-START (~24-25s) e resta dentro senza inseguire.
-        liveSyncDuration: 14,
-        liveMaxLatencyDuration: 26,
+        // v10.12: sync al floor minimo: NTV/Daddy ~8-12s (2 seg), Vavoo parte
+        // dal trim EXT-X-START (~21s). Sopra i 24s accelera a 1.5x e rientra.
+        liveSyncDuration: 10,
+        liveMaxLatencyDuration: 24,
         maxLiveSyncPlaybackRate: 1.5,
         maxBufferLength: 20,
         maxMaxBufferLength: ${MAX_BUFFER_SECS},
@@ -1390,15 +1389,16 @@ async function diag(u) {
   });
   L.push('=== FATTORI DI DELAY (v10.8: target per provider) ===',
     'delay totale = ritardo interno della FONTE + finestra (per provider) + buffer del player',
-    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3 seg x ~4.2s, ~12.6-14s)   <- il provider con il delay minore',
-    'DADDY: target ' + PROV_DELAY.daddy.target + 's (3-4 seg x 4-6s, ~12-15s)',
-    'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2-3 seg 12-17s + trim EXT-X-START)',
+    'NTV:   target ' + PROV_DELAY.ntv.target + 's (2 seg x ~4.2s = 8.4s, floor meccanico)   <- il provider con il delay minore',
+    'DADDY: target ' + PROV_DELAY.daddy.target + 's (2-3 seg x 4-6s = 8-12s)',
+    'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg 12-17s + trim EXT-X-START)',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
     'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
     'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.',
     'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.',
-    'v10.11: heartbeat uptime 5 min (canali sempre pronti) + delay: ntv ~13s, daddy ~14s, vavoo ~25s.');
+    'v10.11: heartbeat uptime 5 min (canali sempre pronti) + delay: ntv ~13s, daddy ~14s, vavoo ~25s.',
+    'v10.12: delay al floor meccanico: ntv ~8.4s, daddy ~8-12s, vavoo ~21s (2 seg + trim).');
   L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
     'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
     'catena embed solo come fallback dopo un edge-fail (memo 60s).',
@@ -1447,7 +1447,7 @@ function debug() {
 function uso(P) {
   return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay ~12-25s (per provider)',
+    '  /live?ch=<slug>                delay ~8-21s (per provider)',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
@@ -1517,4 +1517,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.11 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.12 DELAY-FIX ███
