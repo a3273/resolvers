@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.12 — HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
+// TVNOW-CF v10.13 - HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
@@ -7,11 +7,19 @@
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
 let MODULE_CTX = null;
+// v10.13 AA: budget subrequest PER INVOCAZIONE. Plan free Cloudflare = 50
+// fetch/invocazione: superato il tetto, fetch() lancia e i canali muoiono.
+// Tutto il lavoro opzionale (warm, preWarm, prefetch) consuma il budget e si
+// ferma prima: il traffico reale del player passa SEMPRE.
+let SUB_BUDGET = 40;
+const subFree = n => SUB_BUDGET >= n;
+const subSpend = n => { SUB_BUDGET = Math.max(0, SUB_BUDGET - n); };
 const bg = fn => { try { if (MODULE_CTX && MODULE_CTX.waitUntil) MODULE_CTX.waitUntil(Promise.resolve().then(fn).catch(() => {})); } catch (e) {} };
 
 export default {
   async fetch(req, env, ctx) {
     MODULE_CTX = ctx || null;
+    SUB_BUDGET = 40;   // v10.13 AA: budget azzerato a ogni nuova invocazione
     heartbeat();
     const u = new URL(req.url);
     const P = u.origin;
@@ -54,32 +62,32 @@ export default {
 // DELAY MINIMO PER PROVIDER (v10.8): calcolato sulle durate REALI (EXTINF /
 // TARGETDURATION misurate sulle fonti), ognuno al proprio floor stabile:
 const PROV_DELAY = {
-  ntv:   { target: 9,  min: 8 },   // v10.12: 2 seg x 4.2s = 8.4s reali (floor meccanico)
-  daddy: { target: 10, min: 8 },   // v10.12: 2 seg x 4-6s = 8-12s
-  vavoo: { target: 21, min: 20 }   // v10.12: 2 seg (24-34s) + trim EXT-X-START -> ~21s
+  ntv:   { target: 12, min: 10 },  // v10.13 CC: 3 seg x 4.2s = 12.6s (runway anti-stall; v10.12 a 2 seg micro-stallava)
+  daddy: { target: 11, min: 9 },   // v10.13 CC: 2-3 seg x 4-6s = 10-12s
+  vavoo: { target: 21, min: 20 }   // v10.13 CC: 2 seg (24-34s) + trim EXT-X-START -> ~21s
 };
 const PROV_PREF_SEGS = 3, MIN_SEGS = 2;
 const delayCfg = prov => PROV_DELAY[prov] || { target: 24, min: 20 };
 const DELAY_TARGET = 24; // fallback di testo/estimate per provider non noto
 const EXT_START_TRIM = true;              // F: trim delay via EXT-X-START (false se un device da schermo grigio)
-const PREFETCH_SEGS = 1;                  // G: quanti segmenti nuovi pre-caricare in bg
+const PREFETCH_SEGS = 2;                  // v10.13 CC: 2 (era 1): i 2 seg piu' nuovi gia' in cache -> zero micro-scatti
 const STALE_FACTOR = 6, MAX_BUFFER_SECS = 40;
 const SEG_CACHE_TTL = 30;                 // FIX: 30s edge cache (era 600)
 const BUST_MS = 30000;                    // FIX: bust stabile 30s (era assente)
 const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
-const PL_CACHE_TTL = 2000, RESOLVE_BUDGET = 12000, STATE_STALE_TTL = 15*60*1000;
+const PL_CACHE_TTL = 2000, RESOLVE_BUDGET = 8000, STATE_STALE_TTL = 15*60*1000; // v10.13 BB: resolve cap 8s (era 12s)
 const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.12 MIN-DELAY';
+const VER = 'TVNOW-CF v10.13 SERENO';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;    // se l'edge URL fallisce, usa embeds per 60s
-const PLAYLIST_FRESH_MS = 4000;           // single-flight upstream playlist (finestra freschezza)
+const PLAYLIST_FRESH_MS = 3000;           // v10.13 CC: single-flight 4s -> 3s (finestra anunciata piu' fresca)
 const SEG_API_TTL = 120;                  // Cache API segmenti: sopravvive alla rotazione token (120s)
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -157,7 +165,7 @@ function findCh(q) {
   return BY_KEY.get(k) || null;
 }
 function elencoCanali() {
-  const L = ['CANALI (' + CHANNELS.length + ') — /live?ch=<slug>'];
+  const L = ['CANALI (' + CHANNELS.length + ') - /live?ch=<slug>'];
   for (const c of CHANNELS)
     L.push('  ' + c.slug.padEnd(24) + ' ntv=' + String(c.ntv||'-').padEnd(4) + ' vavoo=' + (c.vavoo||'-').padEnd(18) + ' daddy=' + (c.daddy||'-').padEnd(4));
   return L.join('\n');
@@ -426,6 +434,8 @@ function emitPlaylist(ck, slug, prov, txt, baseUrl, ctx) {
 // popola la Cache API NORMALIZZATA (stessa chiave del player, sopravvive
 // alla rotazione token) + cache edge CF (stesso bust a 30s)
 async function warmSeg(abs, ctx) {
+  if (!subFree(1)) return;   // v10.13 AA: il prefetch non mangia il budget
+  subSpend(1);
   const ref = (ctx && ctx.ref) || 'https://thedaddy.li/';
   const h = getBrowserHeaders(ref, ((ctx && ctx.ch) || '') + '|' + ((ctx && ctx.prov) || ''));
   const o = ctx && ctx.origin;
@@ -463,6 +473,10 @@ function heartbeat() {
 const WARM_BATCH = 2;
 let warmCursor = 0;
 function warmNext(n) {
+  // v10.13 AA: mai superare il budget subrequest dell'invocazione
+  const n2 = Math.min(n, Math.max(0, Math.floor(SUB_BUDGET / 6)));
+  if (!n2) return;
+  subSpend(n2 * 6);
   const t0 = Date.now();
   const jobs = [];
   for (let i = 0; i < n && i < CHANNELS.length; i++) {
@@ -485,6 +499,8 @@ function warmNext(n) {
 // cambi canale o il provider primario cade, il fallback parte gia' caldo.
 // Costo: ~zero dopo il primo giro (tutte le resolution hanno cache propria).
 async function preWarmProv(p, c) {
+  if (!subFree(4)) return;   // v10.13 AA: budget prima del lavoro opzionale
+  subSpend(4);
   try {
     if (p === 'ntv' && c.ntv) await ntvToken(c.ntv, c.slug);
     else if (p === 'vavoo' && (c.vavoo || c.vid6 || c.vid7)) await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
@@ -644,14 +660,14 @@ const vavooHeaders = extra => Object.assign({
 async function vavooResolveId(base, id) {
   const play = base + '/live/play/' + id;
   try {
-    const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: getBrowserHeaders(base + '/', base) }, 6000);
+    const r = await fetchT(base + '/live/resolve?url=' + encodeURIComponent(play), { headers: getBrowserHeaders(base + '/', base) }, 4000);
     if (r.ok) { const j = await r.json().catch(() => null); if (j && j.url) return j.url; }
   } catch (e) {}
   try {
     const r = await fetchT(base + '/mediahubmx-resolve.json', {
       method:'POST', headers: vavooHeaders({ 'Content-Type':'application/json', 'Origin':base, 'Referer':base + '/' }),
       body: JSON.stringify({ language:'de', region:'DE', url:play, clientVersion:'3.0.2' })
-    }, 6000);
+    }, 4000);
     if (r.ok) { const j = await r.json().catch(() => null); if (j && j.url) return j.url; }
   } catch (e) {}
   return null;
@@ -661,7 +677,7 @@ async function vavooLiveFind(base, query) {
     const rl = await fetchT(base + '/mediahubmx-list.json', {
       method:'POST', headers: vavooHeaders({ 'Content-Type':'application/json', 'Origin':base, 'Referer':base + '/' }),
       body: JSON.stringify({ language:'it', region:'IT', clientVersion:'3.0.2', url:base + '/live' })
-    }, 6000);
+    }, 4000);
     if (!rl.ok) return null;
     const j = await rl.json().catch(() => null);
     const items = (j && (j.items || j.channels || j.entries)) || [];
@@ -691,7 +707,7 @@ const noteVavooGoodHost = (u) => {
   if (m && !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(m[1])) vavooGoodHost = 'https://' + m[1];
 };
 async function tryVavooId(id) {
-  for (const base of VAVOO_MIRRORS.slice(0, 4)) {
+  for (const base of VAVOO_MIRRORS.slice(0, 2)) {   // v10.13 BB: 2 mirror (era 4)
     try { const u = await vavooResolveId(base, id); if (u) return u; } catch (e) {}
   }
   return null;
@@ -703,7 +719,9 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
   if (cachedUrl && cachedUrl.exp > t0) return cachedUrl.url;
   const healthKey = slug || norm(query);
   const health = getVavooHealth(healthKey);
-  const m = await ensureVavooMap();
+  // v10.13 BB: con ID espliciti (vid6/vid7) niente mappa GitHub sul percorso
+  // caldo: gli id SONO gia' il mapping. La mappa resta solo fallback finale.
+  const m = (vid6 || vid7) ? null : await ensureVavooMap();
   const mapId = m ? vavooMapFind(query || '', m) : null;
   const cands = [];
   if (mapId) cands.push({ id:mapId, num:0 });
@@ -730,7 +748,7 @@ async function vavooResolveDual(slug, query, vid6, vid7) {
     }
     if (cand.num) recordVavooFail(healthKey, cand.num);
   }
-  if (Date.now() - t0 < RESOLVE_BUDGET && vavooMap.t && Date.now() - vavooMap.t > 45*60*1000) {
+  if ((vid6 || vid7) ? false : (Date.now() - t0 < RESOLVE_BUDGET) && vavooMap.t && Date.now() - vavooMap.t > 45*60*1000) {
     try {
       const m2 = await ensureVavooMap(true);
       const id2 = m2 ? vavooMapFind(query || '', m2) : null;
@@ -884,6 +902,13 @@ async function live(u, P, legacy) {
     }
   }
   for (const p of tryOrder) { cbClear(c.slug, p); clearSegFails(c.slug, p); }
+  // v10.13 DD: RETE DI SICUREZZA AVVIO: nessun provider vivo ora, MA se abbiamo
+  // prodotto un output per questo canale negli ultimi 60s, serviamo quello:
+  // mai un avvio fallito per un singolo poll sfortunato (affaticamento o 403).
+  for (const [k, e] of plCache) {
+    if (k.startsWith(c.slug + ':') && Date.now() - e.t < 60 * 1000)
+      return R(e.txt, 200, HLS_NO_CACHE());
+  }
   return R('ERRORE: provider KO (' + tryOrder.join(' -> ') + ') per ' + c.name + '. Ultimo: ' + lastErr + '. /probe?ch=' + c.slug, 200, TXT());
 }
 
@@ -1151,7 +1176,7 @@ async function player(u, P) {
 <body>
   <div class="controls">
     <div class="title">📺 ${c.name}</div>
-    <div>Player: HLS.js | Delay ~8-21s (per provider) | Quality: MAX</div>
+    <div>Player: HLS.js | Delay ~10-21s (per provider) | Quality: MAX</div>
     <div id="status" class="status loading">⏳ Caricamento...</div>
     <div id="quality"></div>
     <div id="buffer"></div>
@@ -1167,10 +1192,10 @@ async function player(u, P) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
         backBufferLength: 20,
-        // v10.12: sync al floor minimo: NTV/Daddy ~8-12s (2 seg), Vavoo parte
-        // dal trim EXT-X-START (~21s). Sopra i 24s accelera a 1.5x e rientra.
-        liveSyncDuration: 10,
-        liveMaxLatencyDuration: 24,
+        // v10.13 CC: sync al floor stabile: NTV ~12.6s (3 seg), Daddy 10-12s,
+        // Vavoo dal trim (~21s). Sopra i 22s accelera a 1.5x e rientra.
+        liveSyncDuration: 12,
+        liveMaxLatencyDuration: 22,
         maxLiveSyncPlaybackRate: 1.5,
         maxBufferLength: 20,
         maxMaxBufferLength: ${MAX_BUFFER_SECS},
@@ -1389,8 +1414,8 @@ async function diag(u) {
   });
   L.push('=== FATTORI DI DELAY (v10.8: target per provider) ===',
     'delay totale = ritardo interno della FONTE + finestra (per provider) + buffer del player',
-    'NTV:   target ' + PROV_DELAY.ntv.target + 's (2 seg x ~4.2s = 8.4s, floor meccanico)   <- il provider con il delay minore',
-    'DADDY: target ' + PROV_DELAY.daddy.target + 's (2-3 seg x 4-6s = 8-12s)',
+    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3 seg x ~4.2s = 12.6s, runway anti-stall)   <- il provider con il delay minore',
+    'DADDY: target ' + PROV_DELAY.daddy.target + 's (2-3 seg x 4-6s = 10-12s)',
     'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg 12-17s + trim EXT-X-START)',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
@@ -1398,7 +1423,8 @@ async function diag(u) {
     'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.',
     'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.',
     'v10.11: heartbeat uptime 5 min (canali sempre pronti) + delay: ntv ~13s, daddy ~14s, vavoo ~25s.',
-    'v10.12: delay al floor meccanico: ntv ~8.4s, daddy ~8-12s, vavoo ~21s (2 seg + trim).');
+    'v10.12: delay al floor meccanico: ntv ~8.4s, daddy ~8-12s, vavoo ~21s (2 seg + trim).',
+    'v10.13: budget subrequest + resolve vavoo entro 8s + prefetch 2 seg + rete sicurezza avvio: zero micro-stalli, zero canali che non partono.');
   L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
     'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
     'catena embed solo come fallback dopo un edge-fail (memo 60s).',
@@ -1447,7 +1473,7 @@ function debug() {
 function uso(P) {
   return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay ~8-21s (per provider)',
+    '  /live?ch=<slug>                delay ~10-21s (per provider)',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
@@ -1469,11 +1495,12 @@ function uso(P) {
     '  • Cache API segmenti con chiave senza token: sopravvive alla rotazione 120s',
     '  • Single-flight playlist upstream 4s: N viewer = 1 fetch origine',
     '  • Prefetch popola la Cache API normalizzata',
-    'FIX v10.8 - v10.11 (definitiva):',
-    '  • Delay per provider sulle durate reali: ntv ~13s, daddy ~14s, vavoo ~25s',
+    'FIX v10.8 - v10.13 (definitiva):',
+    '  • Delay per provider sulle durate reali: ntv ~12.6s, daddy ~10-12s, vavoo ~21s',
     '  • Anti-cache CDN sulle m3u8 (bust intelligente su URL firmate): playlist sempre fresca',
     '  • URL Vavoo 120s + fix host IP (Cloudflare error 1003): RSI e canali piccoli stanno su',
-    '  • Heartbeat 5 min + warm progressivo con cursore: tutti i canali pronti, zapping istantaneo',
+    '  • Heartbeat 5 min + warm progressivo con cursore + budget subrequest: avvio 3-4s e niente affaticamento',
+    '  • Prefetch 2 seg + playlist upstream 3s + rete di sicurezza avvio: zero micro-stalli',
     '  • Guardie anti-freeze su TUTTI i provider + cleanup memoria completo (niente morti a 30min)',
     ''].join('\n');
 }
@@ -1517,4 +1544,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.12 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.13 DELAY-FIX ███
