@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.9 — DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
+// TVNOW-CF v10.10 — DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
@@ -86,6 +86,26 @@
 //    (bypass della cache edge CF sulla risposta). I SEGMENTI NON si toccano:
 //    sono file immutabili, la cache 30s resta il risparmio richieste.
 //    Resolve/token/estrattori dei provider: ZERO modifiche (restano v10.4).
+//
+// FIX v10.10 (RSI KO + freeze a 1-1.5min + lancio istantaneo):
+// S. BUST INTELLIGENTE: l'origin Vavoo ha URL FIRMATE e rifiuta parametri
+//    extra con 403 (verificato live). fetchPlaylistSmart(): prova con bust ->
+//    se 403/400 riprova SENZA bust e banna il bust per QUELL'HOST 30min.
+//    Risultato: NTV resta bustato (prova fatta: seq 37034 fisso -> 37060 con
+//    _b), Vavoo torna vivo su /rawu pulito + bypass cache CF.
+// T. ROTAZIONE URI VAVOO 240s -> 120s: la URL vavoo non bustabile e' anche la
+//    chiave cache CDN della sua playlist: ruotandola ogni 120s la playlist non
+//    resta congelata (la rotazione parte PRIMA che il player esaurisca i 34s
+//    di finestra) -> il freeze a 1-2 min sparisce.
+// U. DELAY PIU' BASSO CON DURATE REALI MISURATE: NTV reali ~4.2s/seg (non 7s):
+//    ntv 15s/12s -> 3-4 seg = 13-17s; daddy 16s/13s -> 3-4 seg = 15-18s;
+//    vavoo resta 28s (imposta dalla durata 17s dei seg, essenziale stabile).
+//    Player: liveSync 16, liveMax 30, catch-up 1.5x.
+// V. LANCIO TUTTI I CANALI IN 3-4s: warm progressivo CON CURSORE: a ogni
+//    /live il worker pre-riscalda in background i PROSSIMI 2 canali non ancora
+//    caldi (token NTV + URL edge Daddy + resolve Vavoo): dopo ~15 accessi
+//    TUTTI i 29 canali sono pronti; zapping + prima apertura istantanei e
+//    entro i limiti subrequest di Cloudflare (batch da 2 = ~3 rete/locali).
 // ============================================================================
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
@@ -136,8 +156,8 @@ export default {
 // DELAY MINIMO PER PROVIDER (v10.8): calcolato sulle durate REALI (EXTINF /
 // TARGETDURATION misurate sulle fonti), ognuno al proprio floor stabile:
 const PROV_DELAY = {
-  ntv:   { target: 21, min: 15 },  // seg ~7s -> 3 seg (21s); 2 seg solo se la fonte publica poco
-  daddy: { target: 18, min: 14 },  // seg ~4-6s -> 3-5 seg (16-20s)
+  ntv:   { target: 15, min: 12 },  // v10.10 U: durate reali ~4.2s -> 3-4 seg = 13-17s (era 21)
+  daddy: { target: 16, min: 13 },  // v10.10 U: seg 4-6s -> 3-4 seg = 15-18s (era 18)
   vavoo: { target: 28, min: 27 }   // seg ~17s -> 2 seg (34s) + trim EXT-X-START -> ~28s
 };
 const PROV_PREF_SEGS = 3, MIN_SEGS = 2;
@@ -151,10 +171,10 @@ const BUST_MS = 30000;                    // FIX: bust stabile 30s (era assente)
 const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
 const PL_CACHE_TTL = 2000, RESOLVE_BUDGET = 12000, STATE_STALE_TTL = 15*60*1000;
 const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
-const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 240*1000;
+const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.9 ANTI-CDN-M3U8';
+const VER = 'TVNOW-CF v10.10 READY';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -331,6 +351,8 @@ function cleanupStaleState() {
     const near = arr.filter(t => now - t < SEGFAIL_TTL);
     if (near.length) segFails.set(k, near); else segFails.delete(k);
   }
+  // v10.10 S: anche i ban del bust scadono
+  for (const [k, t] of noBustHosts) if (now - t > NO_BUST_TTL) noBustHosts.delete(k);
 }
 
 function getPlState(key) {
@@ -411,13 +433,31 @@ function plBust(url) {
   const b = Math.floor(Date.now() / PL_BUST_MS) * PL_BUST_MS;
   return url + (url.includes('?') ? '&' : '?') + '_b=' + b;
 }
+// v10.10 S: BUST INTELLIGENTE. Alcuni origin (Vavoo) hanno URL firmate e
+// rispondono 403 a qualunque parametro extra: per ogni host si prova il bust,
+// al primo 403/400 si riprova senza e l'host viene bannato dal bust per 30min.
+// Tutto resta dentro cf:{cacheTtl:0} (mai cache CF sulla playlist).
+const NO_BUST_TTL = 30 * 60 * 1000;
+const noBustHosts = new Map();
+const CF_NO_CACHE_PL = () => ({ cf: { cacheTtl: 0, cacheEverything: false } });
+async function fetchPlaylistSmart(url, headers, timeoutMs) {
+  const host = String(url).split('/')[2] || '';
+  const banned = noBustHosts.get(host) || 0;
+  const canBust = Date.now() - banned > NO_BUST_TTL;
+  if (canBust) {
+    const r = await fetchT(plBust(url), Object.assign({ headers }, CF_NO_CACHE_PL()), timeoutMs);
+    if (r.status === 403 || r.status === 400) { noBustHosts.set(host, Date.now()); }
+    else return r;
+  }
+  return await fetchT(url, Object.assign({ headers }, CF_NO_CACHE_PL()), timeoutMs);
+}
 function fetchUpstreamPl(key, url, headers, timeoutMs) {
   const now = Date.now();
   const e = plFetchCache.get(key);
   if (e && e.txt && now - e.t < PLAYLIST_FRESH_MS) return Promise.resolve(e.txt);
   if (e && e.inflight) return e.inflight;
   const p = (async () => {
-    const r = await fetchT(plBust(url), { headers, cf: { cacheTtl: 0, cacheEverything: false } }, timeoutMs);
+    const r = await fetchPlaylistSmart(url, headers, timeoutMs);
     const txt = r.ok ? await r.text() : '';
     if (!txt.includes('#EXTM3U')) throw new Error('upstream ' + r.status);
     return txt;
@@ -499,6 +539,31 @@ async function warmSeg(abs, ctx) {
   } catch (e) {}
 }
 
+// --- v10.10 V: WARM PROGRESSIVO CON CURSORE (tutti i canali pronti in pochi accessi) ---
+// A ogni live/seg/player il worker pre-riscalda in background i PROSSIMI 2
+// canali della lista (token NTV / URL edge Daddy / resolve Vavoo): dopo circa
+// 15 accessi tutti i 29 canali risultano pronti, e ogni zapping successivo
+// parte istantaneo. Batch da 2 canali (~3-5 subrequests) = dentro i limiti
+// subrequest di Cloudflare per invocazione.
+const WARM_BATCH = 2;
+let warmCursor = 0;
+function warmNext(n) {
+  const t0 = Date.now();
+  const jobs = [];
+  for (let i = 0; i < n && i < CHANNELS.length; i++) {
+    const c = CHANNELS[(warmCursor + i) % CHANNELS.length];
+    jobs.push((async () => {
+      try { if (c.ntv) await ntvToken(c.ntv, c.slug); } catch (e) {}
+      try { if (c.daddy) await daddyResolve(c.daddy, c.slug); } catch (e) {}
+      try { if (c.vavoo || c.vid6 || c.vid7) await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7); } catch (e) {}
+    })());
+  }
+  warmCursor = (warmCursor + n) % CHANNELS.length;
+  const p = Promise.all(jobs).then(() => { log('warm batch ok (cur=' + warmCursor + ', ' + (Date.now()-t0) + 'ms)'); }).catch(() => {});
+  if (MODULE_CTX) { try { MODULE_CTX.waitUntil(p); } catch (e) {} }
+  return p;
+}
+
 // --- v10.8 Q: ANTI-AFFATICAMENTO ZAPPING -----------------------------------
 // Al primo poll di un canale i provider DI RIPIEGO vengono pre-riscaldati in
 // background (token NTV / resolve Vavoo / edge Daddy gia' in cache). Quando
@@ -535,12 +600,12 @@ async function ntvToken(id, slug) {
 }
 async function ntvPlaylist(id, slug) {
   let tk = await ntvToken(id, slug);
-  let r = await fetchT(plBust(tk.m3u8), { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+  let r = await fetchPlaylistSmart(tk.m3u8, getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), 8000);
   let txt = r.ok ? await r.text() : '';
   if (!r.ok || r.status >= 500 || !txt.includes('#EXTM3U')) {
     tokenCache.delete(id); ntvStats.refresh++;
     tk = await ntvToken(id, slug);
-    r = await fetchT(plBust(tk.m3u8), { headers: getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+    r = await fetchPlaylistSmart(tk.m3u8, getBrowserHeaders(tk.ref, (slug || '') + '|ntv'), 8000);
     txt = r.ok ? await r.text() : '';
   }
   if (!txt.includes('#EXTM3U')) throw new Error('ntv playlist ' + r.status + ' non-HLS');
@@ -795,6 +860,8 @@ async function live(u, P, legacy) {
   // v10.8 Q: pre-riscalda i provider di ripiego DI QUESTO CANALE in background:
   // se il primario cade (o zappi di continuo), il fallback e' gia' pronto.
   for (let i = 1; i < tryOrder.length; i++) { const pp = tryOrder[i]; if (pp) bg(() => preWarmProv(pp, c)); }
+  // v10.10 V: warm progressivo: i prossimi 2 canali della lista diventano pronti
+  warmNext(WARM_BATCH);
 
   const ck = c.slug + ':' + tryOrder.join('.');
   const cachedOut = plCacheGet(ck);
@@ -813,8 +880,8 @@ async function live(u, P, legacy) {
       const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
       if (!vu) return null;
       if (/\.m3u8(\?|$)/i.test(vu)) {
-        // v10.9 R: playlist vavoo -> bust 2s + bypass cache CF
-        const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+        // v10.10 S/T: playlist vavoo -> smart bust (URL firmate: fallback pulito)
+        const r = await fetchPlaylistSmart(vu, vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), 8000);
         if (!r.ok) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
         const txt = await r.text();
         if (!txt.includes('#EXTM3U')) { vavooURLCache.delete(c.slug); cbRecordFail(c.slug, 'vavoo'); return null; }
@@ -835,7 +902,7 @@ async function live(u, P, legacy) {
       let du = await daddyResolve(c.daddy, c.slug);
       let txt = null;
       if (du && /\.m3u8/i.test(du)) {
-        try { txt = await fetchUpstreamPl('daddy|' + c.daddy, du, dh, 12000); }
+        try { txt = await fetchUpstreamPl('daddy|' + c.daddy, du, dh, 8000); }
         catch (e) {
           if (/wedd48c|edge\./i.test(du)) {
             daddyEdgeFail.set(String(c.daddy), Date.now()); daddyCache.delete(c.daddy);
@@ -847,10 +914,16 @@ async function live(u, P, legacy) {
       if (!du) {
         du = await daddyResolve(c.daddy, c.slug, true);
         if (!du || !/\.m3u8/i.test(du)) return null;
-        // v10.9 R: anche la playlist del fallback embed -> bust 2s + bypass CF
-        const r = await fetchT(plBust(du), { headers: dh, cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+        // v10.10 S: anche la playlist del fallback embed -> smart bust
+        const r = await fetchPlaylistSmart(du, dh, 8000);
         txt = r.ok ? await r.text() : '';
         if (!txt.includes('#EXTM3U')) { daddyCache.delete(c.daddy); cbRecordFail(c.slug, 'daddy'); return null; }
+      }
+      // v10.10: guardia anti-freeze come dagli altri provider: playlist upstream
+      // congelata (seq fermo) -> throw -> il canale passa al provider dopo
+      {
+        const pchk = parseMediaPl(txt);
+        if (!pchk.isMaster && pchk.segs.length) checkFreshOrThrow(c.slug + '|daddy', pchk.upSeq, pchk.upTarget, 'daddy');
       }
       const body = rewriteAny(txt, du, { P, ch:c.slug, prov:'daddy', ref:'https://dembed.st/', origin:'https://dembed.st' });
       const lines = body.split('\n');
@@ -1161,11 +1234,11 @@ async function player(u, P) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
         backBufferLength: 20,
-        // v10.8: sync sul floor del provider piu' rapido: se il canale sta su
-        // NTV (21s) o Daddy (18s), il player segue invece di tenere 25s+;
-        // sopra i 32s accelera a 1.5x e rientra. Il ritardo non si accumula.
-        liveSyncDuration: 18,
-        liveMaxLatencyDuration: 32,
+        // v10.10 U: sync sul floor piu' basso con durate reali: NTV ~13-17s,
+        // Daddy ~15-18s; sopra i 30s accelera a 1.5x e rientra. Vavoo parte
+        // dal trim EXT-X-START (28s) e resta nella finestra senza inseguire.
+        liveSyncDuration: 16,
+        liveMaxLatencyDuration: 30,
         maxLiveSyncPlaybackRate: 1.5,
         maxBufferLength: 20,
         maxMaxBufferLength: ${MAX_BUFFER_SECS},
@@ -1260,7 +1333,7 @@ async function checkseg(u) {
     } else if (source === 'daddy') {
       const du = await daddyResolve(ch, slug);
       if (!du) return R('Daddy non risolto', 200, TXT());
-      const r = await fetchT(plBust(du), { headers: getBrowserHeaders('https://dembed.st/', slug + '|daddy'), cf: { cacheTtl: 0, cacheEverything: false } }, 10000);
+      const r = await fetchPlaylistSmart(du, getBrowserHeaders('https://dembed.st/', slug + '|daddy'), 10000);
       if (!r.ok) return R('Daddy HTTP ' + r.status, 200, TXT());
       txt = await r.text(); headers = getBrowserHeaders('https://dembed.st/', slug + '|daddy');
     } else if (source === 'vavoo') {
@@ -1268,7 +1341,7 @@ async function checkseg(u) {
       if (!c) return R('Vavoo: canale non trovato', 200, TXT());
       const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
       if (!vu) return R('Vavoo non risolto', 200, TXT());
-      const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 10000);
+      const r = await fetchPlaylistSmart(vu, vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), 10000);
       if (!r.ok) return R('Vavoo HTTP ' + r.status, 200, TXT());
       txt = await r.text(); headers = vavooHeaders({ 'User-Agent':'VAVOO/1.0' });
     }
@@ -1370,7 +1443,7 @@ async function diag(u) {
   if (c.vavoo || c.vid6 || c.vid7) await tryP('VAVOO', async () => {
     const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
     if (!vu) throw new Error('non risolto');
-    const r = await fetchT(plBust(vu), { headers: vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+    const r = await fetchPlaylistSmart(vu, vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), 12000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
@@ -1378,13 +1451,13 @@ async function diag(u) {
   if (c.daddy) await tryP('DADDY', async () => {
     const du = await daddyResolve(c.daddy, c.slug);
     if (!du) throw new Error('non risolto');
-    const r = await fetchT(plBust(du), { headers: getBrowserHeaders('https://dembed.st/', c.slug + '|daddy'), cf: { cacheTtl: 0, cacheEverything: false } }, 12000);
+    const r = await fetchPlaylistSmart(du, getBrowserHeaders('https://dembed.st/', c.slug + '|daddy'), 12000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
   L.push('=== FATTORI DI DELAY (v10.8: target per provider) ===',
     'delay totale = ritardo interno della FONTE + finestra (per provider) + buffer del player',
-    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3 seg x ~7s)   <- il provider con il delay minore',
+    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3-4 seg x ~4.2s)   <- il provider con il delay minore',
     'DADDY: target ' + PROV_DELAY.daddy.target + 's (3-5 seg x 4-6s)',
     'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg x 17s + trim EXT-X-START)',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
@@ -1424,6 +1497,7 @@ function debug() {
     'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
     'Delay/provider: ntv ' + PROV_DELAY.ntv.target + 's | daddy ' + PROV_DELAY.daddy.target + 's | vavoo ' + PROV_DELAY.vavoo.target + 's | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
+    'Smart bust: host senza bust (URL firmate): ' + (Array.from(noBustHosts.keys()).join(', ') || 'nessuno') + ' | warm cursor: ' + warmCursor + '/' + CHANNELS.length,
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
     'CB cooldown attivi: ' + (cds.join(', ') || 'nessuno'),
     'SegFails: ' + (sf.join(', ') || 'nessuno'),
@@ -1479,10 +1553,13 @@ async function rawu(u) {
   if (!t) return R('uso: /rawu?u=<url>', 200, TXT());
   const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/', 'rawu');
   if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
-  // v10.9: diagnostici RAW senza cache: m3u8 -> bust + bypass CF (vede il vero origin)
-  const tgt = /\.m3u8(\?|$)/i.test(t) ? plBust(t) : t;
+  // v10.9/v10.10: diagnostici RAW senza cache: m3u8 -> smart bust (vede il vero origin)
   let r;
-  try { r = await fetchT(tgt, { headers:h, cf: { cacheTtl: 0, cacheEverything: false }, redirect:'follow' }, 20000); }
+  try {
+    r = /\.m3u8(\?|$)/i.test(t)
+      ? await fetchPlaylistSmart(t, h, 20000)
+      : await fetchT(t, { headers:h, cf: { cacheTtl: 0, cacheEverything: false }, redirect:'follow' }, 20000);
+  }
   catch (e) { return R('ERR: ' + (e && e.message), 200, TXT()); }
   let body = '';
   try { body = await r.text(); } catch (e) { body = '(no body)'; }
@@ -1498,4 +1575,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.9 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.10 DELAY-FIX ███
