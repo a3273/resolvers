@@ -1,6 +1,5 @@
 // ============================================================================
-// TVNOW-CF v11.2 — Worker ottimizzato con Daddy + Pre-fetch
-// Obiettivo: ~2.500 richieste/giorno per 5h streaming (2,5% limite Free)
+// TVNOW-CF v11.3 — Worker completo con debug, probe, UI + Daddy ottimizzato
 // ============================================================================
 
 const CHANNELS = [
@@ -42,10 +41,10 @@ const CHANNELS = [
 // ============================================================================
 
 const m3u8Cache = new Map();
-const M3U8_TTL = 90 * 1000;  // 90 secondi (token dura ~120s)
+const M3U8_TTL = 90 * 1000;
 
 const segCache = new Map();
-const SEG_TTL = 60 * 1000;    // 60 secondi
+const SEG_TTL = 60 * 1000;
 const MAX_SEG_CACHE = 200;
 
 let totalRequests = 0;
@@ -80,33 +79,33 @@ const TXT = () => ({ 'content-type': 'text/plain; charset=utf-8', 'access-contro
 const JSON_H = () => ({ 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
 const M3U8 = () => ({ 'content-type': 'application/vnd.apple.mpegurl', 'cache-control': 'max-age=30', 'access-control-allow-origin': '*' });
 const TS = () => ({ 'content-type': 'video/mp2t', 'cache-control': 'max-age=60', 'access-control-allow-origin': '*' });
+const HTML = () => ({ 'content-type': 'text/html; charset=utf-8', 'access-control-allow-origin': '*' });
 
 // ============================================================================
-// PLACEHOLDER NTV E VAVOO (da implementare)
+// PLACEHOLDER NTV E VAVOO
 // ============================================================================
 
 async function resolveNtv(slug) {
   try {
     console.log(`[NTV] Tentativo per ${slug}`);
-    return null; // TODO: implementa logica reale
+    return null;
   } catch (e) { return null; }
 }
 
 async function resolveVavoo(id) {
   try {
     console.log(`[VAVOO] Tentativo per ID ${id}`);
-    return null; // TODO: implementa logica reale
+    return null;
   } catch (e) { return null; }
 }
 
 // ============================================================================
-// DADDY: Risoluzione m3u8 da thedaddy.li → dembed.st → edge.wedd48c.top
+// DADDY: Risoluzione m3u8
 // ============================================================================
 
 async function resolveDaddyM3u8(channelId) {
   console.log(`[DADDY] Risoluzione m3u8 per ID ${channelId}`);
 
-  // 1. Pagina player thedaddy.li/cast/stream-{id}.php
   const playerUrl = `https://thedaddy.li/cast/stream-${channelId}.php`;
   const playerResp = await fetch(playerUrl, {
     headers: {
@@ -119,13 +118,11 @@ async function resolveDaddyM3u8(channelId) {
   if (!playerResp.ok) throw new Error(`HTTP ${playerResp.status} thedaddy.li`);
   const playerHtml = await playerResp.text();
 
-  // 2. Iframe dembed.st
   const iframeMatch = playerHtml.match(/<iframe[^>]*src=["']([^"']*dembed\.st[^"']*)["'][^>]*>/i);
   if (!iframeMatch) throw new Error('Iframe dembed.st non trovato');
   let dembedUrl = iframeMatch[1];
   if (dembedUrl.startsWith('//')) dembedUrl = 'https:' + dembedUrl;
 
-  // 3. dembed.st con referer thedaddy.li
   const dembedResp = await fetch(dembedUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -136,7 +133,6 @@ async function resolveDaddyM3u8(channelId) {
   if (!dembedResp.ok) throw new Error(`HTTP ${dembedResp.status} dembed.st`);
   const dembedHtml = await dembedResp.text();
 
-  // 4. m3u8 (prima scelta edge.wedd48c.top, poi fallback)
   let m3u8Match = dembedHtml.match(/https?:\/\/edge\.wedd48c\.top\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
   if (!m3u8Match) m3u8Match = dembedHtml.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
   if (!m3u8Match) throw new Error('URL m3u8 non trovato');
@@ -147,7 +143,7 @@ async function resolveDaddyM3u8(channelId) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-proxy - m3u8 ottimizzata con cache
+// ENDPOINT /daddy-proxy
 // ============================================================================
 
 async function daddyProxy(u, origin) {
@@ -156,7 +152,6 @@ async function daddyProxy(u, origin) {
   if (!id) return new Response('id mancante', { status: 400, headers: TXT() });
 
   try {
-    // 1. Cache m3u8
     const cacheKey = `m3u8_${id}`;
     const cached = m3u8Cache.get(cacheKey);
     if (cached && Date.now() < cached.expires) {
@@ -164,7 +159,6 @@ async function daddyProxy(u, origin) {
       return new Response(cached.content, { headers: M3U8() });
     }
 
-    // 2. Risolvi m3u8 originale
     const originalM3u8Url = await resolveDaddyM3u8(id);
     const m3u8Resp = await fetch(originalM3u8Url, {
       headers: {
@@ -175,7 +169,6 @@ async function daddyProxy(u, origin) {
     if (!m3u8Resp.ok) throw new Error(`HTTP ${m3u8Resp.status} m3u8`);
     let m3u8Content = await m3u8Resp.text();
 
-    // 3. Ottimizzazione: master playlist → qualità singola (più alta)
     if (m3u8Content.includes('#EXT-X-STREAM-INF')) {
       const variants = [];
       const lines = m3u8Content.split('\n');
@@ -204,13 +197,11 @@ async function daddyProxy(u, origin) {
       }
     }
 
-    // 4. Ottimizzazioni m3u8
     m3u8Content = m3u8Content.replace(/#EXT-X-TARGETDURATION:\d+/, '#EXT-X-TARGETDURATION:10');
     if (!m3u8Content.includes('#EXT-X-PLAYLIST-TYPE')) {
       m3u8Content = m3u8Content.replace(/#EXTM3U/, '#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT');
     }
 
-    // 5. Riscrivi URL segmenti → nostro proxy
     const lines = m3u8Content.split('\n');
     const rewritten = lines.map(line => {
       if (line.startsWith('#') || line.trim() === '') return line;
@@ -223,7 +214,6 @@ async function daddyProxy(u, origin) {
     });
     const finalContent = rewritten.join('\n');
 
-    // 6. Salva in cache
     m3u8Cache.set(cacheKey, { content: finalContent, expires: Date.now() + M3U8_TTL });
     console.log(`[DADDY] ✅ m3u8 ottimizzata ID ${id}`);
 
@@ -235,7 +225,7 @@ async function daddyProxy(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-seg - Proxy segmenti con cache
+// ENDPOINT /daddy-seg
 // ============================================================================
 
 async function daddySeg(u) {
@@ -244,7 +234,6 @@ async function daddySeg(u) {
   const cacheKey = u.searchParams.get('k') || segmentUrl;
   if (!segmentUrl) return new Response('u mancante', { status: 400, headers: TXT() });
 
-  // 1. Cache
   const cached = segCache.get(cacheKey);
   if (cached && Date.now() - cached.time < SEG_TTL) {
     cacheHits++;
@@ -252,7 +241,6 @@ async function daddySeg(u) {
   }
 
   try {
-    // 2. Fetch segmento
     const segResp = await fetch(segmentUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -264,8 +252,6 @@ async function daddySeg(u) {
     if (!segResp.ok) return new Response(`HTTP ${segResp.status}`, { status: segResp.status });
 
     const body = await segResp.arrayBuffer();
-
-    // 3. Cache con cleanup
     segCache.set(cacheKey, { body, time: Date.now() });
     cleanupSegCache();
 
@@ -276,14 +262,13 @@ async function daddySeg(u) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-prefetch - Pre-cache canali popolari
+// ENDPOINT /daddy-prefetch
 // ============================================================================
 
 async function daddyPrefetch(u, origin) {
-  // Canali più usati (da personalizzare)
   const popularChannels = ['577', '870', '869', '860', '877', '462', '461'];
-
   const results = [];
+  
   for (const id of popularChannels) {
     try {
       const cacheKey = `m3u8_${id}`;
@@ -293,7 +278,6 @@ async function daddyPrefetch(u, origin) {
         continue;
       }
 
-      // Simula chiamata a daddy-proxy
       const fakeUrl = new URL(`${origin}/daddy-proxy?id=${id}`);
       const resp = await daddyProxy(fakeUrl, origin);
       if (resp.status === 200) {
@@ -314,7 +298,7 @@ async function daddyPrefetch(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /live - Flusso principale NTV → Vavoo → Daddy
+// ENDPOINT /live
 // ============================================================================
 
 async function live(req, u) {
@@ -324,19 +308,16 @@ async function live(req, u) {
 
   console.log(`[LIVE] Richiesta ${channel.name} (${channel.slug})`);
 
-  // 1. NTV
   if (channel.ntv) {
     const r = await resolveNtv(channel.ntv);
     if (r) return new Response(null, { status: 302, headers: { 'Location': r.url, 'access-control-allow-origin': '*' } });
   }
 
-  // 2. Vavoo
   if (channel.vavoo) {
     const r = await resolveVavoo(channel.vavoo);
     if (r) return new Response(null, { status: 302, headers: { 'Location': r.url, 'access-control-allow-origin': '*' } });
   }
 
-  // 3. Daddy → nostro proxy ottimizzato
   if (channel.daddy) {
     const url = `${u.origin}/daddy-proxy?id=${channel.daddy}`;
     return new Response(null, {
@@ -349,7 +330,106 @@ async function live(req, u) {
 }
 
 // ============================================================================
-// ENDPOINT DIAGNOSTICA
+// ENDPOINT /probe - Test canale specifico
+// ============================================================================
+
+async function probe(u) {
+  const query = u.searchParams.get('ch') || u.searchParams.get('id') || '';
+  const provider = u.searchParams.get('provider') || 'all';
+  const channel = findCh(query);
+  
+  if (!channel) {
+    return new Response(JSON.stringify({ error: 'Canale non trovato', query }, null, 2), { headers: JSON_H() });
+  }
+
+  const results = {
+    channel: channel,
+    timestamp: new Date().toISOString(),
+    tests: {}
+  };
+
+  if (provider === 'all' || provider === 'ntv') {
+    if (channel.ntv) {
+      const start = Date.now();
+      try {
+        const r = await resolveNtv(channel.ntv);
+        results.tests.ntv = {
+          status: r ? 'ok' : 'failed',
+          elapsed: Date.now() - start + 'ms',
+          url: r ? r.url : null
+        };
+      } catch (e) {
+        results.tests.ntv = { status: 'error', error: e.message, elapsed: Date.now() - start + 'ms' };
+      }
+    }
+  }
+
+  if (provider === 'all' || provider === 'vavoo') {
+    if (channel.vavoo) {
+      const start = Date.now();
+      try {
+        const r = await resolveVavoo(channel.vavoo);
+        results.tests.vavoo = {
+          status: r ? 'ok' : 'failed',
+          elapsed: Date.now() - start + 'ms',
+          url: r ? r.url : null
+        };
+      } catch (e) {
+        results.tests.vavoo = { status: 'error', error: e.message, elapsed: Date.now() - start + 'ms' };
+      }
+    }
+  }
+
+  if (provider === 'all' || provider === 'daddy') {
+    if (channel.daddy) {
+      const start = Date.now();
+      try {
+        const m3u8Url = await resolveDaddyM3u8(channel.daddy);
+        results.tests.daddy = {
+          status: 'ok',
+          elapsed: Date.now() - start + 'ms',
+          m3u8_url: m3u8Url
+        };
+      } catch (e) {
+        results.tests.daddy = { status: 'error', error: e.message, elapsed: Date.now() - start + 'ms' };
+      }
+    }
+  }
+
+  return new Response(JSON.stringify(results, null, 2), { headers: JSON_H() });
+}
+
+// ============================================================================
+// ENDPOINT /debug - Info completa canale
+// ============================================================================
+
+async function debug(u) {
+  const query = u.searchParams.get('ch') || u.searchParams.get('id') || '';
+  const channel = findCh(query);
+  
+  if (!channel) {
+    return new Response(JSON.stringify({ error: 'Canale non trovato', query }, null, 2), { headers: JSON_H() });
+  }
+
+  const info = {
+    channel: channel,
+    timestamp: new Date().toISOString(),
+    providers: {
+      ntv: channel.ntv ? { configured: true, slug: channel.ntv } : { configured: false },
+      vavoo: channel.vavoo ? { configured: true, id: channel.vavoo } : { configured: false },
+      daddy: channel.daddy ? { configured: true, id: channel.daddy } : { configured: false }
+    },
+    endpoints: {
+      live: `/live?ch=${channel.slug}`,
+      daddy_proxy: `/daddy-proxy?id=${channel.daddy || 'N/A'}`
+    }
+  };
+
+  return new Response(JSON.stringify(info, null, 2), { headers: JSON_H() });
+}
+
+// ============================================================================
+// ENDPOINT /stats
 // ============================================================================
 
 async function stats() {
@@ -371,15 +451,109 @@ async function stats() {
   }, null, 2), { headers: JSON_H() });
 }
 
+// ============================================================================
+// ENDPOINT /channels
+// ============================================================================
+
 async function channels() {
   return new Response(JSON.stringify(CHANNELS, null, 2), { headers: JSON_H() });
 }
 
+// ============================================================================
+// ENDPOINT /health
+// ============================================================================
+
 async function health() {
   return new Response(JSON.stringify({
-    status: 'ok', version: '11.2', channels: CHANNELS.length,
+    status: 'ok',
+    version: '11.3',
+    channels: CHANNELS.length,
     timestamp: new Date().toISOString()
   }, null, 2), { headers: JSON_H() });
+}
+
+// ============================================================================
+// UI WEB - Interfaccia grafica
+// ============================================================================
+
+function ui(origin) {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TVNow-CF Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0a; color: #eee; font: 14px -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
+    h1 { color: #4CAF50; margin-bottom: 10px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 20px 0; }
+    .stat-box { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 16px; }
+    .stat-label { font-size: 11px; color: #888; margin-bottom: 4px; }
+    .stat-value { font-size: 24px; font-weight: 700; color: #4CAF50; }
+    .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 20px; }
+    .channel { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 12px; }
+    .channel-name { font-weight: 700; margin-bottom: 8px; }
+    .providers { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .badge { padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+    .badge-ntv { background: #1a2a4a; color: #6cf; }
+    .badge-vavoo { background: #2a1a4a; color: #c6f; }
+    .badge-daddy { background: #1a4a2a; color: #6f6; }
+    button { background: #2196F3; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; margin-top: 8px; }
+    button:hover { background: #1976D2; }
+  </style>
+</head>
+<body>
+  <h1>📺 TVNow-CF Dashboard</h1>
+  <div class="stats" id="stats"></div>
+  <h2>Canali Disponibili (${CHANNELS.length})</h2>
+  <div class="channels" id="channels"></div>
+  
+  <script>
+    const ORIGIN = ${JSON.stringify(origin)};
+    
+    async function loadStats() {
+      const r = await fetch(ORIGIN + '/stats');
+      const data = await r.json();
+      document.getElementById('stats').innerHTML = 
+        '<div class="stat-box"><div class="stat-label">Uptime</div><div class="stat-value">' + data.uptime_hours + 'h</div></div>' +
+        '<div class="stat-box"><div class="stat-label">Richieste Totali</div><div class="stat-value">' + data.total_requests + '</div></div>' +
+        '<div class="stat-box"><div class="stat-label">Cache Hit Rate</div><div class="stat-value">' + data.cache_hit_rate + '</div></div>' +
+        '<div class="stat-box"><div class="stat-label">Uso Giornaliero</div><div class="stat-value">' + data.usage_percent + '</div></div>';
+    }
+    
+    function loadChannels() {
+      const channels = ${JSON.stringify(CHANNELS)};
+      const html = channels.map(ch => 
+        '<div class="channel">' +
+        '<div class="channel-name">' + ch.name + '</div>' +
+        '<div style="font-size:11px;color:#888;">' + ch.slug + '</div>' +
+        '<div class="providers">' +
+        (ch.ntv ? '<span class="badge badge-ntv">NTV</span>' : '') +
+        (ch.vavoo ? '<span class="badge badge-vavoo">Vavoo</span>' : '') +
+        (ch.daddy ? '<span class="badge badge-daddy">Daddy</span>' : '') +
+        '</div>' +
+        '<button onclick="window.open(\\'' + ORIGIN + '/live?ch=' + ch.slug + '\\', \\'_blank\\')">▶ Play</button>' +
+        '<button onclick="testChannel(\\'' + ch.slug + '\\')">🔍 Test</button>' +
+        '</div>'
+      ).join('');
+      document.getElementById('channels').innerHTML = html;
+    }
+    
+    async function testChannel(slug) {
+      const r = await fetch(ORIGIN + '/probe?ch=' + slug);
+      const data = await r.json();
+      alert(JSON.stringify(data, null, 2));
+    }
+    
+    loadStats();
+    loadChannels();
+    setInterval(loadStats, 5000);
+  </script>
+</body>
+</html>`;
+  
+  return new Response(html, { headers: HTML() });
 }
 
 // ============================================================================
@@ -391,14 +565,19 @@ export default {
     totalRequests++;
     const u = new URL(req.url);
     const path = u.pathname;
+    
     try {
-      if (path === '/' || path === '/health') return await health();
+      if (path === '/') return ui(u.origin);
+      if (path === '/health') return await health();
       if (path === '/live') return await live(req, u);
       if (path === '/channels') return await channels();
       if (path === '/stats') return await stats();
+      if (path === '/probe') return await probe(u);
+      if (path === '/debug') return await debug(u);
       if (path === '/daddy-proxy') return await daddyProxy(u, u.origin);
       if (path === '/daddy-seg') return await daddySeg(u);
       if (path === '/daddy-prefetch') return await daddyPrefetch(u, u.origin);
+      
       return new Response('Endpoint non trovato', { status: 404, headers: TXT() });
     } catch (error) {
       console.error('[ERROR]', error);
