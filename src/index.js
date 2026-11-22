@@ -1465,4 +1465,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.5 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.8 DELAY-FIX ███
