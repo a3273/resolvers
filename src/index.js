@@ -54,7 +54,7 @@ let cacheHits = 0;
 const deployTime = Date.now();
 
 // ============================================================================
-// HELPER
+// HELPER FUNCTIONS
 // ============================================================================
 
 function findCh(query) {
@@ -82,7 +82,7 @@ const TS = () => ({ 'content-type': 'video/mp2t', 'cache-control': 'max-age=60',
 const HTML = () => ({ 'content-type': 'text/html; charset=utf-8', 'access-control-allow-origin': '*' });
 
 // ============================================================================
-// PLACEHOLDER NTV E VAVOO
+// PROVIDER NTV (placeholder)
 // ============================================================================
 
 async function resolveNtv(slug) {
@@ -92,6 +92,10 @@ async function resolveNtv(slug) {
   } catch (e) { return null; }
 }
 
+// ============================================================================
+// PROVIDER VAVOO (placeholder)
+// ============================================================================
+
 async function resolveVavoo(id) {
   try {
     console.log(`[VAVOO] Tentativo per ID ${id}`);
@@ -100,7 +104,7 @@ async function resolveVavoo(id) {
 }
 
 // ============================================================================
-// DADDY: Risoluzione m3u8
+// PROVIDER DADDY - Risoluzione m3u8 da thedaddy.li
 // ============================================================================
 
 async function resolveDaddyM3u8(channelId) {
@@ -143,7 +147,7 @@ async function resolveDaddyM3u8(channelId) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-proxy
+// ENDPOINT /daddy-proxy - m3u8 ottimizzata
 // ============================================================================
 
 async function daddyProxy(u, origin) {
@@ -225,7 +229,7 @@ async function daddyProxy(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /daddy-seg
+// ENDPOINT /daddy-seg - Proxy segmenti
 // ============================================================================
 
 async function daddySeg(u) {
@@ -298,7 +302,7 @@ async function daddyPrefetch(u, origin) {
 }
 
 // ============================================================================
-// ENDPOINT /live
+// ENDPOINT /live - Flusso principale
 // ============================================================================
 
 async function live(req, u) {
@@ -330,7 +334,7 @@ async function live(req, u) {
 }
 
 // ============================================================================
-// ENDPOINT /probe - Test canale specifico
+// ENDPOINT /probe
 // ============================================================================
 
 async function probe(u) {
@@ -400,7 +404,7 @@ async function probe(u) {
 }
 
 // ============================================================================
-// ENDPOINT /debug - Info completa canale
+// ENDPOINT /debug
 // ============================================================================
 
 async function debug(u) {
@@ -473,91 +477,7 @@ async function health() {
 }
 
 // ============================================================================
-// UI WEB - Interfaccia grafica
-// ============================================================================
-
-function ui(origin) {
-  const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>TVNow-CF Dashboard</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0a0a0a; color: #eee; font: 14px -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px; }
-    h1 { color: #4CAF50; margin-bottom: 10px; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 20px 0; }
-    .stat-box { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 16px; }
-    .stat-label { font-size: 11px; color: #888; margin-bottom: 4px; }
-    .stat-value { font-size: 24px; font-weight: 700; color: #4CAF50; }
-    .channels { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 20px; }
-    .channel { background: #161616; border: 1px solid #333; border-radius: 8px; padding: 12px; }
-    .channel-name { font-weight: 700; margin-bottom: 8px; }
-    .providers { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-    .badge { padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: 600; }
-    .badge-ntv { background: #1a2a4a; color: #6cf; }
-    .badge-vavoo { background: #2a1a4a; color: #c6f; }
-    .badge-daddy { background: #1a4a2a; color: #6f6; }
-    button { background: #2196F3; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; margin-top: 8px; }
-    button:hover { background: #1976D2; }
-  </style>
-</head>
-<body>
-  <h1>📺 TVNow-CF Dashboard</h1>
-  <div class="stats" id="stats"></div>
-  <h2>Canali Disponibili (${CHANNELS.length})</h2>
-  <div class="channels" id="channels"></div>
-  
-  <script>
-    const ORIGIN = ${JSON.stringify(origin)};
-    
-    async function loadStats() {
-      const r = await fetch(ORIGIN + '/stats');
-      const data = await r.json();
-      document.getElementById('stats').innerHTML = 
-        '<div class="stat-box"><div class="stat-label">Uptime</div><div class="stat-value">' + data.uptime_hours + 'h</div></div>' +
-        '<div class="stat-box"><div class="stat-label">Richieste Totali</div><div class="stat-value">' + data.total_requests + '</div></div>' +
-        '<div class="stat-box"><div class="stat-label">Cache Hit Rate</div><div class="stat-value">' + data.cache_hit_rate + '</div></div>' +
-        '<div class="stat-box"><div class="stat-label">Uso Giornaliero</div><div class="stat-value">' + data.usage_percent + '</div></div>';
-    }
-    
-    function loadChannels() {
-      const channels = ${JSON.stringify(CHANNELS)};
-      const html = channels.map(ch => 
-        '<div class="channel">' +
-        '<div class="channel-name">' + ch.name + '</div>' +
-        '<div style="font-size:11px;color:#888;">' + ch.slug + '</div>' +
-        '<div class="providers">' +
-        (ch.ntv ? '<span class="badge badge-ntv">NTV</span>' : '') +
-        (ch.vavoo ? '<span class="badge badge-vavoo">Vavoo</span>' : '') +
-        (ch.daddy ? '<span class="badge badge-daddy">Daddy</span>' : '') +
-        '</div>' +
-        '<button onclick="window.open(\\'' + ORIGIN + '/live?ch=' + ch.slug + '\\', \\'_blank\\')">▶ Play</button>' +
-        '<button onclick="testChannel(\\'' + ch.slug + '\\')">🔍 Test</button>' +
-        '</div>'
-      ).join('');
-      document.getElementById('channels').innerHTML = html;
-    }
-    
-    async function testChannel(slug) {
-      const r = await fetch(ORIGIN + '/probe?ch=' + slug);
-      const data = await r.json();
-      alert(JSON.stringify(data, null, 2));
-    }
-    
-    loadStats();
-    loadChannels();
-    setInterval(loadStats, 5000);
-  </script>
-</body>
-</html>`;
-  
-  return new Response(html, { headers: HTML() });
-}
-
-// ============================================================================
-// ROUTER
+// ROUTER PRINCIPALE
 // ============================================================================
 
 export default {
@@ -567,7 +487,7 @@ export default {
     const path = u.pathname;
     
     try {
-      if (path === '/') return ui(u.origin);
+      if (path === '/') return await health();
       if (path === '/health') return await health();
       if (path === '/live') return await live(req, u);
       if (path === '/channels') return await channels();
