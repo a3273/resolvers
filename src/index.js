@@ -1,18 +1,11 @@
 // ============================================================================
-// TVNOW-CF v10.14 SOTTOZERO - DELAY MINIMO CON BUFFER PIENO + RITARDO DI FONTE
-//   v10.14 due novita':
-//   1) window (buffer sotto il playhead) e start (dove PARTE il playhead vs bordo
-//      live, via EXT-X-START) separati: NTV parte a ~10s con 12.6s di buffer,
-//      Daddy ~9s, Vavoo ~17s. Il delay percepito scende, il runway anti-stall resta.
-//   2) ritardo di FONTE misurato via EXT-X-PROGRAM-DATE-TIME (bordo live upstream
-//      vs ORA): un relay lento (Daddy embed fallback, vavoo CDN) che ritrasmette
-//      con MINUTI di lag va IN CODA per quel canale (5 min), resta il provider vivo
-//      che e' davvero "adesso". I minuti di un relay non sono comprimibili.
-// TVNOW-CF v10.11 - HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
-// ============================================================================
-// PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
-// segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
-// playlist/segmenti, che era la causa del ritardo.
+// TVNOW-CF v10.15 FRESCO - NIENTE LOOP VOD: il freeze "bloccato alle 3 di notte"
+//   causo: edge.wedd48c.top in 403 (dalla notte) e il viewer finiva sul fallback
+//   embed Daddy, un relay che ritrasmette loop VOD vecchi di ore: stile "sempre
+//   le stesse cose, mai avanti". v10.15: edge Daddy giu' -> Daddy KO di canale
+//   per 60s (senza embeds), il player cade subito su NTV/Vavoo (fonti vive e
+//   fresche). Edge torna -> Daddy rientra da solo. Aggiunto /dump?ch=<slug>&p=<prov>
+//   (playlist effettiva servita, come testo, leggibile per diagnosi remote).
 
 // ctx del modulo worker: serve per il prefetch in background (waitUntil)
 let MODULE_CTX = null;
@@ -48,6 +41,7 @@ export default {
         case '/vmap':  return R(await vmap(), 200, TXT());
         case '/ch':    return R(elencoCanali(), 200, TXT());
         case '/probe': return R(await probe(u), 200, TXT());
+        case '/dump':  { const rr = await live(u, P, u.searchParams.get('p')); const bb = await rr.text(); return R(bb, 200, TXT()); }
         case '/diag':  return R(await diag(u), 200, TXT());
         case '/debug': return R(debug(), 200, TXT());
         case '/checkseg': return await checkseg(u);
@@ -94,7 +88,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.14 SOTTOZERO';
+const VER = 'TVNOW-CF v10.15 FRESCO';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -587,8 +581,12 @@ async function daddyResolve(id, slug, forceEmbeds) {
       daddyCache.set(id, { url: eu, exp: now + DADDY_TTL });
       return eu;
     }
+    // v10.15: edge giu' -> Daddy KO per quel canale, NIENTE fallback embed:
+    // il relay embed ritrasmette loop VOD vecchi (contenuto congelato da ore,
+    // tipo "bloccato alle 3 di notte"): inaccettabile come fonte live.
+    return null;
   }
-  return await daddyResolveEmbeds(id, slug);
+  return null;
 }
 async function daddyResolveEmbeds(id, slug) {
   if (!id) return null;
@@ -883,19 +881,12 @@ async function live(u, P, legacy) {
         catch (e) {
           if (/wedd48c|edge\./i.test(du)) {
             daddyEdgeFail.set(String(c.daddy), Date.now()); daddyCache.delete(c.daddy);
-            log('daddy edge ko ' + c.daddy + ' -> embeds');
-            du = null;
+            log('daddy edge ko ' + c.daddy + ' (403/blocchi): Daddy KO, niente embeds');
+            cbRecordFail(c.slug, 'daddy');
+            return null;
           } else { cbRecordFail(c.slug, 'daddy'); return null; }
         }
       } else du = null;
-      if (!du) {
-        du = await daddyResolve(c.daddy, c.slug, true);
-        if (!du || !/\.m3u8/i.test(du)) return null;
-        // v10.10 S: anche la playlist del fallback embed -> smart bust
-        const r = await fetchPlaylistSmart(du, dh, 8000);
-        txt = r.ok ? await r.text() : '';
-        if (!txt.includes('#EXTM3U')) { daddyCache.delete(c.daddy); cbRecordFail(c.slug, 'daddy'); return null; }
-      }
       // v10.10: guardia anti-freeze come dagli altri provider: playlist upstream
       // congelata (seq fermo) -> throw -> il canale passa al provider dopo
       {
@@ -1478,20 +1469,7 @@ async function diag(u) {
     'sopra i 45s il provider va in coda per quel canale (5 min): i minuti di',
     'ritardo di un relay NON sono comprimibili, v10.14 li fa EVITARE.',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
-    'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
-    'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
-    'v10.9: anti-cache CDN sulle m3u8 upstream (bust 2s + bypass cache CF): playlist sempre fresca.',
-    'v10.10: smart-bust (URL firmate vavoo) + URL vavoo 120s + fix IP-1003 + warm progressivo + delay piu\' basso.',
-    'v10.11: heartbeat uptime 5 min (canali sempre pronti) + delay: ntv ~13s, daddy ~14s, vavoo ~25s.',
-    'v10.12: delay al floor meccanico: ntv ~8.4s, daddy ~8-12s, vavoo ~21s (2 seg + trim).',
-    'v10.13: budget subrequest + resolve vavoo entro 8s + prefetch 2 seg + rete sicurezza avvio: zero micro-stalli, zero canali che non partono.');
-  L.push('=== PRESERVAZIONE RICHIESTE (v10.7) ===',
-    'Daddy: risoluzione via edge.wedd48c.top (URL stabili daddy-channels) = 0 estrazioni embed;',
-    'catena embed solo come fallback dopo un edge-fail (memo 60s).',
-    'Segmenti: 3 livelli -> Cache API (chiave senza token, 120s, sopravvive alla rotazione)',
-    '-> edge CF (bust 30s) -> origine. Multi-viewer: 1 download, tutti lo riusano.',
-    'Playlist upstream: single-flight 4s (N viewer/poll ravvicinati = 1 fetch).',
-    'Effetto in /debug: riga "Risparmio" -> % segmenti serviti senza toccare l\'origine.');
+    'Cache/efficienza (riepilogo rapido): Cache API segmenti 120s, single-flight, bust anti-cache (dettagli in /debug e nei commenti).');
   return L.join('\n');
 }
 
@@ -1541,29 +1519,7 @@ function uso(P) {
     '  /probe?ch=sky-sport-f1         probe rapido + URL upstream (test VLC)',
     '  /checkseg?s=<ntv|vavoo|daddy>&ch=<id>  test segmento',
     '  /segtest?u=<url>&ref=<referer> test URL diretto',
-    '  /warm /vmap /debug /ch /rawu /ip  utility',
-    '',
-    'FIX v10.5:',
-    '  • Cache edge segmenti 600s -> 30s (la 600s serviva segmenti vecchi di minuti)',
-    '  • Bust _t reintegrato, stabile 30s (freshness garantita, quota protetta)',
-    '  • Finestra adattiva su durate EXTINF reali: 25-28s',
-    'FIX v10.6:',
-    '  • Delay EFFETTIVO 25-30s garantito per ogni canale e provider (EXT-X-START trim)',
-    '  • Prefetch bg del segmento nuovo: meno microscatti',
-    '  • Ordine provider adattivo PER CANALE (provScore): canali 100% indipendenti',
-    'FIX v10.7 (preservazione richieste, daddy-channels):',
-    '  • Risoluzione Daddy da URL edge stabili (edge.json): ZERO estrazioni embed',
-    '  • Cache API segmenti con chiave senza token: sopravvive alla rotazione 120s',
-    '  • Single-flight playlist upstream 4s: N viewer = 1 fetch origine',
-    '  • Prefetch popola la Cache API normalizzata',
-    'FIX v10.8 - v10.14 (sottozero):',
-    '  • Buffer DIVISO dal delay: NTV parte a ~10s dal bordo (12.6s di buffer sotto), Daddy ~9s, Vavoo ~17s',
-    '  • Ritardo di FONTE misurato via PDT: i relay lenti (Daddy/embed, vavoo CDN) vanno in coda da soli',
-    '  • Anti-cache CDN sulle m3u8 (bust intelligente su URL firmate): playlist sempre fresca',
-    '  • URL Vavoo 120s + fix host IP (Cloudflare error 1003): RSI e canali piccoli stanno su',
-    '  • Heartbeat 5 min + warm progressivo con cursore + budget subrequest: avvio 3-4s e niente affaticamento',
-    '  • Prefetch 2 seg + playlist upstream 3s + rete di sicurezza avvio: zero micro-stalli',
-    '  • Guardie anti-freeze su TUTTI i provider + cleanup memoria completo (niente morti a 30min)',
+    '  /warm /vmap /debug /ch /rawu /dump /ip  utility',
     ''].join('\n');
 }
 
@@ -1606,4 +1562,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.5 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.15 DELAY-FIX ███
