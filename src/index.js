@@ -1,5 +1,14 @@
 // ============================================================================
-// TVNOW-CF v10.13 - HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
+// TVNOW-CF v10.14 SOTTOZERO - DELAY MINIMO CON BUFFER PIENO + RITARDO DI FONTE
+//   v10.14 due novita':
+//   1) window (buffer sotto il playhead) e start (dove PARTE il playhead vs bordo
+//      live, via EXT-X-START) separati: NTV parte a ~10s con 12.6s di buffer,
+//      Daddy ~9s, Vavoo ~17s. Il delay percepito scende, il runway anti-stall resta.
+//   2) ritardo di FONTE misurato via EXT-X-PROGRAM-DATE-TIME (bordo live upstream
+//      vs ORA): un relay lento (Daddy embed fallback, vavoo CDN) che ritrasmette
+//      con MINUTI di lag va IN CODA per quel canale (5 min), resta il provider vivo
+//      che e' davvero "adesso". I minuti di un relay non sono comprimibili.
+// TVNOW-CF v10.11 - HEARTBEAT UPTIME + DELAY MINIMO PER PROVIDER + ANTI-CACHE CDN M3U8 + CANALI INDIPENDENTI
 // ============================================================================
 // PROVIDER INTATTI: NTV / Vavoo / Daddy (resolve, health, circuit breaker,
 // segfails, warm, diag) sono IDENTICI alla v10.4. Toccata solo la catena
@@ -61,13 +70,18 @@ export default {
 // --- CONFIGURAZIONE --------------------------------------------------------
 // DELAY MINIMO PER PROVIDER (v10.8): calcolato sulle durate REALI (EXTINF /
 // TARGETDURATION misurate sulle fonti), ognuno al proprio floor stabile:
+// v10.14 SOTTOZERO: SEPARAZIONE buffer vs punto di partenza.
+//   target = quanta FINESTRA pubblico (buffer pieno sotto il playhead, anti-stall)
+//   start  = dove PARTE il playhead rispetto al bordo live (EXT-X-START nucleare)
+// delay percepito = start; il runway di buffer resta sotto: niente stalli anche al minimo.
+// Minimo fisico HLS: 2 seg (embedded, non LL). "Sottozero" = playhead quasi al bordo.
 const PROV_DELAY = {
-  ntv:   { target: 12, min: 10 },  // v10.13 CC: 3 seg x 4.2s = 12.6s (runway anti-stall; v10.12 a 2 seg micro-stallava)
-  daddy: { target: 11, min: 9 },   // v10.13 CC: 2-3 seg x 4-6s = 10-12s
-  vavoo: { target: 21, min: 20 }   // v10.13 CC: 2 seg (24-34s) + trim EXT-X-START -> ~21s
+  ntv:   { target: 12, min: 10, start: 10 },  // 3 seg x 4.2s = 12.6s buffer; parte a ~10s dal bordo
+  daddy: { target: 12, min: 12, start: 9 },   // min 12: la finestra NON scende a 2 seg da 4s (v10.12: stallava); offset 3s reali
+  vavoo: { target: 33, min: 20, start: 17 }   // 2 seg 24-34s; parte a ~17s dal bordo
 };
 const PROV_PREF_SEGS = 3, MIN_SEGS = 2;
-const delayCfg = prov => PROV_DELAY[prov] || { target: 24, min: 20 };
+const delayCfg = prov => PROV_DELAY[prov] || { target: 24, min: 20, start: 20 };
 const DELAY_TARGET = 24; // fallback di testo/estimate per provider non noto
 const EXT_START_TRIM = true;              // F: trim delay via EXT-X-START (false se un device da schermo grigio)
 const PREFETCH_SEGS = 2;                  // v10.13 CC: 2 (era 1): i 2 seg piu' nuovi gia' in cache -> zero micro-scatti
@@ -80,7 +94,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.13 SERENO';
+const VER = 'TVNOW-CF v10.14 SOTTOZERO';
 // v10.7: URL edge STABILI (da daddy-channels/edge.json): nessun token nella
 // URL, il token vive nel contenuto e ruota ogni 120s lato server. La risoluzione
 // Daddy parte da qui = ZERO richieste di estrazione embed.
@@ -259,6 +273,8 @@ function cleanupStaleState() {
   }
   // v10.10 S: anche i ban del bust scadono
   for (const [k, t] of noBustHosts) if (now - t > NO_BUST_TTL) noBustHosts.delete(k);
+  // v10.14 SOTTOZERO: anche le misure di ritardo fonte scadono
+  for (const [k, e] of lagMemo) if (now - e.t > 2 * LAG_TTL_MS) lagMemo.delete(k);
 }
 
 function getPlState(key) {
@@ -414,6 +430,7 @@ async function fetchSegmentWithCache(target, h, range) {
 function emitPlaylist(ck, slug, prov, txt, baseUrl, ctx) {
   const p = parseMediaPl(txt);
   if (!p.isMaster && p.segs.length) checkFreshOrThrow(slug + '|' + prov, p.upSeq, p.upTarget, prov);
+  if (!p.isMaster) noteSrcLag(ctx && ctx.stateKey ? ctx.stateKey : slug + '|' + prov, srcLagOf(p));
   const out = rewriteAny(txt, baseUrl, Object.assign({}, ctx, { stateKey: slug + '|' + prov }));
   // v10.6 G: prefetch in background dei segmenti piu' nuovi. Quando il player
   // li chiede sono gia' nella cache edge CF: anti-microscatti, zero attesa.
@@ -471,11 +488,16 @@ function heartbeat() {
 // parte istantaneo. Batch da 2 canali (~3-5 subrequests) = dentro i limiti
 // subrequest di Cloudflare per invocazione.
 const WARM_BATCH = 2;
-let warmCursor = 0;
+let warmCursor = 0, lastWarm = 0;
 function warmNext(n) {
   // v10.13 AA: mai superare il budget subrequest dell'invocazione
+  // v10.14 SOTTOZERO: finanziaria globale 10s: i poll di playlist (ogni ~4s per
+  // viewer) NON devono risolvere 2 canali x 3 provider ogni volta: bruciavano
+  // subrequest e rate-limitavano i mirror Vavoo/NTV (affaticamento). 1 batch / 10s.
   const n2 = Math.min(n, Math.max(0, Math.floor(SUB_BUDGET / 6)));
   if (!n2) return;
+  if (Date.now() - lastWarm < 10 * 1000) return;
+  lastWarm = Date.now();
   subSpend(n2 * 6);
   const t0 = Date.now();
   const jobs = [];
@@ -806,7 +828,11 @@ async function live(u, P, legacy) {
 
   const cbLive = finalOrder.filter(p => !cbInCooldown(c.slug, p));
   const cbFrozen = finalOrder.filter(p => cbInCooldown(c.slug, p));
-  const tryOrder = cbLive.concat(cbFrozen);
+  // v10.14 SOTTOZERO: provider con ritardo di FONTE (PDT) > 45s -> in coda:
+  // parte subito quello che trasmette "adesso" (Sky sport 24 Daddy +4min fix).
+  const cbLiveOk  = cbLive.filter(p => !lagBad(c.slug + '|' + p));
+  const cbLiveLag = cbLive.filter(p =>  lagBad(c.slug + '|' + p));
+  const tryOrder = cbLiveOk.concat(cbLiveLag, cbFrozen);
 
   // v10.8 Q: pre-riscalda i provider di ripiego DI QUESTO CANALE in background:
   // se il primario cade (o zappi di continuo), il fallback e' gia' pronto.
@@ -1032,6 +1058,32 @@ function rewriteMaster(txt, baseUrl, ctx) {
   return out.join('\n');
 }
 
+// --- v10.14: RITARDO DI FONTE (PDT) + AUTO-DEPRIORIZZAZIONE ----------------
+// Un relay lento (es. Daddy quando l'edge e' 403 e passa dal fallback embed)
+// ritrasmette con MINUTI di lag: nessun player puo' comprimere il ritardo della
+// fonte. Lo misuriamo con EXT-X-PROGRAM-DATE-TIME (bordo live della fonte vs ORA)
+// e mettiamo quel provider IN CODA per quel canale (5 min), cosi' parte subito
+// il provider piu' vicino all'evento reale.
+const lagMemo = new Map(); // slug|prov -> {lag,t,n}
+const LAG_BAD_S = 45, LAG_TTL_MS = 5 * 60 * 1000;
+function srcLagOf(p) {
+  const last = p.segs[p.segs.length - 1];
+  if (!last || !last.pdt) return null;
+  const t = Date.parse(String(last.pdt).replace(/^#EXT-X-PROGRAM-DATE-TIME:(\s*)/, ''));
+  if (!isFinite(t)) return null;
+  return Math.max(0, (Date.now() - (t + (last.dur || 0) * 1000)) / 1000);
+}
+function noteSrcLag(key, lagS) {
+  if (lagS == null || !isFinite(lagS)) return;
+  const now = Date.now();
+  let e = lagMemo.get(key);
+  if (!e || now - e.t > LAG_TTL_MS) e = { lag: lagS, t: now, n: 1 };
+  else { e.lag = e.lag * 0.7 + lagS * 0.3; e.t = now; e.n++; }
+  lagMemo.set(key, e);
+}
+const lagBad = key => { const e = lagMemo.get(key); return !!(e && Date.now() - e.t < LAG_TTL_MS && e.lag >= LAG_BAD_S); };
+const lagTxt = key => { const e = lagMemo.get(key); return e ? (Math.round(e.lag) + 's' + (e.lag >= LAG_BAD_S ? ' BAD->coda' : ' ok')) : 'n/d (no PDT)'; };
+
 function rewriteMediaPl(txt, baseUrl, ctx) {
   const p = parseMediaPl(txt);
   if (p.isMaster || !p.segs.length) return rewriteMaster(txt, baseUrl, ctx);
@@ -1059,7 +1111,10 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   // v10.8 F: trim del delay PER PROVIDER. Se la finestra minimizzata supera il
   // target del provider (es. Vavoo 2x17s = 34s vs target 28s), il player parte
   // dentro la window: delay effettivo = target di quel provider.
-  const pTarget = delayCfg(ctx && ctx.prov).target;
+  // v10.14 SOTTOZERO: il playhead PARTE a `start` secondi dal bordo live;
+  // la finestra completa resta sotto (buffer pieno), il delay percepito = start.
+  const pCfg = delayCfg(ctx && ctx.prov);
+  const pTarget = (pCfg.start != null ? pCfg.start : pCfg.target);
   const offset = Math.max(0, plan.sum - pTarget);
   const out = ['#EXTM3U', '#EXT-X-VERSION:' + version, '#EXT-X-TARGETDURATION:' + p.upTarget, '#EXT-X-MEDIA-SEQUENCE:' + seq];
   if (EXT_START_TRIM && offset > 0.5 && !p.endlist)
@@ -1192,10 +1247,11 @@ async function player(u, P) {
       const hls = new Hls({
         debug: false, enableWorker: true, lowLatencyMode: false,
         backBufferLength: 20,
-        // v10.13 CC: sync al floor stabile: NTV ~12.6s (3 seg), Daddy 10-12s,
-        // Vavoo dal trim (~21s). Sopra i 22s accelera a 1.5x e rientra.
-        liveSyncDuration: 12,
-        liveMaxLatencyDuration: 22,
+        // v10.14 SOTTOZERO: il playhead PARTE dal trim EXT-X-START (ntv ~10s,
+        // daddy ~9s, vavoo ~17s dal bordo). liveSync piu' basso per il recupero:
+        // sopra i 18s accelera a 1.5x e rientra al bordo.
+        liveSyncDuration: 10,
+        liveMaxLatencyDuration: 18,
         maxLiveSyncPlaybackRate: 1.5,
         maxBufferLength: 20,
         maxMaxBufferLength: ${MAX_BUFFER_SECS},
@@ -1393,7 +1449,8 @@ async function diag(u) {
     'CB: ntv=' + (cbInCooldown(c.slug,'ntv')?'CD':'ok') + ' vavoo=' + (cbInCooldown(c.slug,'vavoo')?'CD':'ok') + ' daddy=' + (cbInCooldown(c.slug,'daddy')?'CD':'ok'), ''];
   const tryP = async (label, fn) => {
     const t0 = Date.now();
-    try { const txt = await fn(); L.push('-- ' + label + ' (' + (Date.now()-t0) + 'ms) --', 'OK | ' + playlistStats(txt, String(label).split(' ')[0].toLowerCase())); }
+    try { const txt = await fn();
+      L.push('-- ' + label + ' (' + (Date.now()-t0) + 'ms) --', 'OK | ' + playlistStats(txt, String(label).split(' ')[0].toLowerCase()) + ' | ritardo fonte: ' + lagTxt(c.slug + '|' + String(label).split(' ')[0].toLowerCase())); }
     catch (e) { L.push('-- ' + label + ' (' + (Date.now()-t0) + 'ms) --', 'ERR: ' + (e && e.message)); }
     L.push('');
   };
@@ -1412,11 +1469,14 @@ async function diag(u) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text();
   });
-  L.push('=== FATTORI DI DELAY (v10.8: target per provider) ===',
-    'delay totale = ritardo interno della FONTE + finestra (per provider) + buffer del player',
-    'NTV:   target ' + PROV_DELAY.ntv.target + 's (3 seg x ~4.2s = 12.6s, runway anti-stall)   <- il provider con il delay minore',
-    'DADDY: target ' + PROV_DELAY.daddy.target + 's (2-3 seg x 4-6s = 10-12s)',
-    'VAVOO: target ' + PROV_DELAY.vavoo.target + 's (2 seg 12-17s + trim EXT-X-START)',
+  L.push('=== FATTORI DI DELAY (v10.14 SOTTOZERO: buffer e start separati) ===',
+    'delay totale percepito = ritardo interno della FONTE + start (per provider)',
+    'NTV:   buffer 12.6s (3 seg), PARTE a ~10s dal bordo live',
+    'DADDY: buffer 12-18s (2-3 seg), PARTE a ~9s dal bordo',
+    'VAVOO: buffer 24-34s (2 seg), PARTE a ~17s dal bordo',
+    'RITARDO DI FONTE (relay lenti, es. Daddy embed fallback): misurato via PDT;',
+    'sopra i 45s il provider va in coda per quel canale (5 min): i minuti di',
+    'ritardo di un relay NON sono comprimibili, v10.14 li fa EVITARE.',
     'Ogni provider e\' al SUO minimo stabile, nessuno limitato dagli altri.',
     'v10.7: risoluzione Daddy via edge.json (0 estrazioni) + Cache API senza token + single-flight 4s',
     'v10.8: cleanup completo della memoria (niente morti a 30min) + pre-riscaldamento fallback (zapping fluido).',
@@ -1444,7 +1504,7 @@ function playlistStats(txt, prov) {
   const total = durs.reduce((a,b) => a+b, 0);
   return 'fonte ' + p.segs.length + ' segs / ' + total.toFixed(1) + 's'
     + ' | finestra ' + plan.count + '/' + plan.sum.toFixed(1) + 's'
-    + ' | delay ' + prov.toUpperCase() + ' ~' + Math.min(plan.sum, cfg.target).toFixed(0) + 's (target ' + cfg.target + 's)';
+    + ' | PARTE a ~' + Math.min(plan.sum, cfg.start != null ? cfg.start : cfg.target).toFixed(0) + 's dal bordo (buffer sotto: ' + plan.sum.toFixed(0) + 's)';
 }
 
 function debug() {
@@ -1457,10 +1517,11 @@ function debug() {
     VER,
     'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
-    'Delay/provider: ntv ' + PROV_DELAY.ntv.target + 's | daddy ' + PROV_DELAY.daddy.target + 's | vavoo ' + PROV_DELAY.vavoo.target + 's | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
+    'Delay/provider (start dal bordo): ntv ' + PROV_DELAY.ntv.start + 's | daddy ' + PROV_DELAY.daddy.start + 's | vavoo ' + PROV_DELAY.vavoo.start + 's (buffer 12/12/33s) | trim EXT-X-START=' + (EXT_START_TRIM ? 'ON' : 'off') + ' | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
     'Smart bust: host senza bust (URL firmate): ' + (Array.from(noBustHosts.keys()).join(', ') || 'nessuno') + ' | warm cursor: ' + warmCursor + '/' + CHANNELS.length,
     'Heartbeat: ' + (lastHeartbeat ? 'ultimo tick ' + Math.round((now - lastHeartbeat)/1000) + 's fa (ogni 5 min riscalda 6 canali)' : 'non avviato'),
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
+    'Lag fonte (PDT): ' + (Array.from(lagMemo.entries()).filter(([, e]) => Date.now() - e.t < LAG_TTL_MS).sort((a, b) => b[1].lag - a[1].lag).map(([k, e]) => k + '=' + Math.round(e.lag) + 's').join(', ') || 'nessuno misurato'),
     'CB cooldown attivi: ' + (cds.join(', ') || 'nessuno'),
     'SegFails: ' + (sf.join(', ') || 'nessuno'),
     'NTV: resolve=' + ntvStats.resolve + ' refresh=' + ntvStats.refresh + ' err=' + ntvStats.err,
@@ -1473,7 +1534,7 @@ function debug() {
 function uso(P) {
   return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay ~10-21s (per provider)',
+    '  /live?ch=<slug>                delay ~9-17s (per provider)',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
@@ -1495,8 +1556,9 @@ function uso(P) {
     '  • Cache API segmenti con chiave senza token: sopravvive alla rotazione 120s',
     '  • Single-flight playlist upstream 4s: N viewer = 1 fetch origine',
     '  • Prefetch popola la Cache API normalizzata',
-    'FIX v10.8 - v10.13 (definitiva):',
-    '  • Delay per provider sulle durate reali: ntv ~12.6s, daddy ~10-12s, vavoo ~21s',
+    'FIX v10.8 - v10.14 (sottozero):',
+    '  • Buffer DIVISO dal delay: NTV parte a ~10s dal bordo (12.6s di buffer sotto), Daddy ~9s, Vavoo ~17s',
+    '  • Ritardo di FONTE misurato via PDT: i relay lenti (Daddy/embed, vavoo CDN) vanno in coda da soli',
     '  • Anti-cache CDN sulle m3u8 (bust intelligente su URL firmate): playlist sempre fresca',
     '  • URL Vavoo 120s + fix host IP (Cloudflare error 1003): RSI e canali piccoli stanno su',
     '  • Heartbeat 5 min + warm progressivo con cursore + budget subrequest: avvio 3-4s e niente affaticamento',
@@ -1544,4 +1606,4 @@ async function fetchT(url, opt, ms) {
   }
   return fetch(url, o);
 }
-// ███ FINE TVNOW-CF v10.13 DELAY-FIX ███
+// ███ FINE TVNOW-CF v10.5 DELAY-FIX ███
