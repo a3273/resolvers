@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.21 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
+// TVNOW-CF v10.22 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
 // Deploy: https://resolvers.simone-scorrano-2011.workers.dev
 //
 // v10.20 (FIX BLOCCO/LOOP 6:14 - segnalato: stream fermo alle 6:14 che ripete
@@ -20,6 +20,15 @@
 //   numero crescere mentre lo stream suona. FREEZE attivi >90s senza nuova
 //   seq = stream fermo: a quel punto /debug dice subito quale canale|provider,
 //   e la causa (= relay riavviato, riga "sorgente riavviata" nel log).
+//
+// v10.22 (test delay su 8 canali live, /diag):
+// - NTV misurato 12.1-17.3s con target 10/start 12 -> minimo stabile portato
+//   a target 8 / start 10 (sotto gli 8s, con segmenti da ~4s, un singolo
+//   segmento lento a monte = rebuffer: NON andare oltre).
+// - VAVOO misurato 16.1-24.0s, sempre finestra di 2 segmenti (8-14s ciascuno):
+//   e' il pavimento FISICO della fonte, non abbassabile senza tagliare
+//   segmenti (il worker non taglia i contenuti).
+// - DADDY: edge in 403 su tutti i test -> irraggiungibile; config invariata.
 //
 // v10.19 (esito test live post-incidente 6:14):
 // - incidente 6:14: episodio singolo, non riproducibile a freddo (tutti i
@@ -133,9 +142,9 @@ export default { async fetch(req, env, ctx) {
 //   buffer scende sempre sotto 1 segmento = stallo, NON si scende.
 // - DADDY: relay, floor dinamico = lag fonte (PDT) + margine.
 const PROV_DELAY = {
-  ntv:   { target: 10, start: 12 },   // v10.18: minimo proprio NTV (era 28/30 uniforme)
-  vavoo: { target: 12, start: 14 },   // v10.18: minimo proprio Vavoo (pavimento reale ~29s per segmenti lunghi)
-  daddy: { target: 14, start: 16 }    // v10.18: minimo proprio Daddy (floor dinamico = lag fonte PDT)
+  ntv:   { target: 8, start: 10 },    // v10.22: test live 8 canali: misurato 12-17s con 10/12 -> abbassato; sotto i 8s con seg da 4s = rebuffer
+  vavoo: { target: 12, start: 14 },   // v10.22: test live: sempre 2 seg (16-24s) = pavimento fisico della fonte, non abbassabile
+  daddy: { target: 14, start: 16 }    // v10.22: edge in 403 sui test live; floor dinamico = lag fonte PDT
 };
 const MIN_SEGS = 2;
 const delayCfg = prov => PROV_DELAY[prov] || { target: 24, start: 20 };
@@ -162,7 +171,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.21';
+const VER = 'TVNOW-CF v10.22';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;    // edge giu -> canale Daddy KO 60s (niente embed, v10.15)
