@@ -1,6 +1,17 @@
 // ============================================================================
-// TVNOW-CF v10.18 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
+// TVNOW-CF v10.19 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
 // Deploy: https://resolvers.simone-scorrano-2011.workers.dev
+//
+// v10.19 (esito test live post-incidente 6:14):
+// - incidente 6:14: episodio singolo, non riproducibile a freddo (tutti i
+//   resolver OK, playlist avanti). Scenari: rotazione/tokens a monte o Daddy
+//   edge 403 (verificato giu' in quel momento). Le protezioni anti-freeze
+//   (guardia seq, fallback provider, plCache 60s) hanno gia' abbordato.
+// - checkseg rifatto: mapping slug->id corretto (prima lo slug finiva
+//   all'API NTV come id = 400), /checkseg?ch=<slug>&all=1 = verdetto codec
+//   (PMT) su TUTTI i provider in un colpo, URL relativi oggi risolti.
+// - PROV_SCORE_TTL 30min: il cambio manuale di provider (quello che ripara
+//   il grigio marcia) resta in testa nell'ordine automatico piu' a lungo.
 //
 // Regole stabili:
 // - Logica di risoluzione provider intatta. Daddy = SOLO edge URL stabili
@@ -132,7 +143,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.18';
+const VER = 'TVNOW-CF v10.19';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;    // edge giu -> canale Daddy KO 60s (niente embed, v10.15)
@@ -218,7 +229,8 @@ const plFetchCache = new Map();           // v10.7: single-flight fetch playlist
 const SEGCACHE = (typeof caches !== 'undefined') ? caches.default : null; // v10.7 L
 let segStat = { apiHits: 0, origin: 0 }; // v10.7: preservazione richieste visibile in /debug
 const provScore = new Map();
-const PROV_SCORE_TTL = 10 * 60 * 1000;
+const PROV_SCORE_TTL = 30 * 60 * 1000;    // v10.19: 30min (era 10): il cambio manuale di provider
+                                          // (quello che risolve il grigio) resta in testa piu' a lungo
 const noteProv = (slug, prov, ok) => { if (slug && prov) provScore.set(slug + '|' + prov, { ok: !!ok, t: Date.now() }); };
 const provRank = (slug, prov) => {
   const e = provScore.get((slug || '_') + '|' + (prov || '_'));
@@ -1171,42 +1183,46 @@ async function segtest(u) {
   } catch (e) { return R('ERR: ' + e.message, 200, TXT()); }
 }
 const baseUrl_of = d => d.startsWith('http') ? d : 'https://' + d.replace(/^\/{2,}/, '');
-async function checkseg(u) {
-  const source = u.searchParams.get('s') || 'ntv';
-  const ch = u.searchParams.get('ch') || '869';
-  const L = ['=== CHECK SEG ===', 'Fonte: ' + source, 'Canale: ' + ch, ''];
+// v10.19: test segmento per UN provider, con mapping slug->id corretto (prima
+// lo slug arrivava all'API NTV come id -> 400), URL relativi risolti (Vavoo ora
+// testabile) e verdetto codec dal PMT.
+async function checksegOne(source, ch) {
+  const cc = findCh(ch); const slug = cc ? cc.slug : '';
+  const L = ['--- ' + source.toUpperCase() + ' (canale ' + (cc ? cc.name : ch) + ') ---'];
   try {
-    let segUrl = '', headers = {}, txt = '';
-    let prov = source, slug = '';
-    const cc = findCh(ch); if (cc) slug = cc.slug;
+    let segUrl = '', headers = {}, txt = '', base = '';
     if (source === 'ntv') {
-      const pl = await ntvPlaylist(ch, slug); txt = pl.txt; headers = getBrowserHeaders(pl.ref, slug + '|ntv');
+      const ntvId = (cc && cc.ntv) ? cc.ntv : ch;
+      if (!ntvId) return L.concat(['canale senza NTV']);
+      const pl = await ntvPlaylist(ntvId, slug);
+      txt = pl.txt; base = pl.base; headers = getBrowserHeaders(pl.ref, slug + '|ntv');
     } else if (source === 'daddy') {
-      const du = await daddyResolve(ch, slug);
-      if (!du) return R('Daddy non risolto', 200, TXT());
+      const daddyId = (cc && cc.daddy) ? cc.daddy : ch;
+      if (!daddyId) return L.concat(['canale senza Daddy']);
+      const du = await daddyResolve(daddyId, slug);
+      if (!du) return L.concat(['Daddy non risolto (edge KO o id assente)']);
       const r = await fetchPlaylistSmart(du, getBrowserHeaders('https://dembed.st/', slug + '|daddy'), 10000);
-      if (!r.ok) return R('Daddy HTTP ' + r.status, 200, TXT());
-      txt = await r.text(); headers = getBrowserHeaders('https://dembed.st/', slug + '|daddy');
+      if (!r.ok) return L.concat(['Daddy HTTP ' + r.status]);
+      txt = await r.text(); base = du; headers = getBrowserHeaders('https://dembed.st/', slug + '|daddy');
     } else if (source === 'vavoo') {
-      const c = findCh(ch);
-      if (!c) return R('Vavoo: canale non trovato', 200, TXT());
-      const vu = await vavooResolveDual(c.slug, c.vavoo, c.vid6, c.vid7);
-      if (!vu) return R('Vavoo non risolto', 200, TXT());
+      if (!cc) return L.concat(['Vavoo: canale non trovato']);
+      const vu = await vavooResolveDual(cc.slug, cc.vavoo, cc.vid6, cc.vid7);
+      if (!vu) return L.concat(['Vavoo non risolto']);
       const r = await fetchPlaylistSmart(vu, vavooHeaders({ 'User-Agent':'VAVOO/1.0' }), 10000);
-      if (!r.ok) return R('Vavoo HTTP ' + r.status, 200, TXT());
-      txt = await r.text(); headers = vavooHeaders({ 'User-Agent':'VAVOO/1.0' });
-    }
+      if (!r.ok) return L.concat(['Vavoo HTTP ' + r.status]);
+      txt = await r.text(); base = vu; headers = vavooHeaders({ 'User-Agent':'VAVOO/1.0' });
+    } else return L.concat(['fonte sconosciuta: ' + source]);
     const lines = txt.split('\n');
     const isMaster = txt.includes('#EXT-X-STREAM-INF');
     if (isMaster) {
-      L.push('Master Playlist.');
+      L.push('master playlist.');
       for (let i = 0; i < lines.length; i++) if (!lines[i].startsWith('#') && lines[i].trim()) { segUrl = lines[i].trim(); break; }
     } else {
       for (let i = 0; i < lines.length; i++)
         if (lines[i].trim().startsWith('#EXTINF') && lines[i+1] && !lines[i+1].trim().startsWith('#')) { segUrl = lines[i+1].trim(); break; }
     }
-    if (!segUrl) return R('Nessun URL trovato', 200, TXT());
-    if (!segUrl.startsWith('http')) { L.push('URL relativo.'); return R(L.join('\n'), 200, TXT()); }
+    if (!segUrl) return L.concat(['nessun URL trovato']);
+    if (!/^https?:\/\//i.test(segUrl)) segUrl = absSegUrl(segUrl, base);   // v10.19: URL relativi ora risolti
     L.push('URL: ' + segUrl, '');
     const r = await fetchT(segUrl, { headers }, 12000);
     L.push('HTTP: ' + r.status, 'CT: ' + r.headers.get('content-type'), '');
@@ -1216,11 +1232,28 @@ async function checkseg(u) {
     L.push('Hex: ' + Array.from(b.slice(0,16)).map(x => x.toString(16).padStart(2,'0')).join(' '), '');
     if (b.length >= 4) {
       if (b[0] === 0x47) L.push('OK MPEG-TS', 'Codec video (PMT): ' + tsParseVideoCodec(b.slice(0, Math.min(b.length, 131072))));
-      else if (String.fromCharCode(b[4],b[5],b[6],b[7]) === 'ftyp') L.push('OK fMP4');
+      else if (String.fromCharCode(b[4],b[5],b[6],b[7]) === 'ftyp') L.push('OK fMP4 (codec dal box mdat: non analizzato)');
       else { const tx = String.fromCharCode(...b.slice(0,100)); L.push(tx.includes('<html') ? 'ERR HTML' : 'WARN'); }
     }
+    return L;
+  } catch (e) { return L.concat(['ERR: ' + (e && e.message)]); }
+}
+async function checkseg(u) {
+  const all = u.searchParams.get('all') === '1';                 // v10.19: tutti i provider in un colpo
+  const source = u.searchParams.get('s') || 'ntv';
+  const ch = u.searchParams.get('ch') || '869';
+  const L = ['=== CHECK SEG ===', 'Canale: ' + ch, ''];
+  if (all) {
+    const provs = ['ntv', 'vavoo', 'daddy'];
+    const res = await Promise.all(provs.map(async s => {
+      try { return await checksegOne(s, ch); } catch (e) { return ['--- ' + s.toUpperCase() + ' ---', 'ERR: ' + (e && e.message)]; }
+    }));
+    for (const part of res) { L.push(...part, ''); }
+    L.push('verdetto: h265 = video grigio su ExoPlayer -> quel provider va in coda appena un /live serve il canale (sonda v10.18).');
     return R(L.join('\n'), 200, TXT());
-  } catch (e) { return R('ERR: ' + e.message, 200, TXT()); }
+  }
+  L.push(...(await checksegOne(source, ch)), '');
+  return R(L.join('\n'), 200, TXT());
 }
 async function warm() { const t0 = Date.now();
   const ids = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
@@ -1367,7 +1400,7 @@ function uso(P) { return [VER, '',
     '  /player?ch=<slug>              player HLS.js (sync 9s / tetto 22s, v10.18)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra, delay, H265 per-provider',
     '  /probe?ch=sky-sport-f1         probe rapido + URL upstream (test VLC)',
-    '  /checkseg?s=<ntv|vavoo|daddy>&ch=<id>  test segmento (+ codec video PMT)',
+    '  /checkseg?ch=<slug>&all=1    test segmento + codec video SU TUTTI i provider (v10.19)',
     '  /segtest?u=<url>&ref=<referer> test URL diretto',
     '  /warm /vmap /debug /ch /rawu /dump /ip  utility',
     ''].join('\n'); }
