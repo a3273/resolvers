@@ -1947,4 +1947,83 @@ function uso(P) {
     '  /segtest?u=<url>&ref=<referer> test URL diretto',
     '  /warm /vmap /debug /ch /rawu /dump /ip  utility',
     '',
-    '🔧 streaming fluido! 🚀
+    '🔧 FIX v10.25 FINAL (segmenti fermi/stesse scene):',
+    '  • SEG_API_TTL: 120s → 30s (Cache API ora scade col bust)',
+    '  • Time-bucket di 30s nella segCacheKey per URL senza token',
+    '  • SEG_CACHE_TTL = BUST_MS = 30000 (cache CF sincronizzata)',
+    '  • Invalidazione cache aggressiva su freeze (5 min bypass)',
+    ''
+  ].join('\n');
+}
+
+// --- HELPERS ---------------------------------------------------------------
+function TXT() {
+  return { 'content-type':'text/plain; charset=utf-8', ...CORS() };
+}
+
+function HLS_NO_CACHE() {
+  return {
+    'content-type':'application/vnd.apple.mpegurl',
+    'cache-control':'no-cache, no-store, must-revalidate',
+    'pragma':'no-cache',
+    'expires':'0',
+    ...CORS()
+  };
+}
+
+function CORS() {
+  return { 'access-control-allow-origin':'*' };
+}
+
+function R(body, status, headers) {
+  const h = Object.assign({ 'content-type':'text/plain; charset=utf-8' }, headers || {});
+  if (status === 302) delete h['content-type'];
+  return new Response(body, { status:status || 200, headers:h });
+}
+
+async function rawu(u) {
+  const t = u.searchParams.get('u');
+  if (!t) return R('uso: /rawu?u=<url>', 200, TXT());
+
+  const h = getBrowserHeaders(u.searchParams.get('ref') || 'https://thedaddy.li/', 'rawu');
+  if (u.searchParams.get('o')) h['Origin'] = u.searchParams.get('o');
+
+  let r;
+  try {
+    r = /\.m3u8(\?|$)/i.test(t)
+      ? await fetchPlaylistSmart(t, h, 20000)
+      : await fetchT(t, { headers:h, cf: { cacheTtl: 0, cacheEverything: false }, redirect:'follow' }, 20000);
+  } catch (e) {
+    return R('ERR: ' + (e && e.message), 200, TXT());
+  }
+
+  let body = '';
+  try {
+    body = await r.text();
+  } catch (e) {
+    body = '(no body)';
+  }
+
+  return R('status ' + r.status + ' | len ' + body.length + '\n' + body.slice(0, 2000), 200, TXT());
+}
+
+async function fetchT(url, opt, ms) {
+  const o = Object.assign({}, opt || {});
+
+  if (ms && typeof AbortController !== 'undefined') {
+    const ac = new AbortController();
+    const t = setTimeout(() => {
+      try { ac.abort(); } catch (e) {}
+    }, ms);
+    o.signal = ac.signal;
+    try {
+      return await fetch(url, o);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  return fetch(url, o);
+}
+
+// ███ FINE TVNOW-CF v10.25 FINAL ███
