@@ -1,13 +1,15 @@
 // ============================================================================
-// TVNOW-CF v10.16 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
+// TVNOW-CF v10.17 - Worker HLS re-streamer (NTV / Vavoo / Daddy)
 // Deploy: https://resolvers.simone-scorrano-2011.workers.dev
 //
 // Regole stabili:
 // - Logica di risoluzione provider intatta. Daddy = SOLO edge URL stabili
 //   (edge.wedd48c.top, token nel contenuto): edge giu -> Daddy KO 60s,
 //   NIENTE fallback embed (relay VOD vecchi = stream congelato).
-// - Delay PER PROVIDER (mai uniforme), su BORDI SEGMENTO: offset EXT-X-START
-//   solo su keyframe; un offset dentro il GOP = video grigio/corrotto.
+// - Delay UNIFORME ~30s (v10.17, ExoPlayer/buffer) su BORDI SEGMENTO:
+//   offset EXT-X-START solo su keyframe; offset dentro il GOP = video
+//   grigio/corrotto. Floor: il ritardo di FONTE (PDT) si somma.
+// - Filtro H264 (v10.17): variant H265 scartate dal master e loggate.
 // - Stabilita prima del delay.
 // - Canali indipendenti: cache/stato per canale|provider, ordine adattivo.
 // - Niente recap "FIX vX" nell output; storico solo qui nei commenti.
@@ -69,16 +71,18 @@ export default { async fetch(req, env, ctx) {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 // --- CONFIGURAZIONE --------------------------------------------------------
-// v10.16: delay allineato ai KEYFRAME. EXT-X-START solo a confine segmento (snapOffset):
+// v10.17: TARGET UNIFORME ~30s su TUTTI i provider (richiesta esperta: ExoPlayer
+// non decodifica H265 -> serve margine per il filtro H264 e i buffer dei player).
+// Ritardo sotto: delay totale = ritardo di FONTE (PDT, misurato) + finestra.
 const PROV_DELAY = {
-  ntv:   { target: 12, start: 10 },   // 3 seg x 4.2s = 12.6s buffer; parte a ~10-12s dal bordo
-  daddy: { target: 12, start: 9 },    // seg 4-6s: offset reale ~12s
-  vavoo: { target: 33, start: 17 }    // seg 12-17s: offset reale ~17-24s
+  ntv:   { target: 28, start: 30 },   // finestra ~30s -> EXT-X-START -> delay ~28-32s
+  daddy: { target: 28, start: 30 },   // idem
+  vavoo: { target: 28, start: 30 }    // idem (prima 17-27s: unificato a richiesta)
 }; const MIN_SEGS = 2;
 const delayCfg = prov => PROV_DELAY[prov] || { target: 24, start: 20 };
 const PREFETCH_SEGS = 2;                  // v10.13 CC: 2 (era 1): i 2 seg piu' nuovi gia' in cache -> zero micro-scatti
 const STALE_FACTOR = 6, MAX_BUFFER_SECS = 40;
-const SEG_CACHE_TTL = 30;                 // FIX: 30s edge cache (era 600)
+const SEG_CACHE_TTL = 60;                 // v10.17: 60s (era 30): i segmenti pubblicati non cambiano mai -> piu' cache = meno scatti
 const BUST_MS = 30000;                    // FIX: bust stabile 30s (era assente)
 const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
 const PL_CACHE_TTL = 2000, RESOLVE_BUDGET = 8000, STATE_STALE_TTL = 15*60*1000; // v10.13 BB: resolve cap 8s (era 12s)
@@ -86,7 +90,7 @@ const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000; // v10.10 T: 120s (era 240s): la URL vavoo e' anche la chiave cache CDN della playlist
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.16';
+const VER = 'TVNOW-CF v10.17';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;    // edge giu -> canale Daddy KO 60s (niente embed, v10.15)
@@ -812,7 +816,16 @@ function rewriteMaster(txt, baseUrl, ctx) {
   }
   if (maxBw && ctx && ctx.ch)
     log('quality ' + ctx.ch + ': max ' + maxRes + ' @ ' + Math.round(maxBw/1000) + 'kbps (' + variants.filter(v => !v.audioOnly).length + ' variant)');
-  const video = variants.filter(v => !v.audioOnly).sort((a, b) => b.bw - a.bw);
+  const allVideo = variants.filter(v => !v.audioOnly).sort((a, b) => b.bw - a.bw);
+  // v10.17 ANTI-H265: i codec dichiarati in CODECS vincono rispetto alla banda:
+  // scartate le variant HEVC/H265 (ExoPlayer e tanti player TV non le decodificano);
+  // senza CODECS o senza variant avc note si tengono tutte (mai playlists vuote).
+  const isHevc = v => /CODECS="/.test(v.line) && /(hevc|hvc1|hev1|h265)/i.test(v.line);
+  const hasExplicitCodec = allVideo.some(v => /CODECS="/.test(v.line));
+  const hasAvc = allVideo.some(v => !isHevc(v));
+  const video = (hasExplicitCodec && hasAvc) ? allVideo.filter(v => !isHevc(v)) : allVideo;
+  if (video.length !== allVideo.length)
+    log('h264 ' + ((ctx && ctx.ch) || '?') + ': tenute ' + video.length + '/' + allVideo.length + ' variant (filtro H265)');
   const audio = variants.filter(v => v.audioOnly);
   const out = ['#EXTM3U']; out.push(...media);
   for (const v of video) out.push(v.line, proxUrl(absSegUrl(v.url, baseUrl), ctx));
@@ -942,9 +955,9 @@ async function player(u, P) {
   const html = `<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>${c.name} - TVNOW</title>\n  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>\n  <style>\n    * { box-sizing: border-box; }
     body { margin: 0; background: #000; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }\n    video { width: 100%; max-width: 1200px; height: auto; background: #000; }
     .controls { position: fixed; top: 10px; left: 10px; color: #fff; font-family: monospace; background: rgba(0,0,0,0.85); padding: 15px; border-radius: 8px; font-size: 13px; line-height: 1.6; backdrop-filter: blur(10px); z-index: 1000; }\n    .controls div { margin: 2px 0; }\n    .title { font-weight: 600; font-size: 14px; margin-bottom: 8px; }\n    .status { color: #4CAF50; }\n    .status.error { color: #f44336; }\n    .status.loading { color: #FFC107; }
-  </style>\n</head>\n<body>\n  <div class="controls">\n    <div class="title">📺 ${c.name}</div>\n    <div>Player: HLS.js | Delay ~9-27s (per provider) | Quality: MAX</div>\n    <div id="status" class="status loading">⏳ Caricamento...</div>\n    <div id="quality"></div>\n    <div id="buffer"></div>\n  </div>\n  <video id="video" controls autoplay muted playsinline></video>\n  <script>\n    const video = document.getElementById('video');
-    const status = document.getElementById('status');\n    const quality = document.getElementById('quality');\n    const buffer = document.getElementById('buffer');\n    const streamUrl = '${P}/live?ch=${c.slug}';\n    if (Hls.isSupported()) {\n      const hls = new Hls({\n        debug: false, enableWorker: true, lowLatencyMode: false,\n        backBufferLength: 20,\n// v10.16: catch-up SPENTO (1.0x): con delay reali 17-27s un 1.25x svuotava il buffer -> blocco ciclico.
-liveSyncDuration: 15,\n        liveMaxLatencyDuration: 30,
+  </style>\n</head>\n<body>\n  <div class="controls">\n    <div class="title">📺 ${c.name}</div>\n    <div>Player: HLS.js | Delay target: ~30s uniforme | Quality: MAX | Codec: H264</div>\n    <div id="status" class="status loading">⏳ Caricamento...</div>\n    <div id="quality"></div>\n    <div id="buffer"></div>\n  </div>\n  <video id="video" controls autoplay muted playsinline></video>\n  <script>\n    const video = document.getElementById('video');
+    const status = document.getElementById('status');\n    const quality = document.getElementById('quality');\n    const buffer = document.getElementById('buffer');\n    const streamUrl = '${P}/live?ch=${c.slug}';\n    if (Hls.isSupported()) {\n      const hls = new Hls({\n        debug: false, enableWorker: true, lowLatencyMode: false,\n        backBufferLength: 20,\n// v10.17: target delay UNIFORME ~30s (sync 25s, tetto 40s prima del catch-up).
+liveSyncDuration: 25,\n        liveMaxLatencyDuration: 40,
         maxLiveSyncPlaybackRate: 1.0,\n        maxBufferLength: 20,\n        maxMaxBufferLength: ${MAX_BUFFER_SECS},\n        maxBufferSize: 60 * 1000 * 1000, maxBufferHole: 0.5,\n        capLevelToPlayerSize: false, autoStartLoad: true,\n        nudgeMaxRetry: 10, fragLoadingMaxRetry: 8, manifestLoadingMaxRetry: 4\n      });\n      hls.loadSource(streamUrl);\n      hls.attachMedia(video);\n      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
         status.textContent = '✅ Stream caricato';\n        status.className = 'status';\n        video.play().catch(e => console.log('Autoplay bloccato:', e));\n        if (data.levels && data.levels.length > 0) {\n          let bestIdx = 0;\n          data.levels.forEach((l, i) => { if ((l.bitrate || 0) > (data.levels[bestIdx].bitrate || 0)) bestIdx = i; });\n          hls.currentLevel = bestIdx;\n          const lv = data.levels[bestIdx];
           quality.textContent = 'Qualità: ' + lv.width + 'x' + lv.height + ' @ ' + Math.round((lv.bitrate || 0) / 1000) + 'kbps (MAX)';\n        }\n      });\n      hls.on(Hls.Events.ERROR, (event, data) => {\n        if (data.fatal) {\n          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {\n            status.textContent = '🔄 Riconnessione...';\n            status.className = 'status loading';\n            setTimeout(() => hls.startLoad(), 1000);
@@ -1098,11 +1111,11 @@ const vmap = async () => {
     const r = await fetchPlaylistSmart(du, getBrowserHeaders('https://dembed.st/', c.slug + '|daddy'), 12000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return await r.text(); });
-  L.push('=== FATTORI DI DELAY (v10.16: bordo keyframe) ===',
-    'delay totale percepito = ritardo interno della FONTE + start (per provider)',
-    'NTV:   delay ~12.6-14s (3 seg x 4.2-7s, bordo keyframe)',
-    'DADDY: delay ~8-12s (2-3 seg x 4-6s, bordo keyframe)',
-    'VAVOO: delay ~17-27s (2 seg 12-17s, bordo keyframe)',
+  L.push('=== FATTORI DI DELAY (v10.17: target UNIFORME ~30s) ===',
+    'delay totale percepito = ritardo interno della FONTE + finestra (target 28s / start 30s)',
+    'TUTTI i provider (ntv/daddy/vavoo): stesso target -> lo switch non cambia il delay',
+    'H264: variant H265 scartate dal master e loggate (ExoPlayer non decodifica H265)',
+    'seg window: soglia adattiva per-TARGETDURATION del provider (bordi keyframe)',
     'RITARDO DI FONTE (relay lenti, es. Daddy embed fallback): misurato via PDT;',
     'sopra i 45s il provider va in coda per quel canale (5 min): i minuti di',
     'ritardo di un relay NON sono comprimibili, v10.14 li fa EVITARE.',
@@ -1131,7 +1144,7 @@ function debug() { const vm = vavooMapGet();
     VER,
     'Cache: NTV=' + tokenCache.size + ' | Daddy=' + daddyCache.size + ' | VavooURL=' + vavooURLCache.size,
     'Vavoo map: ' + (vm ? vm.size + ' (' + Math.round((Date.now() - vavooMap.t)/60000) + ' min)' : 'non caricata'),
-    'Delay/provider (bordo keyframe): ntv ~12.6-14s | daddy ~8-12s | vavoo ~17-27s | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
+    'Delay (v10.17): target UNIFORME ~28-30s tutti i provider (floor = lag fonte PDT) | m3u8 bust 2s anti-cache CDN | cache seg ' + SEG_CACHE_TTL + 's + bust ' + (BUST_MS/1000) + 's',
     'Smart bust: host senza bust (URL firmate): ' + (Array.from(noBustHosts.keys()).join(', ') || 'nessuno') + ' | warm cursor: ' + warmCursor + '/' + CHANNELS.length,
     'Heartbeat: ' + (lastHeartbeat ? 'ultimo tick ' + Math.round((now - lastHeartbeat)/1000) + 's fa (ogni 5 min riscalda 6 canali)' : 'non avviato'),
     'Stream: ' + plState.size + ' | Cache PL: ' + plCache.size,
@@ -1145,7 +1158,7 @@ function debug() { const vm = vavooMapGet();
   ].join('\n'); }
 function uso(P) { return [VER, '',
     'uso:',
-    '  /live?ch=<slug>                delay keyframe: ~12.6s ntv, ~8-12s daddy, ~17-27s vavoo',
+    '  /live?ch=<slug>                delay UNIFORME ~30s + H264 forzato (v10.17)',
     '  /live?ch=<slug>&p=vavoo,ntv   ordine preferito (fallback reale)',
     '  /player?ch=<slug>              player HLS.js (latenza controllata + catch-up)',
     '  /diag?ch=sky-sport-f1          diagnostica: finestra e delay per-provider',
