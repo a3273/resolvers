@@ -1,75 +1,60 @@
 // ============================================================================
-// TVNOW-CF v10.28 - PER-PROVIDER DELAY + ANTI-FREEZE LOOP + HEVC BLOCK
+// TVNOW-CF v10.29 - HARDENING POST-REVIEW
 // Deploy: https://resolvers.simone-scorrano-2011.workers.dev
 //
-// BASE: v10.27. Canali, mapping, timeout 20s, HEVC non bloccante di default:
-// IDENTICI. Le differenze sono elencate sotto.
+// BASE: v10.28. Stesso per-provider delay, anti-freeze loop, HEVC block,
+// sicurezza SSRF, bug fix di v10.28: IDENTICI.
 //
-// FIX 1 - DELAY PER-PROVIDER (non piu' uguale per tutti)
-//   v10.27 usava RUNWAY_BASE=4 per tutti e tre i provider. Cosi' ntv (che
-//   regge 3s) veniva limitato a 4s e daddy (che ne ha bisogno di 6) era
-//   troppo aggressivo -> scatti. Ora ogni provider ha il suo runway base
-//   e il suo minimo. Inoltre la finestra si adatta in base alla latenza
-//   di consegna MISURATA per quel provider: se ntv consegna in 200ms puo'
-//   stare a 3s, se daddy consegna in 800ms sta a 6s. Il player vede il
-//   delay minore che ciascun provider puo' reggere, non un compromesso.
+// v10.29 applica le correzioni legittime emerse dalla review esterna:
 //
-// FIX 2 - ANTI-FREEZE LOOP (il "blocco alle 6:14" con ripetizione)
-//   Sintomo: la fonte si blocca, il proxy continua a servire la stessa
-//   finestra per minuti. Causa: checkFreshOrThrow segnava freezeDetected
-//   ma il loop live() non switchava provider finche' non throws. Inoltre
-//   se la playlist upstream tornava OK (HTTP 200) ma con la STESSA seq,
-//   non veniva rilevato. Ora:
-//   - LOOP DETECTION: se per 3 poll consecutivi la seq upstream e' ferma,
-//     il provider viene marcato FROZEN e si switcha subito.
-//   - SEGMENT LOOP DETECTION: se serviamo lo stesso URL di segmento due
-//     volte di fila (extinf hash), scatta il freeze.
-//   - RECOVERY: quando un provider e' frozen, il CB trip subito (no wait
-//     6 fail), cooldown 30s. Il player non resta bloccato.
+// FIX 1 - BUST PLAYLIST SENZA JITTER (era v10.28 FIX 3b)
+//   Il jitter casuale ±400ms contraddiceva la filosofia "URL stabili" di
+//   v10.27 FIX 1: ogni client aveva un _b= diverso -> cache edge CF non
+//   condivisa -> miss simultanei -> micro-scatti ogni 30s tornavano.
+//   Ora il bust e' di nuovo deterministico (per-secondo). La cache e'
+//   condivisa tra tutti i client dello stesso secondo.
 //
-// FIX 3 - ANTI-MINISCATTI (potenziato)
-//   a) PREFETCH PREDITTIVO: oltre ai segmenti pubblicati, prefetcha il
-//      PROSSIMO segmento (seq+1) calcolando il timing. Quando il player
-//      lo chiede e' gia' in cache.
-//   b) JITTER SUL BUST PLAYLIST: il bust a 1s sincronizzava i fetch di
-//      tutti i client nello stesso istante -> miss cache simultanei.
-//      Ora il bust ha jitter casuale 800-1200ms per client.
-//   c) LATENZA EWMA con peso maggiore sui campioni recenti (0.6/0.4 vs
-//      0.75/0.25): reagisce prima ai degradamenti.
-//   d) BACKOFF PIU' VELOCE: 1 segFail (era 2) per attivare il +1 seg.
-//   e) CB SOGLIA 4 (era 6) in 90s (era 120s), cooldown 30s (era 50s).
+// FIX 2 - VALIDAZIONE SEGMENTI (nuovo)
+//   Aggiunto validateSegment(b): controlla sync byte 0x47, dimensione
+//   minima, coerenza su piu' pacchetti TS. Segmenti corrotti (HTML
+//   mascherato, pagine 403 JSON, risposte vuote) vengono scartati e
+//   marcati come segFail+segCorrupt invece di essere serviti al player.
+//   Risolve il sintomo "video verde/corrotto dopo N minuti".
 //
-// FIX 4 - HEVC BLOCK AGGRESSIVO (audio si, video corrotto)
-//   Sintomo: il player riceve l'audio ma il video e' verde/corrotto. Causa:
-//   HEVC servito a player H264-only. v10.27 filtrava le varianti HEVC dal
-//   master MA se il master era HEVC-only (onlyHevc) lo serviva comunque.
-//   Ora:
-//   - Se master e' HEVC-only: marca provider come h265Bad e PASSA al prossimo
-//     provider nella stessa richiesta (non aspetta il prossimo poll).
-//   - Probe codec sui segmenti (gia' presente) ora blocca anch'esso: se
-//     tsParseVideoCodec ritorna h265, marcame e switch.
-//   - Nuovo parametro ?strict264=1 (gia' c'era) ora funge da kill switch
-//     HEVC su TUTTO il percorso, non solo sul master.
-//   - Aggiunto filtro URL: alcuni provider servono HEVC via query ?codec=h265
-//     o path /hevc/. Lo strippiamo se strict264=1.
+// FIX 3 - FILTRO URL HEVC REALE (era v10.28 FIX 4, non implementato)
+//   stripHevc(url): rimuove/normalizza path /hevc/, query ?codec=h265,
+//   ?codec=hevc, ?hevc=1, /h265/ quando strict264=1. NON si limita a
+//   stripBust. Applicato su /seg prima del fetch.
 //
-// FIX 5 - BUG FIX
-//   a) warm() passava DADDY_EDGE_IDS a ntvToken: ora chiama daddyResolve
-//      per gli ID Daddy e ntvToken solo per i canali con ntv mappato.
-//   b) txtSafe(p) stub rimosso: diag() usa il txt reale.
-//   c) setTimeout in finally() di withSegSingleFlight rimosso: usa cleanup.
-//   d) plFetchCache senza LRU: aggiunto cap 200 entry.
+// FIX 4 - 429/503 NON SONO segFail (nuovo)
+//   429 (Too Many Requests) e 503 (Service Unavailable) sono blip
+//   transitori del CDN/edge, non blocchi reali del provider. Marcarli
+//   come segFail triggerava backoff prematuro e CB inutili. Ora vengono
+//   solo loggati (segStat.cdnBlip++) e ritornati al player come 503,
+//   senza toccare segFails/chAdapt/cbFails.
 //
-// FIX 6 - SICUREZZA
-//   /seg, /rawu, /segtest ora validano l'host contro una whitelist dei
-//   provider noti (NTV, Vavoo, Daddy, edge). SSRF chiuso.
-//   Endpoint diagnostici rispondono a /debug, /dump, /why, /adapt?reset=1,
-//   /bytetest, /freezetest solo se ?k=<token> dove token = env.ADMIN_TOKEN
-//   (opzionale: se non settato, tutto resta aperto come prima).
+// FIX 5 - LOOP DETECTION INVALIDA plCache (nuovo)
+//   Quando checkSeqLoop o checkSegLoop scattano, oltre a cbForceCooldown
+//   invalidano anche la entry plCache[ckOf(prov)] per evitare che la
+//   playlist congelata venga servita in SWR per 2.5s. segStat.loopInvalidate++.
 //
-// INVARIATO: 30 canali, mappatura, timeout 20s, cache-control no-cache al
-// player, ENDLIST rimosso, guard daddy, safety-net skip freeze, stateKey
-// annidate senza bust, fix SOURCE RESTART v10.20, SUB_BUDGET 40.
+// FIX 6 - cbForceCooldown RESETTA FAIL COUNT (nuovo)
+//   cbForceCooldown ora cancella cbFails[key] oltre a mettere il cooldown.
+//   Prima i fail restavano nella finestra e potevano riattivare un
+//   nuovo cooldown subito dopo il primo.
+//
+// FIX 7 - predictNextSeg SKIP TIMESTAMP UNIX (nuovo)
+//   Se il numero nel path ha 10+ cifre (timestamp Unix), non lo
+//   incrementa: sarebbe un URL sbagliato. Ritorna null. Funziona solo
+//   per seq numeriche brevi (seg001.ts, 1.ts, 42.ts).
+//
+// FIX 8 - EWMA LATENZA FILTRA OUTLIER (nuovo)
+//   Se un campione di latenza e' >3x l'EWMA attuale (e latN>=3), viene
+//   scartato come outlier. Evita backoff prematuri su reti instabili.
+//
+// INVARIATO: 30 canali, mappatura, timeout 20s, cache-control no-cache
+// al player, ENDLIST rimosso, guard daddy, safety-net skip freeze,
+// stateKey annidate senza bust, fix SOURCE RESTART v10.20, SUB_BUDGET 40.
 // ============================================================================
 let MODULE_CTX = null; let SUB_BUDGET = 40;
 const subFree = n => SUB_BUDGET >= n;
@@ -124,49 +109,46 @@ export default { async fetch(req, env, ctx) {
 // --- CONFIGURAZIONE --------------------------------------------------------
 const MIN_SEGS = 2;
 const EXTRA_SEGS_MAX = 1;
-const BACKOFF_FAIL_MIN = 1;                 // FIX 3d: era 2
+const BACKOFF_FAIL_MIN = 1;
 const CLEAN_DECAY_MS = 5 * 60 * 1000;
-const LAT_RISK_RATIO = 0.30;                // FIX 3c: era 0.35 (piu' sensibile)
+const LAT_RISK_RATIO = 0.30;
 const SEG_TIMEOUT = 20000;
 const WARM_RESERVE = 14;
 const PREFETCH_SEGS = 3;
 const STALE_FACTOR = 6, MAX_BUFFER_SECS = 40;
 const SEG_CACHE_TTL = 90;
 const SEG_API_TTL = 120;
-const SEGFAIL_TTL = 90*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;  // FIX 3d: TTL 90s (era 180s)
+const SEGFAIL_TTL = 90*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
 const PL_CACHE_TTL = 700;
 const PL_STALE_MS = 2500;
 const PLAYLIST_FRESH_MS = 1000;
-const PL_BUST_MS = 1000;
-const PL_BUST_JITTER_MS = 400;              // FIX 3b: jitter 800-1200ms
+const PL_BUST_MS = 1000;                    // v10.29 FIX 1: bust deterministico, no jitter
 const RESOLVE_BUDGET = 8000, STATE_STALE_TTL = 15*60*1000;
-const CB_FAIL_WIN = 90*1000, CB_FAIL_TH = 4, CB_COOLDOWN = 30*1000;  // FIX 3e: 4/90s/30s
+const CB_FAIL_WIN = 90*1000, CB_FAIL_TH = 4, CB_COOLDOWN = 30*1000;
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000;
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const MAX_PLFETCH = 200;                    // FIX 5d: cap LRU
-const VER = 'TVNOW-CF v10.28';
+const MAX_PLFETCH = 200;
+const VER = 'TVNOW-CF v10.29';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;
 const FREEZE_TTL = 60 * 1000;
-const LOOP_DETECT_POLLS = 3;                // FIX 2: 3 poll fermi = FROZEN
-const LOOP_SEG_REPEAT = 2;                  // FIX 2: stesso seg URL 2 volte = FROZEN
-// FIX 1: per-provider runway. ntv al minimo (3s), daddy piu' largo (6s).
+const LOOP_DETECT_POLLS = 3;
+const LOOP_SEG_REPEAT = 2;
 const PROV_CFG = {
   ntv:   { runwayBase: 3, runwayMin: 2, segsMin: 2, plFresh: 600,  plStale: 2200 },
   vavoo: { runwayBase: 4, runwayMin: 3, segsMin: 2, plFresh: 700,  plStale: 2500 },
   daddy: { runwayBase: 6, runwayMin: 4, segsMin: 2, plFresh: 800,  plStale: 2800 }
 };
-// FIX 6: whitelist host per SSRF
 const HOST_WHITELIST = [
-  'cfbu247.sbs','tvnow247.today',                // NTV
+  'cfbu247.sbs','tvnow247.today',
   'vavoo.to','geil.to','geil.app','geil.win','kool.to','kool.ws','vavoo.net',
-  'huhu.to','oha.to','voltop.net',               // Vavoo mirrors
-  '7jep2q6xee5pjrv.fu8oefd4v2dvlmaarur6crfp.com',// Vavoo IP-fallback
-  'dembed.st','thedaddy.li','wedd48c.top','edge.wedd48c.top', // Daddy
-  'raw.githubusercontent.com',                   // Vavoo map
-  'www.cloudflare.com'                           // /ip trace
+  'huhu.to','oha.to','voltop.net',
+  '7jep2q6xee5pjrv.fu8oefd4v2dvlmaarur6crfp.com',
+  'dembed.st','thedaddy.li','wedd48c.top','edge.wedd48c.top',
+  'raw.githubusercontent.com',
+  'www.cloudflare.com'
 ];
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -180,14 +162,13 @@ function uaFor(key) {
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   return UA_LIST[h % UA_LIST.length];
 }
-// FIX 6: token diagnostico opzionale
 function diagOk(u, env) {
   const tok = env && env.ADMIN_TOKEN;
-  if (!tok) return true; // se non configurato, aperto come prima
+  if (!tok) return true;
   return u.searchParams.get('k') === tok;
 }
 
-// --- CANALI (IDENTICI) -----------------------------------------------------
+// --- CANALI ----------------------------------------------------------------
 const CHANNELS = [
   { slug:'rsi-la-1', name:'RSI La 1', ntv:'', vavoo:'rsi la 1', daddy:'', vid6:'2455610203', vid7:'2290395046' },
   { slug:'rsi-la-2', name:'RSI La 2', ntv:'', vavoo:'rsi la 2', daddy:'', vid6:'3590183307', vid7:'3475299702' },
@@ -263,7 +244,6 @@ function contentFingerprint(b) {
   return [hashRange(b,0,65536),hashRange(b,32768,98304),hashRange(b,131072,196608)].join('-');
 }
 function strHash(s) { let h=5381; for (let i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))>>>0; return h; }
-// FIX 6: validazione host contro whitelist
 function hostAllowed(urlStr) {
   try {
     const h = String(urlStr||'').split('/')[2] || '';
@@ -296,7 +276,12 @@ function noteSegDur(slug,prov,durs) {
 function noteSegLatency(slug,prov,ms) {
   if (!slug||!prov||!(ms>=0)) return;
   const a = getAdapt(slug,prov);
-  // FIX 3c: EWMA 0.6/0.4 (era 0.75/0.25) per reattivita'
+  // v10.29 FIX 8: filtra outlier (>3x EWMA attuale) per evitare backoff
+  // prematuri su reti instabili. Solo dopo almeno 3 campioni.
+  if (a.latN>=3 && a.segLat>0 && ms > a.segLat*3) {
+    log('lat-outlier '+adaptKey(slug,prov)+': '+ms+'ms scartato (ewma '+Math.round(a.segLat)+'ms)');
+    return;
+  }
   a.segLat = a.segLat ? (a.segLat*0.6+ms*0.4) : ms;
   a.latN++; a.t = Date.now();
 }
@@ -375,10 +360,9 @@ const plCache=new Map(), plState=new Map(), upFresh=new Map();
 const daddyEdgeFail=new Map(), plFetchCache=new Map();
 const lastWin=new Map(), freezeDetected=new Map();
 const byteSamples=new Map(), freezeSamples=new Map();
-// FIX 2: tracking loop detection (poll count con seq ferma + ultimo URL seg)
 const seqPollCount=new Map(), lastSegUrl=new Map();
 const SEGCACHE = (typeof caches !== 'undefined') ? caches.default : null;
-let segStat = { apiHits:0, origin:0, joined:0, timeouts:0, stale:0, swr:0, loopDetect:0, freezeRecover:0, hevcBlock:0 };
+let segStat = { apiHits:0, origin:0, joined:0, timeouts:0, stale:0, swr:0, loopDetect:0, freezeRecover:0, hevcBlock:0, segCorrupt:0, cdnBlip:0, loopInvalidate:0 };
 const provScore=new Map();
 const PROV_SCORE_TTL = 30*60*1000;
 const noteProv = (slug,prov,ok) => { if (slug&&prov) provScore.set(slug+'|'+prov,{ok:!!ok,t:Date.now()}); };
@@ -408,10 +392,12 @@ function cbRecordFail(slug,prov) {
     log('CB '+key+' cooldown '+(CB_COOLDOWN/1000)+'s');
   }
 }
-function cbForceCooldown(slug,prov) {  // FIX 2: per freeze/loop
+function cbForceCooldown(slug,prov) {  // v10.29 FIX 6: reset fail count
   if (!prov) return;
-  cbCooldown.set(cbKey(slug,prov),Date.now()+CB_COOLDOWN);
-  log('CB FORCE '+cbKey(slug,prov)+' (freeze/loop)');
+  const k=cbKey(slug,prov);
+  cbCooldown.set(k,Date.now()+CB_COOLDOWN);
+  cbFails.delete(k);
+  log('CB FORCE '+k+' (freeze/loop)');
 }
 function cbInCooldown(slug,prov) {
   const key=cbKey(slug,prov); const until=cbCooldown.get(key);
@@ -465,9 +451,8 @@ function cleanupStaleState() {
   for (const [k,e] of byteSamples) if (now-e.t>15*60*1000) byteSamples.delete(k);
   for (const [k,e] of freezeSamples) if (now-e.t>15*60*1000) freezeSamples.delete(k);
   for (const [k,e] of lastWin) if (now-e.t>10*60*1000) lastWin.delete(k);
-  for (const [k,t] of seqPollCount) if (now-t>5*60*1000) seqPollCount.delete(k);  // FIX 2
-  for (const [k,e] of lastSegUrl) if (now-e.t>5*60*1000) lastSegUrl.delete(k);    // FIX 2
-  // FIX 5d: LRU cap su plFetchCache
+  for (const [k,t] of seqPollCount) if (now-t>5*60*1000) seqPollCount.delete(k);
+  for (const [k,e] of lastSegUrl) if (now-e.t>5*60*1000) lastSegUrl.delete(k);
   if (plFetchCache.size>MAX_PLFETCH) {
     const ks=Array.from(plFetchCache.keys()).sort((a,b)=>{
       const ea=plFetchCache.get(a), eb=plFetchCache.get(b);
@@ -481,7 +466,7 @@ function getPlState(key) { let st=plState.get(key);
   if (!st) { st={lastSeq:-1,lastUpSeq:-1,base:'',discont:false,clampAt:0,t:Date.now()}; plState.set(key,st); }
   return st; }
 
-// --- TRACKING SEQ + LOOP DETECTION (FIX 2) --------------------------------
+// --- TRACKING SEQ + LOOP DETECTION ----------------------------------------
 const servedSeq=new Map();
 function noteServedSeq(slug,prov,seq) { if (slug&&prov) servedSeq.set(slug+'|'+prov,{seq,t:Date.now()}); }
 function servedSeqManual() {
@@ -498,7 +483,6 @@ function frozenManual() {
     if (now-e.t>FROZEN_S*1000 && now-e.t<15*60*1000)
       out.push(k+': fermo da '+Math.round((now-e.t)/1000)+'s');
   return out.join('; ')||'nessuno'; }
-// FIX 2: detection loop. Ritorna true se la seq upstream e' ferma da troppi poll.
 function checkSeqLoop(slug,prov,upSeq) {
   if (!slug||!prov||upSeq==null) return false;
   const k=slug+'|'+prov, now=Date.now();
@@ -508,11 +492,11 @@ function checkSeqLoop(slug,prov,upSeq) {
   if (e.count>=LOOP_DETECT_POLLS) {
     log('LOOP '+k+': seq '+upSeq+' ferma per '+e.count+' poll');
     segStat.loopDetect++;
+    invalidatePlCacheForLoop(slug,prov);  // v10.29 FIX 5
     return true;
   }
   return false;
 }
-// FIX 2: detection stesso segmento URL servito due volte di fila.
 function checkSegLoop(slug,prov,segUrl) {
   if (!slug||!prov||!segUrl) return false;
   const k=slug+'|'+prov, now=Date.now();
@@ -521,9 +505,19 @@ function checkSegLoop(slug,prov,segUrl) {
   if (e && e.url===segUrl && e.count+1>=LOOP_SEG_REPEAT) {
     log('LOOP-SEG '+k+': stesso URL '+segUrl.slice(-40)+' x'+(e.count+1));
     segStat.loopDetect++;
+    invalidatePlCacheForLoop(slug,prov);  // v10.29 FIX 5
     return true;
   }
   return false;
+}
+// v10.29 FIX 5: invalida tutte le plCache entry del canale|provider in loop.
+function invalidatePlCacheForLoop(slug,prov) {
+  if (!slug||!prov) return;
+  const prefix=slug+':'+prov+':';
+  let n=0;
+  for (const k of plCache.keys()) if (k.startsWith(prefix)) { plCache.delete(k); n++; }
+  segStat.loopInvalidate++;
+  log('LOOP invalidate plCache '+prefix+'* ('+n+' entries)');
 }
 
 // --- VAVOO HEALTH ----------------------------------------------------------
@@ -552,8 +546,6 @@ function recordVavooFail(slug,idNum) {
 
 const plCacheSet = (ck,txt) => { if (ck) plCache.set(ck,{txt,t:Date.now()}); };
 
-// FIX 2: checkFreshOrThrow ora segnala anche il loop. La seq che avanza
-// cancella freeze (invariato da v10.27).
 function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
   const now=Date.now(); const st=upFresh.get(key);
   if (!st || upSeq!==st.seq) {
@@ -565,7 +557,6 @@ function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
     }
     return;
   }
-  // seq ferma: controlla loop
   if (slug && checkSeqLoop(slug,prov,upSeq)) {
     freezeDetected.set(key,now);
     cbForceCooldown(slug,prov);
@@ -684,10 +675,10 @@ function segCacheKey(abs) {
   const q=keep.length?'?'+keep.join('&'):'';
   return base+q+'#k'+strHash(base+q).toString(36);
 }
-// FIX 3b: bust con jitter per client per evitare miss sincronizzati.
+// v10.29 FIX 1: bust deterministico (per-secondo). Niente jitter: la cache
+// edge CF e' condivisa tra tutti i client che chiedono nello stesso secondo.
 function plBust(url) {
-  const jitter = Math.floor((Math.random()-0.5)*2*PL_BUST_JITTER_MS);
-  const b = Math.floor((Date.now()+jitter)/PL_BUST_MS)*PL_BUST_MS;
+  const b = Math.floor(Date.now()/PL_BUST_MS)*PL_BUST_MS;
   return url+(url.includes('?')?'&':'?')+'_b='+b;
 }
 const NO_BUST_TTL=30*60*1000;
@@ -721,11 +712,38 @@ function withSegSingleFlight(key,fn) {
   if (e&&e.p&&Date.now()-e.t<25000) { segStat.joined++; return e.p.catch(() => fn()); }
   const p=fn();
   segInflight.set(key,{p,t:Date.now()});
-  // FIX 5c: niente setTimeout in finally (non garantito in Workers post-response).
-  // Affidiamoci al cleanup di cleanupStaleState (30s).
   return p;
 }
 function isVideoCt(ct) { ct=String(ct||'').toLowerCase(); return /mpegurl|mp2t|mp4|octet-stream|video\//.test(ct)&&!/html|json|xml/.test(ct); }
+// v10.29 FIX 2: validazione segmento TS. Ritorna {ok, reason}.
+function validateSegment(b) {
+  if (!b || b.length < 188) return { ok:false, reason:'too small ('+(b?b.length:0)+'B)' };
+  if (b[0] !== 0x47) return { ok:false, reason:'no sync byte 0x47 (got 0x'+(b[0]||0).toString(16)+')' };
+  let syncHits=0, checked=0;
+  const max=Math.min(Math.floor(b.length/188), 8);
+  for (let i=0;i<max;i++) { checked++; if (b[i*188]===0x47) syncHits++; }
+  if (checked>=4 && syncHits < Math.ceil(checked*0.75))
+    return { ok:false, reason:'sync misaligned '+syncHits+'/'+checked };
+  return { ok:true, reason:'ok' };
+}
+// v10.29 FIX 3: strip HEVC da URL segmenti quando strict264=1.
+function stripHevc(url) {
+  let s = String(url||'');
+  s = s.replace(/\/hevc\//i,'/').replace(/\/h265\//i,'/');
+  const qi=s.indexOf('?');
+  if (qi<0) return s.replace(/\/+/g,'/');
+  const base=s.slice(0,qi).replace(/\/+/g,'/');
+  const keep=[];
+  for (const kv of s.slice(qi+1).split('&')) {
+    const eq=kv.indexOf('=');
+    const name=(eq>=0?kv.slice(0,eq):kv).toLowerCase();
+    const val=eq>=0?kv.slice(eq+1):'';
+    if (name==='codec' && /^(h265|hevc|hvc1|hev1)$/i.test(val)) continue;
+    if (name==='hevc') continue;
+    keep.push(kv);
+  }
+  return keep.length ? base+'?'+keep.join('&') : base;
+}
 async function fetchSegmentWithCache(target,h,range,opts) {
   const skipApi=opts&&opts.skipApiCache;
   const skipCf=opts&&opts.skipCfCache;
@@ -762,10 +780,8 @@ async function fetchSegmentWithCache(target,h,range,opts) {
       bg(() => SEGCACHE.put(key,stored));
     } catch (e) {}
   }
-  return { resp:r, fromCache:(skipApi||skipForFreeze)?'origin-fresh':'origin' };
+  return { resp:r, fromCache:(skipApi||skipForFreeze)?'origin-fresh':'origin', validated:false };
 }
-// FIX 3a + 6: prefetch mirato sui segmenti PUBBLICATI + PREFETCH PREDITTIVO
-// del prossimo segmento (seq+1). Il primo in await al primo poll.
 async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
   const p=parseMediaPl(txt);
   if (p.isMaster) {
@@ -773,7 +789,6 @@ async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
     if (v.onlyHevc) {
       noteH265(slug+'|'+prov,true); segStat.hevcBlock++;
       log('h264 '+slug+'|'+prov+': master HEVC-only -> coda');
-      // FIX 4: HEVC-only = blocking se strict264, altrimenti coda ma NON passa
       if (ctx&&ctx.strict264) throw new Error(prov+' HEVC-only (strict264)');
     }
     if (v.video===0&&v.audioGroups>0)
@@ -800,8 +815,6 @@ async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
     for (const s of rest) {
       try { bg(() => warmSeg(absSegUrl(s.url,baseUrl),ctx)); } catch (e) {}
     }
-    // FIX 3a: prefetch predittivo del prossimo segmento (seq+1).
-    // Calcoliamo l'URL del prossimo segmento sostituendo il numero nel path.
     try {
       const last=published[published.length-1];
       const nextUrl=predictNextSeg(last.url,baseUrl);
@@ -813,13 +826,13 @@ async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
   if (ctx&&ctx.winKey) lastWin.set(ctx.winKey,{prov,t:Date.now()});
   return R(out,200,HLS_NO_CACHE());
 }
-// FIX 3a: predice l'URL del prossimo segmento incrementando l'ultimo numero
-// nel path. Funziona per la maggior parte degli HLS live (seq numeriche).
+// v10.29 FIX 7: skip timestamp Unix (10+ cifre).
 function predictNextSeg(lastUrl,baseUrl) {
   const abs = absSegUrl(lastUrl,baseUrl);
   const m = abs.match(/^(.*?)(\d+)(\.[a-zA-Z0-9]+)?(\?.*)?$/);
   if (!m) return null;
   const prefix=m[1], numStr=m[2], ext=m[3]||'', qs=m[4]||'';
+  if (numStr.length >= 10) return null;
   const next = (parseInt(numStr,10)+1).toString().padStart(numStr.length,'0');
   return prefix+next+ext+qs;
 }
@@ -1099,8 +1112,6 @@ async function live(u,P,env,legacy) {
   const finalOrder=good.concat(bad);
   const cbLive=finalOrder.filter(p=>!cbInCooldown(c.slug,p));
   const cbFrozen=finalOrder.filter(p=>cbInCooldown(c.slug,p));
-  // FIX 4: provider HEVC-only marcati vanno in fondo (non rimossi: potrebbero
-  // essere gli unici disponibili).
   const hurt=k=>lagBad(k)||h265Bad(k);
   let tryOrder=cbLive.filter(p=>!hurt(c.slug+'|'+p))
     .concat(cbLive.filter(p=>hurt(c.slug+'|'+p)),cbFrozen);
@@ -1182,7 +1193,6 @@ async function live(u,P,env,legacy) {
         for (const s of (cc.awaitFirst?published.slice(1):published)) {
           try { bg(() => warmSeg(absSegUrl(s.url,du),cc)); } catch (e) {}
         }
-        // FIX 3a: prefetch predittivo anche per daddy
         try {
           const last=published[published.length-1];
           const nextUrl=predictNextSeg(last.url,du);
@@ -1202,7 +1212,6 @@ async function live(u,P,env,legacy) {
     }
   };
 
-  // SWR playlist: il player non aspetta mai l'upstream a regime.
   if (lw && !cbInCooldown(c.slug,lw.prov)) {
     const ck=ckOf(lw.prov);
     const ent=plCache.get(ck);
@@ -1236,7 +1245,6 @@ async function live(u,P,env,legacy) {
       if (/FREEZE|LOOP/i.test(msg)) sawFreeze=true;
       log(p+' ko '+c.slug+': '+msg);
       noteProv(c.slug,p,false);
-      // FIX 4: HEVC-only = skip al prossimo provider subito, non loggare come freeze
       if (/HEVC-only/i.test(msg)) continue;
     }
   }
@@ -1279,7 +1287,6 @@ function parseMediaPl(txt) {
   }
   return { upSeq,upTarget,upVersion,map,segs,isMaster,endlist };
 }
-// FIX 1: pickWindow usa runway PER PROVIDER (PROV_CFG). ntv sta a 3s, daddy a 6s.
 function pickWindow(durs,prov,slug,forceSegs,wide) {
   const n=durs.length;
   if (!n) return {count:0,sum:0,segDur:0,runway:0,extra:0};
@@ -1319,7 +1326,6 @@ function proxUrl(abs,ctx) {
   if (ctx.origin) u+='&o='+encodeURIComponent(ctx.origin);
   if (ctx.ch) u+='&ch='+encodeURIComponent(ctx.ch);
   if (ctx.prov) u+='&p='+encodeURIComponent(ctx.prov);
-  // FIX 4: propaga strict264 al proxy segmenti per filtrare HEVC se richiesto
   if (ctx.strict264) u+='&strict264=1';
   return u; }
 function isAudioOnlyStreamInf(line) {
@@ -1355,7 +1361,6 @@ function rewriteMaster(txt,baseUrl,ctx) {
   const isHevc=v=>/CODECS="/.test(v.line)&&/(hevc|hvc1|hev1|h265|dvh)/i.test(v.line);
   const hasExplicit=allVideo.some(v=>/CODECS="/.test(v.line));
   const hasAvc=allVideo.some(v=>!isHevc(v));
-  // FIX 4: con strict264 filter SOLO avc; senza, preferisci avc ma fallback hevc
   const video=(hasExplicit&&hasAvc)||ctx.strict264
     ?allVideo.filter(v=>!isHevc(v))
     :allVideo;
@@ -1412,7 +1417,6 @@ function rewriteMediaPl(txt,baseUrl,ctx) {
     if (st.discont&&kept.length) { discontTop=true; st.discont=false; }
   }
   noteServedSeq(ctx&&ctx.ch,ctx&&ctx.prov,seq);
-  // FIX 2: loop detection sull'ultimo segmento pubblicato
   if (ctx&&ctx.ch&&ctx.prov&&kept.length) {
     const lastSeg=kept[kept.length-1];
     if (lastSeg&&lastSeg.url && checkSegLoop(ctx.ch,ctx.prov,lastSeg.url)) {
@@ -1451,12 +1455,13 @@ function rewriteMediaPl(txt,baseUrl,ctx) {
 async function seg(u,req,env) { countReq('seg');
   const target=u.searchParams.get('u');
   if (!target) return R('uso: /seg?u=<url>',200,TXT());
-  // FIX 6: SSRF whitelist
   if (!hostAllowed(target)) return R('host non consentito',403,TXT());
   const ref=u.searchParams.get('ref')||'https://thedaddy.li/';
   const ch=u.searchParams.get('ch')||'';
   const prov=u.searchParams.get('p')||'';
   const strict264=u.searchParams.get('strict264')==='1';
+  // v10.29 FIX 3: applica filtro URL HEVC se strict264
+  const effTarget = strict264 ? stripHevc(target) : target;
   const h=getBrowserHeaders(ref,(ch&&prov)?(ch+'|'+prov):ref);
   const o=u.searchParams.get('o'); if (o) h['Origin']=o;
   const rangeParam=u.searchParams.get('range');
@@ -1465,20 +1470,18 @@ async function seg(u,req,env) { countReq('seg');
   else if (playerRange) h['Range']=playerRange;
   const range=h['Range']||null;
   if (ref.includes('thedaddy')||ref.includes('dembed')) { h['Referer']='https://dembed.st/'; h['Origin']='https://dembed.st'; }
-  if (/\.m3u8(\?|$)/i.test(target)) {
-    const clean=stripBust(target);
+  if (/\.m3u8(\?|$)/i.test(effTarget)) {
+    const clean=stripBust(effTarget);
     let txt;
-    try { txt=await fetchUpstreamPl('m|'+prov+'|'+clean,target,h,12000); }
+    try { txt=await fetchUpstreamPl('m|'+prov+'|'+clean,effTarget,h,12000); }
     catch (e) { return R('upstream playlist',502,TXT()); }
-    const baseDir=target.substring(0,target.lastIndexOf('/')+1)||target;
+    const baseDir=effTarget.substring(0,effTarget.lastIndexOf('/')+1)||effTarget;
     const out=rewriteAny(txt,baseUrl_of(baseDir),
       {P:u.origin,ref,origin:o||'',ch,prov,strict264,stateKey:'m|'+prov+'|'+clean});
     return R(out,200,HLS_NO_CACHE());
   }
-  // FIX 4: strict264 su segmenti - probe al volo se non gia' marcato
   if (strict264 && ch && prov && !h265Bad(ch+'|'+prov)) {
-    // probe asincrono: se il segmento risulta HEVC, marcalo. Non bloccare la prima richiesta.
-    bg(() => probeH265(ch,prov,target,{ref,origin:o||''}));
+    bg(() => probeH265(ch,prov,effTarget,{ref,origin:o||''}));
   }
   let r,attempts=0; const maxAttempts=3;
   while (attempts<maxAttempts) {
@@ -1487,8 +1490,8 @@ async function seg(u,req,env) { countReq('seg');
     if (attempts>=2) { o2.skipApiCache=true; o2.skipCfCache=attempts>=3; }
     let signed;
     try {
-      signed=await withSegSingleFlight(segCacheKey(target)+'|r'+attempts+(range?'|rg':''),() =>
-        fetchSegmentWithCache(target,h,range,o2));
+      signed=await withSegSingleFlight(segCacheKey(effTarget)+'|r'+attempts+(range?'|rg':''),() =>
+        fetchSegmentWithCache(effTarget,h,range,o2));
     } catch (e) {
       noteRetry(ch,prov);
       if (attempts<maxAttempts) { log('seg timeout retry '+attempts+' '+(ch||'?')); continue; }
@@ -1497,6 +1500,26 @@ async function seg(u,req,env) { countReq('seg');
     r=signed.resp;
     const ct=r.headers.get('content-type')||'';
     const isHtmlBody=r.ok&&/^(text\/html|application\/json|text\/xml)/i.test(ct);
+    // v10.29 FIX 4: 429/503 = blip CDN, non segFail. Log + return al player.
+    if (r.status===429 || r.status===503) {
+      segStat.cdnBlip++;
+      log('cdn-blip '+(ch||'?')+'/'+(prov||'?')+' '+r.status+' (no segFail)');
+      return R('upstream '+r.status,r.status,TXT());
+    }
+    // v10.29 FIX 2: valida il segmento se non range e 200 OK
+    if (r.ok && !range && isVideoCt(ct)) {
+      try {
+        const buf = await r.clone().arrayBuffer();
+        const v = validateSegment(new Uint8Array(buf));
+        if (!v.ok) {
+          segStat.segCorrupt++;
+          log('seg-corrupt '+(ch||'?')+'/'+(prov||'?')+': '+v.reason);
+          recordSegFail(ch,prov);
+          if (attempts<maxAttempts) continue;
+          return R('upstream corrotto: '+v.reason,502,TXT());
+        }
+      } catch (e) {}
+    }
     if (!r.ok&&!range) { recordSegFail(ch,prov);
       if (attempts<maxAttempts) continue;
       return R('upstream '+r.status,r.status,TXT());
@@ -1753,7 +1776,6 @@ async function segtest(u,env) {
   const t=u.searchParams.get('u');
   if (!t) return R('uso: /segtest?u=<url>',200,TXT());
   if (!diagOk(u,env)) return R('token richiesto',200,TXT());
-  // FIX 6: SSRF whitelist
   if (!hostAllowed(t)) return R('host non consentito',403,TXT());
   const ref=u.searchParams.get('ref')||'https://tvnow247.today/';
   const L=['=== SEGTEST ===',''];
@@ -1808,13 +1830,8 @@ async function checkseg(u) {
 }
 async function warm() { const t0=Date.now();
   let ok=0,err=0;
-  // FIX 5a: warm chiama daddyResolve per gli ID Daddy e ntvToken per i canali
-  // con ntv mappato. Prima passava DADDY_EDGE_IDS a ntvToken.
-  const daddyIds=new Set(DADDY_EDGE_IDS);
-  const ntvIds=new Set(CHANNELS.filter(c=>c.ntv).map(c=>c.ntv));
   for (let i=0;i<DADDY_EDGE_IDS.length;i+=8)
     await Promise.all(DADDY_EDGE_IDS.slice(i,i+8).map(async id => { try{await daddyResolve(id,null);ok++}catch(e){err++} }));
-  // ntvToken solo per i canali che hanno ntv (corrispondenza slug)
   for (const c of CHANNELS) if (c.ntv) { try{await ntvToken(c.ntv,c.slug);ok++}catch(e){err++} }
   for (const ch of ['sky sport 24','sky sport uno','sky sport calcio','rsi la 1','rsi la 2'])
     try{await vavooResolve(ch,null)}catch(e){}
@@ -1855,7 +1872,7 @@ async function diag(u) {
     'segmenti: URL STABILI (bust rimosso) | timeout '+SEG_TIMEOUT+'ms',
     'playlist: SWR per-provider (ntv '+PROV_CFG.ntv.plFresh+'/'+PROV_CFG.ntv.plStale+' | vavoo '+PROV_CFG.vavoo.plFresh+'/'+PROV_CFG.vavoo.plStale+' | daddy '+PROV_CFG.daddy.plFresh+'/'+PROV_CFG.daddy.plStale+')',
     'finestra PER PROVIDER: ntv '+PROV_CFG.ntv.runwayBase+'s | vavoo '+PROV_CFG.vavoo.runwayBase+'s | daddy '+PROV_CFG.daddy.runwayBase+'s','',
-    'loop detection: '+LOOP_DETECT_POLLS+' poll fermi = CB force | seg loop: '+LOOP_SEG_REPEAT+' ripetizioni',''];
+    'loop detection: '+LOOP_DETECT_POLLS+' poll fermi = CB force + invalidate plCache | seg loop: '+LOOP_SEG_REPEAT+' ripetizioni',''];
   const tryP=async(label,prov) => {
     try {
       const R0=await resolveForDiag(prov,c);
@@ -1866,7 +1883,6 @@ async function diag(u) {
       const p=parseMediaPl(txt);
       L.push('-- '+label+' --');
       if (p.isMaster) {
-        // FIX 5b: usa il txt reale, non lo stub
         const v=masterCodecVerdict(txt);
         L.push('   master avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':''));
         if (v.onlyHevc) L.push('   >>> HEVC-only: serve strict264=1 o altro provider');
@@ -1904,9 +1920,10 @@ function debug() {
   return [VER,
     'PER-PROVIDER: ntv='+PROV_CFG.ntv.runwayBase+'s vavoo='+PROV_CFG.vavoo.runwayBase+'s daddy='+PROV_CFG.daddy.runwayBase+'s | timeout '+SEG_TIMEOUT+'ms',
     'Playlist SWR: ntv '+PROV_CFG.ntv.plFresh+'/'+PROV_CFG.ntv.plStale+'ms vavoo '+PROV_CFG.vavoo.plFresh+'/'+PROV_CFG.vavoo.plStale+'ms daddy '+PROV_CFG.daddy.plFresh+'/'+PROV_CFG.daddy.plStale+'ms',
-    'Bust playlist: '+PL_BUST_MS+'ms +/- '+PL_BUST_JITTER_MS+'ms jitter | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s cooldown '+(CB_COOLDOWN/1000)+'s',
+    'Bust playlist: '+PL_BUST_MS+'ms deterministico (no jitter) | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s cooldown '+(CB_COOLDOWN/1000)+'s',
     'Cache API hit='+segStat.apiHits+' origine='+segStat.origin+' join='+segStat.joined+' timeouts='+segStat.timeouts,
-    'SWR served='+segStat.swr+' | LOOP detect='+segStat.loopDetect+' | FREEZE recover='+segStat.freezeRecover+' | HEVC block='+segStat.hevcBlock,
+    'SWR served='+segStat.swr+' | LOOP detect='+segStat.loopDetect+' (invalidate '+segStat.loopInvalidate+') | FREEZE recover='+segStat.freezeRecover+' | HEVC block='+segStat.hevcBlock,
+    'SEG corrupt='+segStat.segCorrupt+' | CDN blip (429/503)='+segStat.cdnBlip,
     'DELAY PER CANALE: '+(est.sort().join(' | ')||'nessuna misura'),
     'Cache: NTV='+tokenCache.size+' Daddy='+daddyCache.size+' VavooURL='+vavooURLCache.size+' plFetch='+plFetchCache.size+'/'+MAX_PLFETCH,
     'Vavoo host '+vavooGoodHost.replace('https://','')+' (fail '+vavooHostFails+')',
@@ -1922,7 +1939,7 @@ function uso(P) { return [VER,'',
     '  /live?ch=<slug>            delay PER PROVIDER (ntv 3s / vavoo 4s / daddy 6s)',
     '  /live?ch=<slug>&d=3        piu\' margine (3 segmenti)',
     '  /live?ch=<slug>&w=1        runway 12s',
-    '  /live?ch=<slug>&strict264=1  FORZA H264 (ignora HEVC-only)',
+    '  /live?ch=<slug>&strict264=1  FORZA H264 (strip HEVC URL + filter master)',
     '  /player?ch=<slug>          Primo frame ms / SN / Playhead / Underrun',
     '  /why?ch=<slug>[&k=token]   dove si rompe + latenza + loop detection',
     '  /adapt?ch=<slug>           segDur, latenza, backoff, delay per provider',
@@ -1930,7 +1947,7 @@ function uso(P) { return [VER,'',
     '  /diag /probe /debug /codec /bytetest?k= /freezetest?k= /checkseg?all=1',
     '  /segtest?k= /rawu /dump /warm /vmap /ch /ip',
     '',
-    'NOVITA v10.28: delay per-provider, anti-freeze loop, HEVC block, prefetch predittivo',''].join('\n'); }
+    'NOVITA v10.29: bust deterministico, validateSegment, stripHevc URL, 429/503 no segFail, loop invalida plCache',''].join('\n'); }
 
 // --- HELPERS ---------------------------------------------------------------
 function TXT() { return { 'content-type':'text/plain; charset=utf-8', ...CORS() }; }
@@ -1948,7 +1965,6 @@ async function rawu(u,env) {
   const t=u.searchParams.get('u');
   if (!t) return R('uso: /rawu?u=<url>',200,TXT());
   if (!diagOk(u,env)) return R('token richiesto',200,TXT());
-  // FIX 6: SSRF whitelist
   if (!hostAllowed(t)) return R('host non consentito',403,TXT());
   const h=getBrowserHeaders(u.searchParams.get('ref')||'https://thedaddy.li/','rawu');
   if (u.searchParams.get('o')) h['Origin']=u.searchParams.get('o');
