@@ -1,5 +1,6 @@
 // ============================================================================
-// TVNOW-CF v11.0 - Per-provider min delay, anti-freeze/loop, HEVC fix, full compat
+// TVNOW-CF v11.1 - FIX SCOPE in seg() (variabili fuori dal while)
+// Deploy: https://resolvers.simone-scorrano-2011.workers.dev
 // ============================================================================
 let MODULE_CTX = null; let SUB_BUDGET = 40;
 const subFree = n => SUB_BUDGET >= n;
@@ -67,32 +68,28 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
-// ──────────────────────── CONFIG (FIX v11: per-provider runway, aggressive anti-freeze) ────────────────────────
+// --- CONFIGURAZIONE ---
 const MIN_SEGS = 2;
 const EXTRA_SEGS_MAX = 2;
 const BACKOFF_FAIL_MIN = 1;
-const CLEAN_DECAY_MS = 2 * 60 * 1000;        // FIX: era 4*60*1000
+const CLEAN_DECAY_MS = 2 * 60 * 1000;
 const LAT_RISK_RATIO = 0.28;
-const SEG_TIMEOUT = 9000;                    // FIX: era 12000
-const WARM_RESERVE = 10;                     // FIX: era 14
+const SEG_TIMEOUT = 9000;
+const WARM_RESERVE = 10;
 const PREFETCH_SEGS = 3;
 const STALE_FACTOR = 5;
 const MAX_BUFFER_SECS = 36;
-const SEG_CACHE_TTL = 60;                    // FIX: era 75
+const SEG_CACHE_TTL = 60;
 const SEG_API_TTL = 100;
-const SEGFAIL_TTL = 45 * 1000;               // FIX: era 75*1000
-const SEGFAIL_MAX = 2;                       // FIX: era 3
-const SEGFAIL_EARLY = 1;
-const PL_CACHE_TTL = 8;                      // FIX: era 600
+const SEGFAIL_TTL = 45 * 1000, SEGFAIL_MAX = 2, SEGFAIL_EARLY = 1;
+const PL_CACHE_TTL = 8;
 const PL_STALE_MS = 2000;
 const PLAYLIST_FRESH_MS = 900;
 const PL_BUST_MS = 1000;
 const PL_BUST_JITTER_MS = 120;
 const RESOLVE_BUDGET = 7500;
-const STATE_STALE_TTL = 10 * 60 * 1000;      // FIX: era 12*60*1000
-const CB_FAIL_WIN = 45 * 1000;               // FIX: era 75*1000
-const CB_FAIL_TH = 2;                        // FIX: era 3
-const CB_COOLDOWN = 15 * 1000;               // FIX: era 25*1000
+const STATE_STALE_TTL = 10 * 60 * 1000;
+const CB_FAIL_WIN = 45 * 1000, CB_FAIL_TH = 2, CB_COOLDOWN = 15 * 1000;
 const NTV_REFRESH_MARGIN = 800;
 const VAVOO_URL_TTL = 100 * 1000;
 const DADDY_TTL = 8 * 60 * 1000;
@@ -100,21 +97,21 @@ const VAVOO_HEALTH_TTL = 12 * 60 * 1000;
 const VAVOO_MAP_TTL = 6 * 3600 * 1000;
 const MAX_TOKEN_CACHE = 80;
 const MAX_DADDY_CACHE = 150;
-const MAX_PLFETCH = 120;                     // FIX: era 180
-const VER = 'TVNOW-CF v11.0';
+const MAX_PLFETCH = 120;
+const VER = 'TVNOW-CF v11.1';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
-const DADDY_EDGE_FAIL_TTL = 30 * 1000;       // FIX: era 50*1000
-const FREEZE_TTL = 15 * 1000;                // FIX: era 45*1000 (logica 75s) → 15s hard
-const LOOP_DETECT_POLLS = 1;                 // FIX: era 2
+const DADDY_EDGE_FAIL_TTL = 30 * 1000;
+const FREEZE_TTL = 15 * 1000;
+const LOOP_DETECT_POLLS = 1;
 const LOOP_SEG_REPEAT = 2;
-const HEVC_FILTER_DEFAULT = true;            // FIX: NEW - HEVC filtered by default
-const HEVC_TTL = 20 * 60 * 1000;             // FIX: NEW
+const HEVC_FILTER_DEFAULT = true;
+const HEVC_TTL = 20 * 60 * 1000;
 
 const PROV_CFG = {
-  ntv:   { runwayBase: 1.8, runwayMin: 1.2, segsMin: 2, plFresh: 400,  plStale: 1500 },  // FIX: era 2.2/1.6/480/1700
-  vavoo: { runwayBase: 2.2, runwayMin: 1.5, segsMin: 2, plFresh: 500,  plStale: 1800 },  // FIX: era 3.0/2.0/580/1900
-  daddy: { runwayBase: 3.0, runwayMin: 2.0, segsMin: 2, plFresh: 600,  plStale: 2200 }   // FIX: era 4.5/3.2/680/2300
+  ntv:   { runwayBase: 1.8, runwayMin: 1.2, segsMin: 2, plFresh: 400,  plStale: 1500 },
+  vavoo: { runwayBase: 2.2, runwayMin: 1.5, segsMin: 2, plFresh: 500,  plStale: 1800 },
+  daddy: { runwayBase: 3.0, runwayMin: 2.0, segsMin: 2, plFresh: 600,  plStale: 2200 }
 };
 
 const HOST_WHITELIST = [
@@ -593,7 +590,7 @@ function noteServedFp(slug, prov, url, b) {
     }
     e.lastSeen = now; e.count++;
     const stable = Math.round((now - e.firstSeen) / 1000);
-    return { loop: stable > 60, stable, fp };  // FIX: 60s threshold
+    return { loop: stable > 60, stable, fp };
   } catch (err) {
     return { loop: false, stable: 0, skipped: true };
   }
@@ -646,7 +643,6 @@ function recordVavooFail(slug,idNum) {
 
 const plCacheSet = (ck,txt) => { if (ck) plCache.set(ck,{txt,t:Date.now()}); };
 
-// ──────────────────────── FIX v11: checkFreshOrThrow with 15s freeze + 1-poll loop ────────────────────────
 function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
   const now=Date.now(); const st=upFresh.get(key);
   if (!st || upSeq!==st.seq) {
@@ -663,7 +659,7 @@ function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
     cbForceCooldown(slug,prov);
     throw new Error(prov+' LOOP (seq '+upSeq+' ferma)');
   }
-  const maxAge = Math.max(FREEZE_TTL, (upTarget||4)*5*1000);  // FIX: FREEZE_TTL=15s, 5x targetDuration
+  const maxAge = Math.max(FREEZE_TTL, (upTarget||4)*5*1000);
   if (now-st.t>maxAge) {
     freezeDetected.set(key,now);
     cbForceCooldown(slug,prov);
@@ -1236,7 +1232,6 @@ async function vavooResolve(query,vid) {
   return await vavooResolveDual(null, query, vid, null);
 }
 
-// ──────────────────────── LIVE HANDLER (FIX v11: per-provider delay + immediate switch) ────────────────────────
 async function live(u, P, env, legacy, req) {
   countReq('live'); cleanupStaleState();
   const q=u.searchParams.get('ch')||u.searchParams.get('c')||'';
@@ -1245,7 +1240,7 @@ async function live(u, P, env, legacy, req) {
   if (!c) return R('canale non mappato: "'+q+'"\n\n'+elencoCanali(),200,TXT());
   const wide=u.searchParams.get('w')==='1';
   const strict264=u.searchParams.get('strict264')==='1';
-  const allowHevc=u.searchParams.get('allowHevc')==='1';          // FIX: NEW param
+  const allowHevc=u.searchParams.get('allowHevc')==='1';
   const dParam=parseInt(u.searchParams.get('d')||'0',10);
   const forceSegs=(dParam>=1&&dParam<=8)?dParam:0;
   const prefParam=legacy||u.searchParams.get('p')||'';
@@ -1324,7 +1319,7 @@ async function live(u, P, env, legacy, req) {
         catch (e) {
           if (/wedd48c|edge\./i.test(du)) {
             daddyEdgeFail.set(String(c.daddy), Date.now()); daddyCache.delete(c.daddy);
-            log('daddy edge ko '+c.daddy+': KO 50s');
+            log('daddy edge ko '+c.daddy+': KO 30s');
           }
           cbRecordFail(c.slug,'daddy'); return null;
         }
@@ -1503,7 +1498,6 @@ function isAudioOnlyStreamInf(line) {
   return !/(avc|hevc|hvc|vp09|av01)/i.test(codecs);
 }
 
-// ──────────────────────── FIX v11: shouldFilterHevc DEFAULT ON ────────────────────────
 function shouldFilterHevc(ctx) {
   if (ctx && ctx.allowHevc) return false;
   if (ctx && ctx.strict264) return true;
@@ -1644,7 +1638,7 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   return out.join('\n');
 }
 
-// ──────────────────────── SEGMENT PROXY ────────────────────────
+// ──────────────────────── SEGMENT PROXY (v11.1: scope FIX) ────────────────────────
 async function seg(u,req, env) {
   countReq('seg');
   const target=u.searchParams.get('u');
@@ -1681,73 +1675,80 @@ async function seg(u,req, env) {
     bg(() => probeH265(ch, prov, effTarget, {ref, origin:o||''}));
   }
 
-  let r,attempts=0;
-  const maxAttempts=3;
+  // ✅ v11.1 FIX: tutte le dichiarazioni FUORI dal while (scope corretto)
+  let r = null;
+  let attempts = 0;
+  let buf = null;
+  let signed = null;
+  const maxAttempts = 3;
 
-  while (attempts<maxAttempts) {
+  while (attempts < maxAttempts) {
     attempts++;
-    const o2={ch,prov, timeoutMs:SEG_TIMEOUT};
-    if (attempts>=2) { o2.skipApiCache=true; o2.skipCfCache=attempts>=3; }
-    let signed;
+    const o2 = { ch, prov, timeoutMs: SEG_TIMEOUT };
+    if (attempts >= 2) { o2.skipApiCache = true; o2.skipCfCache = attempts >= 3; }
     try {
-      signed = await withSegSingleFlight(segCacheKey(effTarget)+'|r'+attempts+(range?'|rg':''),
-        () => fetchSegmentWithCache(effTarget,h,range,o2));
+      signed = await withSegSingleFlight(
+        segCacheKey(effTarget) + '|r' + attempts + (range ? '|rg' : ''),
+        () => fetchSegmentWithCache(effTarget, h, range, o2)
+      );
     } catch (e) {
       noteRetry(ch, prov);
-      if (attempts<maxAttempts) { log('seg timeout retry '+attempts+' '+(ch||'?')); continue; }
-      return R('upstream timeout', 504,TXT());
+      if (attempts < maxAttempts) { log('seg timeout retry ' + attempts + ' ' + (ch || '?')); continue; }
+      return R('upstream timeout', 504, TXT());
     }
-    r=signed.resp;
-    const ct=r.headers.get('content-type')||'';
-    const isHtmlBody=r.ok&&/^(text\/html|application\/json|text\/xml)/i.test(ct);
+    r = signed.resp;
+    const ct = r.headers.get('content-type') || '';
+    const isHtmlBody = r.ok && /^(text\/html|application\/json|text\/xml)/i.test(ct);
 
-    if (r.status===429 || r.status===503) {
+    if (r.status === 429 || r.status === 503) {
       segStat.cdnBlip++;
-      log('cdn-blip '+(ch||'?')+'/'+(prov||'?')+' '+r.status+' (no segFail)');
-      return R('upstream '+r.status,r.status, TXT());
+      log('cdn-blip ' + (ch || '?') + '/' + (prov || '?') + ' ' + r.status + ' (no segFail)');
+      return R('upstream ' + r.status, r.status, TXT());
     }
 
-    let buf = null;
+    // Reset buf ad ogni tentativo (variabile accessibile perché dichiarata fuori)
+    buf = null;
     if (r.ok && !range && isVideoCt(ct)) {
       try {
         buf = await r.arrayBuffer();
         const v = validateSegment(new Uint8Array(buf));
         if (!v.ok) {
           segStat.segCorrupt++;
-          log('seg-corrupt '+(ch||'?')+'/'+(prov||'?')+': '+v.reason);
-          recordSegFail(ch,prov);
+          log('seg-corrupt ' + (ch || '?') + '/' + (prov || '?') + ': ' + v.reason);
+          recordSegFail(ch, prov);
           buf = null;
-          if (attempts<maxAttempts) continue;
-          return R('upstream corrotto: '+v.reason, 502,TXT());
+          if (attempts < maxAttempts) continue;
+          return R('upstream corrotto: ' + v.reason, 502, TXT());
         }
         if (ch && prov) {
           const loopInfo = noteServedFp(ch, prov, effTarget, new Uint8Array(buf));
           if (loopInfo && loopInfo.loop) {
-            log('LOOP '+ch+'/'+prov+': stesso segmento '+loopInfo.stable+'s -> flip forzato');
+            log('LOOP ' + ch + '/' + prov + ': stesso segmento ' + loopInfo.stable + 's -> flip forzato');
             recordSegFail(ch, prov);
           }
         }
       } catch (e) {
-        log('seg-buffer-err '+(ch||'?')+': '+(e&&e.message));
+        log('seg-buffer-err ' + (ch || '?') + ': ' + (e && e.message));
         buf = null;
       }
     }
 
-    if (!r.ok&&!range) {
-      recordSegFail(ch,prov);
-      if (attempts<maxAttempts) continue;
-      return R('upstream '+r.status,r.status, TXT());
-    } else if (isHtmlBody&&!range) {
-      recordSegFail(ch,prov);
-      if (attempts<maxAttempts) continue;
-      return R('upstream corrotto '+r.status,r.status, TXT());
+    if (!r.ok && !range) {
+      recordSegFail(ch, prov);
+      if (attempts < maxAttempts) continue;
+      return R('upstream ' + r.status, r.status, TXT());
+    } else if (isHtmlBody && !range) {
+      recordSegFail(ch, prov);
+      if (attempts < maxAttempts) continue;
+      return R('upstream corrotto ' + r.status, r.status, TXT());
     } else if (!r.ok) {
       recordSegFail(ch, prov);
-      return R('upstream '+r.status,r.status, TXT());
+      return R('upstream ' + r.status, r.status, TXT());
     }
     break;
   }
 
+  // ✅ v11.1: ora buf e signed sono accessibili qui (scope corretto)
   if (buf && signed && signed.shouldCache && signed.cacheKey && SEGCACHE) {
     try {
       const stored = new Response(buf, {
@@ -1761,29 +1762,31 @@ async function seg(u,req, env) {
     } catch (e) {}
   }
 
-  const hh={
-    'content-type':r.headers.get('content-type')||'video/mp2t',
-    'access-control-allow-origin':'*',
-    'access-control-allow-methods':'GET, HEAD, OPTIONS',
+  const hh = {
+    'content-type': r.headers.get('content-type') || 'video/mp2t',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, HEAD, OPTIONS',
     'access-control-allow-headers': 'Range, User-Agent, Referer, Origin, Accept, Accept-Language',
     'access-control-expose-headers': 'Content-Length, Content-Range, Accept-Ranges',
-    'accept-ranges':'bytes',
-    'cache-control':'no-cache, no-store, must-revalidate','pragma':'no-cache','expires':'0'
+    'accept-ranges': 'bytes',
+    'cache-control': 'no-cache, no-store, must-revalidate', 'pragma': 'no-cache', 'expires': '0'
   };
-  const cr=r.headers.get('content-range');
-  if (cr) hh['content-range']=cr;
+  const cr = r.headers.get('content-range');
+  if (cr) hh['content-range'] = cr;
 
+  // ✅ v11.1: usa il buffer se disponibile (evita body inconsistente)
   if (buf) {
     hh['content-length'] = String(buf.byteLength);
-    return new Response(buf, {status:r.status, headers:hh});
+    return new Response(buf, { status: r.status, headers: hh });
   }
 
-  const cl=r.headers.get('content-length');
-  if (cl) hh['content-length']=cl;
-  return new Response(r.body, {status:r.status, headers:hh});
+  // Fallback: streaming diretto
+  const cl = r.headers.get('content-length');
+  if (cl) hh['content-length'] = cl;
+  return new Response(r.body, { status: r.status, headers: hh });
 }
 
-// ──────────────────────── DIAGNOSTICS ────────────────────────
+// --- DIAGNOSTICA ---
 async function resolveForDiag(prov,c) {
   if (prov==='ntv') {
     if (!c.ntv) return null;
@@ -2225,7 +2228,7 @@ function debug() {
 
 function uso(P) {
   return [VER,'',
-    '/live?ch=<slug>                 delay ADATTIVO per-provider (ciascuno al suo minimo)',
+    '/live?ch=<slug>                 delay ADATTIVO per-provider',
     '/live?ch=<slug>&d=3             piu\' margine',
     '/live?ch=<slug>&w=1             runway 11s',
     '/live?ch=<slug>&strict264=1     FORZA H264 (legacy)',
@@ -2237,7 +2240,7 @@ function uso(P) {
     '/diag /probe /debug /codec /bytetest /freezetest /checkseg',
     '/segtest /rawu /dump /warm /vmap /ch /ip',
     '',
-    'v11: per-provider min delay | freeze 15s | loop 1 poll | HEVC default OFF'].join('\n');
+    'v11.1: fix scope seg() (variabili fuori dal while)'].join('\n');
 }
 
 function TXT() { return { 'content-type':'text/plain; charset=utf-8', ...CORS() }; }
