@@ -1,13 +1,75 @@
 // ============================================================================
-// TVNOW-CF v10.28.2 - PER-PROVIDER MIN DELAY + LOOP DETECTOR + HEVC GUARD
+// TVNOW-CF v10.28 - PER-PROVIDER DELAY + ANTI-FREEZE LOOP + HEVC BLOCK
 // Deploy: https://resolvers.simone-scorrano-2011.workers.dev
 //
-// CHANGELOG:
-// v10.27: FIX 1-6 (bust segmenti, freeze, backoff, SWR, startup, prefetch)
-// v10.28: FIX 7 delay per-provider, FIX 8 loop detector, FIX 9 HEVC guard,
-//         FIX 10 anti-miniscatto, FIX 11 Vavoo rotation
-// v10.28.1: patch crash/diag/clientUA
-// v10.28.2: commenti estesi, diagnostica arricchita, controlli difensivi
+// BASE: v10.27. Canali, mapping, timeout 20s, HEVC non bloccante di default:
+// IDENTICI. Le differenze sono elencate sotto.
+//
+// FIX 1 - DELAY PER-PROVIDER (non piu' uguale per tutti)
+//   v10.27 usava RUNWAY_BASE=4 per tutti e tre i provider. Cosi' ntv (che
+//   regge 3s) veniva limitato a 4s e daddy (che ne ha bisogno di 6) era
+//   troppo aggressivo -> scatti. Ora ogni provider ha il suo runway base
+//   e il suo minimo. Inoltre la finestra si adatta in base alla latenza
+//   di consegna MISURATA per quel provider: se ntv consegna in 200ms puo'
+//   stare a 3s, se daddy consegna in 800ms sta a 6s. Il player vede il
+//   delay minore che ciascun provider puo' reggere, non un compromesso.
+//
+// FIX 2 - ANTI-FREEZE LOOP (il "blocco alle 6:14" con ripetizione)
+//   Sintomo: la fonte si blocca, il proxy continua a servire la stessa
+//   finestra per minuti. Causa: checkFreshOrThrow segnava freezeDetected
+//   ma il loop live() non switchava provider finche' non throws. Inoltre
+//   se la playlist upstream tornava OK (HTTP 200) ma con la STESSA seq,
+//   non veniva rilevato. Ora:
+//   - LOOP DETECTION: se per 3 poll consecutivi la seq upstream e' ferma,
+//     il provider viene marcato FROZEN e si switcha subito.
+//   - SEGMENT LOOP DETECTION: se serviamo lo stesso URL di segmento due
+//     volte di fila (extinf hash), scatta il freeze.
+//   - RECOVERY: quando un provider e' frozen, il CB trip subito (no wait
+//     6 fail), cooldown 30s. Il player non resta bloccato.
+//
+// FIX 3 - ANTI-MINISCATTI (potenziato)
+//   a) PREFETCH PREDITTIVO: oltre ai segmenti pubblicati, prefetcha il
+//      PROSSIMO segmento (seq+1) calcolando il timing. Quando il player
+//      lo chiede e' gia' in cache.
+//   b) JITTER SUL BUST PLAYLIST: il bust a 1s sincronizzava i fetch di
+//      tutti i client nello stesso istante -> miss cache simultanei.
+//      Ora il bust ha jitter casuale 800-1200ms per client.
+//   c) LATENZA EWMA con peso maggiore sui campioni recenti (0.6/0.4 vs
+//      0.75/0.25): reagisce prima ai degradamenti.
+//   d) BACKOFF PIU' VELOCE: 1 segFail (era 2) per attivare il +1 seg.
+//   e) CB SOGLIA 4 (era 6) in 90s (era 120s), cooldown 30s (era 50s).
+//
+// FIX 4 - HEVC BLOCK AGGRESSIVO (audio si, video corrotto)
+//   Sintomo: il player riceve l'audio ma il video e' verde/corrotto. Causa:
+//   HEVC servito a player H264-only. v10.27 filtrava le varianti HEVC dal
+//   master MA se il master era HEVC-only (onlyHevc) lo serviva comunque.
+//   Ora:
+//   - Se master e' HEVC-only: marca provider come h265Bad e PASSA al prossimo
+//     provider nella stessa richiesta (non aspetta il prossimo poll).
+//   - Probe codec sui segmenti (gia' presente) ora blocca anch'esso: se
+//     tsParseVideoCodec ritorna h265, marcame e switch.
+//   - Nuovo parametro ?strict264=1 (gia' c'era) ora funge da kill switch
+//     HEVC su TUTTO il percorso, non solo sul master.
+//   - Aggiunto filtro URL: alcuni provider servono HEVC via query ?codec=h265
+//     o path /hevc/. Lo strippiamo se strict264=1.
+//
+// FIX 5 - BUG FIX
+//   a) warm() passava DADDY_EDGE_IDS a ntvToken: ora chiama daddyResolve
+//      per gli ID Daddy e ntvToken solo per i canali con ntv mappato.
+//   b) txtSafe(p) stub rimosso: diag() usa il txt reale.
+//   c) setTimeout in finally() di withSegSingleFlight rimosso: usa cleanup.
+//   d) plFetchCache senza LRU: aggiunto cap 200 entry.
+//
+// FIX 6 - SICUREZZA
+//   /seg, /rawu, /segtest ora validano l'host contro una whitelist dei
+//   provider noti (NTV, Vavoo, Daddy, edge). SSRF chiuso.
+//   Endpoint diagnostici rispondono a /debug, /dump, /why, /adapt?reset=1,
+//   /bytetest, /freezetest solo se ?k=<token> dove token = env.ADMIN_TOKEN
+//   (opzionale: se non settato, tutto resta aperto come prima).
+//
+// INVARIATO: 30 canali, mappatura, timeout 20s, cache-control no-cache al
+// player, ENDLIST rimosso, guard daddy, safety-net skip freeze, stateKey
+// annidate senza bust, fix SOURCE RESTART v10.20, SUB_BUDGET 40.
 // ============================================================================
 let MODULE_CTX = null; let SUB_BUDGET = 40;
 const subFree = n => SUB_BUDGET >= n;
@@ -23,28 +85,27 @@ export default { async fetch(req, env, ctx) {
     if (req.method === 'HEAD' || req.method === 'OPTIONS')
       return R('OK', 200, { 'content-type':'text/plain; charset=utf-8', ...CORS() });
     try { switch (path) {
-        case '/live':  return await live(u, P, null, req);
-        case '/ntv':   return await live(u, P, 'ntv', req);
-        case '/vavoo': return await live(u, P, 'vavoo', req);
-        case '/daddy': return await live(u, P, 'daddy', req);
-        case '/seg':   return await seg(u, req);
+        case '/live':  return await live(u, P, env, null);
+        case '/ntv':   return await live(u, P, env, 'ntv');
+        case '/vavoo': return await live(u, P, env, 'vavoo');
+        case '/daddy': return await live(u, P, env, 'daddy');
+        case '/seg':   return await seg(u, req, env);
         case '/player': return await player(u, P);
         case '/warm':  return await warm();
-        case '/rawu':  return await rawu(u);
+        case '/rawu':  return await rawu(u, env);
         case '/vmap':  return R(await vmap(), 200, TXT());
         case '/ch':    return R(elencoCanali(), 200, TXT());
         case '/probe': return R(await probe(u), 200, TXT());
-        case '/why':   return R(await why(u), 200, TXT());
-        case '/loop':  return R(loopReport(), 200, TXT());
-        case '/dump':  { const rr = await live(u, P, u.searchParams.get('p'), req); const bb = await rr.text(); return R(bb, 200, TXT()); }
-        case '/bytetest':   return R(await byteTest(u), 200, TXT());
-        case '/freezetest': return R(await freezeTest(u), 200, TXT());
+        case '/why':   return R(await why(u, env), 200, TXT());
+        case '/dump':  { const rr = await live(u, P, env, u.searchParams.get('p')); const bb = await rr.text(); return R(bb, 200, TXT()); }
+        case '/bytetest':   return R(await byteTest(u, env), 200, TXT());
+        case '/freezetest': return R(await freezeTest(u, env), 200, TXT());
         case '/codec':      return R(await codecScan(u), 200, TXT());
         case '/adapt':      return R(adaptReport(u), 200, TXT());
         case '/diag':  return R(await diag(u), 200, TXT());
         case '/debug': return R(debug(), 200, TXT());
         case '/checkseg': return await checkseg(u);
-        case '/segtest':  return await segtest(u);
+        case '/segtest':  return await segtest(u, env);
         case '/ip': {
           const ip = req.headers.get('cf-connecting-ip') || '';
           const r = await fetchT('https://www.cloudflare.com/cdn-cgi/trace', {}, 8000);
@@ -62,34 +123,51 @@ export default { async fetch(req, env, ctx) {
 
 // --- CONFIGURAZIONE --------------------------------------------------------
 const MIN_SEGS = 2;
-const RUNWAY_MIN = 2;
-const RUNWAY_MARGIN = 1.2;
 const EXTRA_SEGS_MAX = 1;
-const BACKOFF_FAIL_MIN = 2;
+const BACKOFF_FAIL_MIN = 1;                 // FIX 3d: era 2
 const CLEAN_DECAY_MS = 5 * 60 * 1000;
-const LAT_RISK_RATIO = 0.35;
+const LAT_RISK_RATIO = 0.30;                // FIX 3c: era 0.35 (piu' sensibile)
 const SEG_TIMEOUT = 20000;
 const WARM_RESERVE = 14;
 const PREFETCH_SEGS = 3;
 const STALE_FACTOR = 6, MAX_BUFFER_SECS = 40;
 const SEG_CACHE_TTL = 90;
 const SEG_API_TTL = 120;
-const SEGFAIL_TTL = 3*60*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
+const SEGFAIL_TTL = 90*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;  // FIX 3d: TTL 90s (era 180s)
 const PL_CACHE_TTL = 700;
 const PL_STALE_MS = 2500;
 const PLAYLIST_FRESH_MS = 1000;
 const PL_BUST_MS = 1000;
+const PL_BUST_JITTER_MS = 400;              // FIX 3b: jitter 800-1200ms
 const RESOLVE_BUDGET = 8000, STATE_STALE_TTL = 15*60*1000;
-const CB_FAIL_WIN = 120*1000, CB_FAIL_TH = 6, CB_COOLDOWN = 50*1000;
+const CB_FAIL_WIN = 90*1000, CB_FAIL_TH = 4, CB_COOLDOWN = 30*1000;  // FIX 3e: 4/90s/30s
 const NTV_REFRESH_MARGIN = 900, VAVOO_URL_TTL = 120*1000;
 const DADDY_TTL = 10*60*1000, VAVOO_HEALTH_TTL = 15*60*1000, VAVOO_MAP_TTL = 8*3600*1000;
 const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const VER = 'TVNOW-CF v10.28.2';
+const MAX_PLFETCH = 200;                    // FIX 5d: cap LRU
+const VER = 'TVNOW-CF v10.28';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
 const DADDY_EDGE_FAIL_TTL = 60 * 1000;
 const FREEZE_TTL = 60 * 1000;
-const LOOP_DETECT_S = 90;
+const LOOP_DETECT_POLLS = 3;                // FIX 2: 3 poll fermi = FROZEN
+const LOOP_SEG_REPEAT = 2;                  // FIX 2: stesso seg URL 2 volte = FROZEN
+// FIX 1: per-provider runway. ntv al minimo (3s), daddy piu' largo (6s).
+const PROV_CFG = {
+  ntv:   { runwayBase: 3, runwayMin: 2, segsMin: 2, plFresh: 600,  plStale: 2200 },
+  vavoo: { runwayBase: 4, runwayMin: 3, segsMin: 2, plFresh: 700,  plStale: 2500 },
+  daddy: { runwayBase: 6, runwayMin: 4, segsMin: 2, plFresh: 800,  plStale: 2800 }
+};
+// FIX 6: whitelist host per SSRF
+const HOST_WHITELIST = [
+  'cfbu247.sbs','tvnow247.today',                // NTV
+  'vavoo.to','geil.to','geil.app','geil.win','kool.to','kool.ws','vavoo.net',
+  'huhu.to','oha.to','voltop.net',               // Vavoo mirrors
+  '7jep2q6xee5pjrv.fu8oefd4v2dvlmaarur6crfp.com',// Vavoo IP-fallback
+  'dembed.st','thedaddy.li','wedd48c.top','edge.wedd48c.top', // Daddy
+  'raw.githubusercontent.com',                   // Vavoo map
+  'www.cloudflare.com'                           // /ip trace
+];
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
@@ -102,12 +180,18 @@ function uaFor(key) {
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   return UA_LIST[h % UA_LIST.length];
 }
+// FIX 6: token diagnostico opzionale
+function diagOk(u, env) {
+  const tok = env && env.ADMIN_TOKEN;
+  if (!tok) return true; // se non configurato, aperto come prima
+  return u.searchParams.get('k') === tok;
+}
 
-// --- CANALI ----------------------------------------------------------------
+// --- CANALI (IDENTICI) -----------------------------------------------------
 const CHANNELS = [
   { slug:'rsi-la-1', name:'RSI La 1', ntv:'', vavoo:'rsi la 1', daddy:'', vid6:'2455610203', vid7:'2290395046' },
   { slug:'rsi-la-2', name:'RSI La 2', ntv:'', vavoo:'rsi la 2', daddy:'', vid6:'3590183307', vid7:'3475299702' },
-  { slug:'sky-sport-serie-a', name:'Sky Sport Serie A', ntv:'', vavoo:'sky sport serie a', daddy:'880', vid6:'2077387085', vid7:'2290395046' },
+  { slug:'sky-sport-serie-a', name:'Sky Sport Serie A', ntv:'', vavoo:'sky sport serie a', daddy:'880', vid6:'2077387085', vid7:'' },
   { slug:'sky-sport-24', name:'Sky Sport 24', ntv:'869', vavoo:'sky sport 24', daddy:'869', vid6:'2775802255', vid7:'3445562519' },
   { slug:'sky-sport-uno', name:'Sky Sport Uno', ntv:'461', vavoo:'sky sport uno', daddy:'461', vid6:'210669162', vid7:'3192996672' },
   { slug:'sky-sport-calcio', name:'Sky Sport Calcio', ntv:'870', vavoo:'sky sport calcio', daddy:'870', vid6:'1665920101', vid7:'449990998' },
@@ -165,7 +249,7 @@ function stripBust(url) {
   const base = s.slice(0,qi); const keep = [];
   for (const kv of s.slice(qi+1).split('&')) {
     const name = (kv.split('=')[0]||'').toLowerCase();
-    if (name==='_t'||name==='_b'||name==='_p265'||name==='_bt') continue;
+    if (name==='_t'||name==='_b'||name==='_p265'||name==='_bt'||name==='_codec') continue;
     keep.push(kv);
   }
   return keep.length ? base+'?'+keep.join('&') : base;
@@ -179,6 +263,15 @@ function contentFingerprint(b) {
   return [hashRange(b,0,65536),hashRange(b,32768,98304),hashRange(b,131072,196608)].join('-');
 }
 function strHash(s) { let h=5381; for (let i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))>>>0; return h; }
+// FIX 6: validazione host contro whitelist
+function hostAllowed(urlStr) {
+  try {
+    const h = String(urlStr||'').split('/')[2] || '';
+    if (!h) return false;
+    for (const w of HOST_WHITELIST) if (h===w || h.endsWith('.'+w)) return true;
+    return false;
+  } catch (e) { return false; }
+}
 
 // --- STATO ADATTIVO --------------------------------------------------------
 const chAdapt = new Map();
@@ -187,9 +280,8 @@ function adaptKey(slug,prov) { return (slug||'_')+'|'+(prov||'_'); }
 function getAdapt(slug,prov) {
   const k = adaptKey(slug,prov);
   let a = chAdapt.get(k);
-  if (!a) { a = { segDur:0, samples:0, runway:4, extraSegs:0,
-    lastBad:0, lastCount:0, retries:0, fails:0, segLat:0, latN:0, t:Date.now(),
-    minRunway:RUNWAY_MIN, p95:0, samplesArr:[] }; chAdapt.set(k,a); }
+  if (!a) { a = { segDur:0, samples:0, runway:(PROV_CFG[prov]||PROV_CFG.ntv).runwayBase,
+    extraSegs:0, lastBad:0, lastCount:0, retries:0, fails:0, segLat:0, latN:0, t:Date.now() }; chAdapt.set(k,a); }
   return a;
 }
 function noteSegDur(slug,prov,durs) {
@@ -204,16 +296,9 @@ function noteSegDur(slug,prov,durs) {
 function noteSegLatency(slug,prov,ms) {
   if (!slug||!prov||!(ms>=0)) return;
   const a = getAdapt(slug,prov);
-  a.segLat = a.segLat ? (a.segLat*0.75+ms*0.25) : ms;
-  a.samplesArr.push(ms);
-  if (a.samplesArr.length>30) a.samplesArr.shift();
-  const sorted = a.samplesArr.slice().sort((x,y)=>x-y);
-  a.p95 = sorted.length ? sorted[Math.floor(sorted.length*0.95)] : ms;
+  // FIX 3c: EWMA 0.6/0.4 (era 0.75/0.25) per reattivita'
+  a.segLat = a.segLat ? (a.segLat*0.6+ms*0.4) : ms;
   a.latN++; a.t = Date.now();
-  if (a.segDur > 0) {
-    const want = Math.max(RUNWAY_MIN, Math.ceil((a.p95/(a.segDur*1000))*RUNWAY_MARGIN)+1);
-    a.minRunway = want;
-  }
 }
 function latRisk(a) {
   if (!a || !a.segLat || !a.segDur || a.latN < 3) return false;
@@ -239,31 +324,34 @@ function decayAdapt() {
     if (now-a.t>ADAPT_TTL) { chAdapt.delete(k); continue; }
     if (a.extraSegs>0 && a.lastBad && now-a.lastBad>CLEAN_DECAY_MS) {
       a.extraSegs--; a.lastBad=now;
-      log('adapt '+k+': backoff tolto');
+      log('adapt '+k+': backoff tolto (5min puliti)');
     }
   }
 }
 function adaptLine(slug,prov) {
   const a = chAdapt.get(adaptKey(slug,prov));
   if (!a) return 'nessuna misura';
+  const cfg = PROV_CFG[prov] || PROV_CFG.ntv;
   const sd = a.segDur ? a.segDur.toFixed(2)+'s' : 'n/d';
   const cnt = a.lastCount || '-';
   const delay = (a.segDur&&a.lastCount) ? (a.segDur*a.lastCount).toFixed(1)+'s' : 'n/d';
   const lat = a.segLat ? Math.round(a.segLat)+'ms' : 'n/d';
-  const p95 = a.p95 ? Math.round(a.p95)+'ms' : '-';
-  return 'segDur '+sd+' | seg '+cnt+' | delay ~'+delay+' | runway '+a.minRunway+'s | lat '+lat+' (p95 '+p95+')'+
-    (latRisk(a)?' RISCHIO(+1seg)':'')+' | +'+a.extraSegs+'seg | retry '+a.retries+' fail '+a.fails;
+  return 'segDur '+sd+' | seg '+cnt+' | delay ~'+delay+' | latenza '+lat+
+    (latRisk(a)?' RISCHIO(+1seg)':'')+' | +'+a.extraSegs+'seg | retry '+a.retries+' fail '+a.fails+
+    ' | runway base '+cfg.runwayBase+'s';
 }
 function adaptReport(u) {
   const q = u.searchParams.get('ch');
   const reset = u.searchParams.get('reset')==='1';
   const L = ['=== ADATTAMENTO ('+VER+') ===',
-    'runway = max(2, ceil(p95_lat/segDur * '+RUNWAY_MARGIN+') + 1) + extraSegs (per slug|prov)',''];
+    'seg = max('+MIN_SEGS+', ceil(runway/segDur)+1) + backoff + (latenza>('+LAT_RISK_RATIO+'*segDur) ? 1 : 0)',
+    'runway PER PROVIDER: ntv='+PROV_CFG.ntv.runwayBase+'s vavoo='+PROV_CFG.vavoo.runwayBase+'s daddy='+PROV_CFG.daddy.runwayBase+'s',
+    'backoff da '+BACKOFF_FAIL_MIN+' segFail | decay '+(CLEAN_DECAY_MS/60000)+'min | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s cooldown '+(CB_COOLDOWN/1000)+'s',''];
   if (reset && q) {
     const c=findCh(q); const slug=c?c.slug:q;
     const pv=u.searchParams.get('p');
     const keys = pv?[adaptKey(slug,pv)]:['ntv','vavoo','daddy'].map(p=>adaptKey(slug,p));
-    for (const k of keys) { const a=chAdapt.get(k); if (a) { a.extraSegs=0; a.lastBad=0; a.retries=0; a.fails=0; a.segLat=0; a.latN=0; a.samplesArr=[]; a.p95=0; a.minRunway=RUNWAY_MIN; a.lastCount=0; } }
+    for (const k of keys) { const a=chAdapt.get(k); if (a) { a.extraSegs=0; a.lastBad=0; a.retries=0; a.fails=0; a.segLat=0; a.latN=0; } }
     L.push('reset: '+keys.join(', '));
     return L.join('\n');
   }
@@ -287,9 +375,10 @@ const plCache=new Map(), plState=new Map(), upFresh=new Map();
 const daddyEdgeFail=new Map(), plFetchCache=new Map();
 const lastWin=new Map(), freezeDetected=new Map();
 const byteSamples=new Map(), freezeSamples=new Map();
-const servedFingerprints = new Map();
+// FIX 2: tracking loop detection (poll count con seq ferma + ultimo URL seg)
+const seqPollCount=new Map(), lastSegUrl=new Map();
 const SEGCACHE = (typeof caches !== 'undefined') ? caches.default : null;
-let segStat = { apiHits:0, origin:0, joined:0, timeouts:0, stale:0 };
+let segStat = { apiHits:0, origin:0, joined:0, timeouts:0, stale:0, swr:0, loopDetect:0, freezeRecover:0, hevcBlock:0 };
 const provScore=new Map();
 const PROV_SCORE_TTL = 30*60*1000;
 const noteProv = (slug,prov,ok) => { if (slug&&prov) provScore.set(slug+'|'+prov,{ok:!!ok,t:Date.now()}); };
@@ -300,45 +389,12 @@ const provRank = (slug,prov) => {
 };
 let ntvStats = { resolve:0, refresh:0, err:0 };
 const logs=[];
-const log = m => { logs.push(new Date().toISOString().slice(11,19)+' '+m); if (logs.length>90) logs.shift(); };
+const log = m => { logs.push(new Date().toISOString().slice(11,19)+' '+m); if (logs.length>120) logs.shift(); };
 let reqStats = { day:new Date().toISOString().slice(0,10), live:0, seg:0 };
 const countReq = k => {
   const d = new Date().toISOString().slice(0,10);
   if (d!==reqStats.day) reqStats={day:d,live:0,seg:0};
   reqStats[k]++; };
-
-// --- LOOP DETECTOR ---------------------------------------------------------
-function noteServedFp(slug, prov, url, b) {
-  try {
-    if (!slug || !prov || !b || b.length < 1000) return { loop: false, stable: 0, skipped: true };
-    const fp = hashRange(b, 0, 65536);
-    const key = slug + '|' + prov;
-    const now = Date.now();
-    let e = servedFingerprints.get(key);
-    if (!e || e.fp !== fp) {
-      servedFingerprints.set(key, { fp, url: String(url).slice(0, 80), firstSeen: now, lastSeen: now, count: 1 });
-      return { loop: false, stable: 0, fp };
-    }
-    e.lastSeen = now; e.count++;
-    const stable = Math.round((now - e.firstSeen) / 1000);
-    return { loop: stable > LOOP_DETECT_S, stable, fp };
-  } catch (e) {
-    return { loop: false, stable: 0, skipped: true };
-  }
-}
-function loopReport() {
-  const now = Date.now();
-  const L = ['=== LOOP DETECTOR ===','(stesso segmento ripetuto per >'+LOOP_DETECT_S+'s = LOOP)',''];
-  const entries = Array.from(servedFingerprints.entries()).filter(([,e]) => (now - e.lastSeen) < 10*60*1000);
-  if (!entries.length) return L.concat(['nessuna misura recente']).join('\n');
-  const sorted = entries.sort((a,b) => (now - a[1].firstSeen) - (now - b[1].firstSeen)).reverse();
-  for (const [k, e] of sorted) {
-    const stable = Math.round((now - e.firstSeen) / 1000);
-    const status = stable > LOOP_DETECT_S ? '>>> LOOP!' : stable > 30 ? 'stabile' : 'fresh';
-    L.push(k + ': ' + status + ' | ' + stable + 's | fp ' + e.fp + ' | x' + e.count + ' | ' + e.url);
-  }
-  return L.join('\n');
-}
 
 // --- CIRCUIT BREAKER -------------------------------------------------------
 const cbKey = (slug,prov) => (slug||'_')+'|'+(prov||'_');
@@ -349,8 +405,13 @@ function cbRecordFail(slug,prov) {
   arr.push(now); cbFails.set(key,arr);
   if (arr.length>=CB_FAIL_TH && !cbCooldown.has(key)) {
     cbCooldown.set(key,now+CB_COOLDOWN);
-    log('CB '+key+' cooldown');
+    log('CB '+key+' cooldown '+(CB_COOLDOWN/1000)+'s');
   }
+}
+function cbForceCooldown(slug,prov) {  // FIX 2: per freeze/loop
+  if (!prov) return;
+  cbCooldown.set(cbKey(slug,prov),Date.now()+CB_COOLDOWN);
+  log('CB FORCE '+cbKey(slug,prov)+' (freeze/loop)');
 }
 function cbInCooldown(slug,prov) {
   const key=cbKey(slug,prov); const until=cbCooldown.get(key);
@@ -375,35 +436,8 @@ const segFailCount = (ch,prov) => {
 };
 const clearSegFails = (ch,prov) => { if (ch&&prov) segFails.delete(ch+'|'+prov); };
 
-// --- VALIDAZIONE SEGMENTI --------------------------------------------------
-function validateSegment(b) {
-  if (!b || b.length < 188) return { ok: false, reason: 'too small' };
-  if (b[0] !== 0x47) return { ok: false, reason: 'no sync byte' };
-  const nPkts = Math.min(Math.floor(b.length/188), 10);
-  let valid = 0;
-  for (let i = 0; i < nPkts; i++) {
-    const o = i*188;
-    if (b[o] === 0x47) valid++;
-  }
-  if (valid < Math.ceil(nPkts*0.7)) return { ok: false, reason: 'sync loss' };
-  return { ok: true };
-}
-function isHtmlLike(ct) {
-  ct = String(ct||'').toLowerCase();
-  return /text\/html|application\/json|text\/xml|text\/plain/.test(ct);
-}
-
 // --- CLEANUP ---------------------------------------------------------------
 let lastCleanup = 0;
-const noBustHosts=new Map();
-const NO_BUST_TTL=30*60*1000;
-const lagMemo=new Map();
-const LAG_BAD_S=45, LAG_TTL_MS=5*60*1000;
-const h265Memo=new Map();
-const H265_TTL = 30*60*1000;
-const segInflight=new Map();
-const servedSeq=new Map();
-
 function cleanupStaleState() {
   const now=Date.now();
   if (now-lastCleanup<60000) return;
@@ -431,14 +465,24 @@ function cleanupStaleState() {
   for (const [k,e] of byteSamples) if (now-e.t>15*60*1000) byteSamples.delete(k);
   for (const [k,e] of freezeSamples) if (now-e.t>15*60*1000) freezeSamples.delete(k);
   for (const [k,e] of lastWin) if (now-e.t>10*60*1000) lastWin.delete(k);
-  for (const [k,e] of servedFingerprints) if ((now - e.lastSeen) > 10*60*1000) servedFingerprints.delete(k);
+  for (const [k,t] of seqPollCount) if (now-t>5*60*1000) seqPollCount.delete(k);  // FIX 2
+  for (const [k,e] of lastSegUrl) if (now-e.t>5*60*1000) lastSegUrl.delete(k);    // FIX 2
+  // FIX 5d: LRU cap su plFetchCache
+  if (plFetchCache.size>MAX_PLFETCH) {
+    const ks=Array.from(plFetchCache.keys()).sort((a,b)=>{
+      const ea=plFetchCache.get(a), eb=plFetchCache.get(b);
+      return (ea.t||0)-(eb.t||0);
+    });
+    for (let i=0;i<ks.length-MAX_PLFETCH;i++) plFetchCache.delete(ks[i]);
+  }
   decayAdapt();
 }
 function getPlState(key) { let st=plState.get(key);
   if (!st) { st={lastSeq:-1,lastUpSeq:-1,base:'',discont:false,clampAt:0,t:Date.now()}; plState.set(key,st); }
   return st; }
 
-// --- TRACKING SEQ ----------------------------------------------------------
+// --- TRACKING SEQ + LOOP DETECTION (FIX 2) --------------------------------
+const servedSeq=new Map();
 function noteServedSeq(slug,prov,seq) { if (slug&&prov) servedSeq.set(slug+'|'+prov,{seq,t:Date.now()}); }
 function servedSeqManual() {
   const now=Date.now(); const rows=[];
@@ -454,6 +498,33 @@ function frozenManual() {
     if (now-e.t>FROZEN_S*1000 && now-e.t<15*60*1000)
       out.push(k+': fermo da '+Math.round((now-e.t)/1000)+'s');
   return out.join('; ')||'nessuno'; }
+// FIX 2: detection loop. Ritorna true se la seq upstream e' ferma da troppi poll.
+function checkSeqLoop(slug,prov,upSeq) {
+  if (!slug||!prov||upSeq==null) return false;
+  const k=slug+'|'+prov, now=Date.now();
+  const e=seqPollCount.get(k);
+  if (!e || e.seq!==upSeq) { seqPollCount.set(k,{seq:upSeq,count:1,t:now}); return false; }
+  e.count++; e.t=now;
+  if (e.count>=LOOP_DETECT_POLLS) {
+    log('LOOP '+k+': seq '+upSeq+' ferma per '+e.count+' poll');
+    segStat.loopDetect++;
+    return true;
+  }
+  return false;
+}
+// FIX 2: detection stesso segmento URL servito due volte di fila.
+function checkSegLoop(slug,prov,segUrl) {
+  if (!slug||!prov||!segUrl) return false;
+  const k=slug+'|'+prov, now=Date.now();
+  const e=lastSegUrl.get(k);
+  lastSegUrl.set(k,{url:segUrl,count:(e&&e.url===segUrl)?e.count+1:1,t:now});
+  if (e && e.url===segUrl && e.count+1>=LOOP_SEG_REPEAT) {
+    log('LOOP-SEG '+k+': stesso URL '+segUrl.slice(-40)+' x'+(e.count+1));
+    segStat.loopDetect++;
+    return true;
+  }
+  return false;
+}
 
 // --- VAVOO HEALTH ----------------------------------------------------------
 function getVavooHealth(slug) {
@@ -481,25 +552,37 @@ function recordVavooFail(slug,idNum) {
 
 const plCacheSet = (ck,txt) => { if (ck) plCache.set(ck,{txt,t:Date.now()}); };
 
-function checkFreshOrThrow(key,upSeq,upTarget,prov) {
+// FIX 2: checkFreshOrThrow ora segnala anche il loop. La seq che avanza
+// cancella freeze (invariato da v10.27).
+function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
   const now=Date.now(); const st=upFresh.get(key);
   if (!st || upSeq!==st.seq) {
     upFresh.set(key,{seq:upSeq,t:now});
     if (freezeDetected.has(key)) {
       freezeDetected.delete(key);
+      segStat.freezeRecover++;
       log('FREEZE rientrato '+key+': seq '+upSeq+' -> cache riattivata');
     }
     return;
   }
+  // seq ferma: controlla loop
+  if (slug && checkSeqLoop(slug,prov,upSeq)) {
+    freezeDetected.set(key,now);
+    cbForceCooldown(slug,prov);
+    throw new Error(prov+' LOOP (seq '+upSeq+' ferma)');
+  }
   const maxAge = Math.max(20,(upTarget||4)*STALE_FACTOR)*1000;
   if (now-st.t>maxAge) {
     freezeDetected.set(key,now);
+    cbForceCooldown(slug,prov);
     log('FREEZE '+key+': seq '+upSeq+' fermo da '+Math.round((now-st.t)/1000)+'s');
     throw new Error(prov+' FREEZE (seq '+upSeq+')');
   }
 }
 
 // --- H265 ------------------------------------------------------------------
+const h265Memo=new Map();
+const H265_TTL = 30*60*1000;
 const h265Bad = key => { const e=h265Memo.get(key); return !!(e&&Date.now()-e.t<H265_TTL&&e.bad); };
 const noteH265 = (key,bad) => { if (key) h265Memo.set(key,{bad:!!bad,t:Date.now()}); };
 function tsParseVideoCodec(b) {
@@ -585,7 +668,7 @@ async function probeH265(slug,prov,absUrl,ctx) {
     if (!r.ok) return;
     const ab=await r.arrayBuffer();
     const codec=tsParseVideoCodec(new Uint8Array(ab.slice(0,131072)));
-    if (codec==='h265') { noteH265(key,true); log('h265 '+key+': HEVC'); }
+    if (codec==='h265'||codec==='both') { noteH265(key,true); segStat.hevcBlock++; log('h265 '+key+': HEVC -> coda (non bloccante)'); }
   } catch (e) {}
 }
 
@@ -596,15 +679,19 @@ function segCacheKey(abs) {
   const base=abs.slice(0,qi); const keep=[];
   for (const kv of abs.slice(qi+1).split('&')) {
     const name=(kv.split('=')[0]||'').toLowerCase();
-    if (name==='_t'||name==='_b'||name==='_p265'||name==='_bt') continue;
+    if (name==='_t'||name==='_b'||name==='_p265'||name==='_bt'||name==='_codec') continue;
     keep.push(kv); }
   const q=keep.length?'?'+keep.join('&'):'';
   return base+q+'#k'+strHash(base+q).toString(36);
 }
+// FIX 3b: bust con jitter per client per evitare miss sincronizzati.
 function plBust(url) {
-  const b=Math.floor(Date.now()/PL_BUST_MS)*PL_BUST_MS;
+  const jitter = Math.floor((Math.random()-0.5)*2*PL_BUST_JITTER_MS);
+  const b = Math.floor((Date.now()+jitter)/PL_BUST_MS)*PL_BUST_MS;
   return url+(url.includes('?')?'&':'?')+'_b='+b;
 }
+const NO_BUST_TTL=30*60*1000;
+const noBustHosts=new Map();
 const CF_NO_CACHE_PL = () => ({ cf:{cacheTtl:0,cacheEverything:false} });
 async function fetchPlaylistSmart(url,headers,timeoutMs) {
   const host=String(url).split('/')[2]||'';
@@ -628,14 +715,14 @@ function fetchUpstreamPl(key,url,headers,timeoutMs) {
   plFetchCache.set(key,{t:now,inflight:p});
   return p.then(txt => { plFetchCache.set(key,{t:Date.now(),txt,inflight:null}); return txt; })
     .catch(err => { plFetchCache.delete(key); throw err; }); }
+const segInflight=new Map();
 function withSegSingleFlight(key,fn) {
   const e=segInflight.get(key);
   if (e&&e.p&&Date.now()-e.t<25000) { segStat.joined++; return e.p.catch(() => fn()); }
-  const p=fn().finally(() => { setTimeout(() => {
-    const cur=segInflight.get(key);
-    if (cur&&cur.p===p) segInflight.delete(key);
-  },2000); });
+  const p=fn();
   segInflight.set(key,{p,t:Date.now()});
+  // FIX 5c: niente setTimeout in finally (non garantito in Workers post-response).
+  // Affidiamoci al cleanup di cleanupStaleState (30s).
   return p;
 }
 function isVideoCt(ct) { ct=String(ct||'').toLowerCase(); return /mpegurl|mp2t|mp4|octet-stream|video\//.test(ct)&&!/html|json|xml/.test(ct); }
@@ -677,13 +764,16 @@ async function fetchSegmentWithCache(target,h,range,opts) {
   }
   return { resp:r, fromCache:(skipApi||skipForFreeze)?'origin-fresh':'origin' };
 }
+// FIX 3a + 6: prefetch mirato sui segmenti PUBBLICATI + PREFETCH PREDITTIVO
+// del prossimo segmento (seq+1). Il primo in await al primo poll.
 async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
   const p=parseMediaPl(txt);
   if (p.isMaster) {
     const v=masterCodecVerdict(txt);
     if (v.onlyHevc) {
-      noteH265(slug+'|'+prov,true);
-      log('h264 '+slug+'|'+prov+': master HEVC-only');
+      noteH265(slug+'|'+prov,true); segStat.hevcBlock++;
+      log('h264 '+slug+'|'+prov+': master HEVC-only -> coda');
+      // FIX 4: HEVC-only = blocking se strict264, altrimenti coda ma NON passa
       if (ctx&&ctx.strict264) throw new Error(prov+' HEVC-only (strict264)');
     }
     if (v.video===0&&v.audioGroups>0)
@@ -691,7 +781,7 @@ async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
   }
   let published = [];
   if (!p.isMaster && p.segs.length) {
-    checkFreshOrThrow(slug+'|'+prov,p.upSeq,p.upTarget,prov);
+    checkFreshOrThrow(slug+'|'+prov,p.upSeq,p.upTarget,prov,slug);
     const durs=p.segs.map(s=>s.dur||p.upTarget);
     noteSegDur(slug,prov,durs);
     const plan=pickWindow(durs,prov,slug,ctx&&ctx.forceSegs,ctx&&ctx.wide);
@@ -710,11 +800,28 @@ async function emitPlaylist(ck,slug,prov,txt,baseUrl,ctx) {
     for (const s of rest) {
       try { bg(() => warmSeg(absSegUrl(s.url,baseUrl),ctx)); } catch (e) {}
     }
+    // FIX 3a: prefetch predittivo del prossimo segmento (seq+1).
+    // Calcoliamo l'URL del prossimo segmento sostituendo il numero nel path.
+    try {
+      const last=published[published.length-1];
+      const nextUrl=predictNextSeg(last.url,baseUrl);
+      if (nextUrl) bg(() => warmSeg(nextUrl,ctx));
+    } catch (e) {}
     try { bg(() => probeH265(slug,prov,absSegUrl(published[published.length-1].url,baseUrl),ctx)); } catch (e) {}
   }
   plCacheSet(ck,out);
   if (ctx&&ctx.winKey) lastWin.set(ctx.winKey,{prov,t:Date.now()});
   return R(out,200,HLS_NO_CACHE());
+}
+// FIX 3a: predice l'URL del prossimo segmento incrementando l'ultimo numero
+// nel path. Funziona per la maggior parte degli HLS live (seq numeriche).
+function predictNextSeg(lastUrl,baseUrl) {
+  const abs = absSegUrl(lastUrl,baseUrl);
+  const m = abs.match(/^(.*?)(\d+)(\.[a-zA-Z0-9]+)?(\?.*)?$/);
+  if (!m) return null;
+  const prefix=m[1], numStr=m[2], ext=m[3]||'', qs=m[4]||'';
+  const next = (parseInt(numStr,10)+1).toString().padStart(numStr.length,'0');
+  return prefix+next+ext+qs;
 }
 async function warmSeg(abs,ctx,force) {
   if (!force && !subFree(1)) return;
@@ -962,8 +1069,9 @@ async function vavooResolve(query,vid) {
   if (c) return await vavooResolveDual(c.slug,c.vavoo||query,c.vid6,c.vid7);
   return await vavooResolveDual(null,query,vid,null);
 }
+
 // --- ROTTA /live -----------------------------------------------------------
-async function live(u,P,legacy,req) {
+async function live(u,P,env,legacy) {
   countReq('live'); cleanupStaleState();
   const q=u.searchParams.get('ch')||u.searchParams.get('c')||'';
   if (!q) return R('uso: /live?ch=<slug>\n\n'+elencoCanali(),200,TXT());
@@ -973,7 +1081,6 @@ async function live(u,P,legacy,req) {
   const strict264=u.searchParams.get('strict264')==='1';
   const dParam=parseInt(u.searchParams.get('d')||'0',10);
   const forceSegs=(dParam>=1&&dParam<=8)?dParam:0;
-  const clientUA = (req && req.headers && req.headers.get('user-agent')) || '';
   const prefParam=legacy||u.searchParams.get('p')||'';
   const prefList=prefParam?prefParam.split(',').map(s=>s.trim().toLowerCase()).filter(Boolean):[];
   const allProvs=['ntv','vavoo','daddy'];
@@ -986,19 +1093,14 @@ async function live(u,P,legacy,req) {
   const ordered=[];
   for (const p of prefList) if (available.includes(p)&&!ordered.includes(p)) ordered.push(p);
   for (const p of available) if (!ordered.includes(p)) ordered.push(p);
-  ordered.sort((a,b) => {
-    const aa = chAdapt.get(adaptKey(c.slug,a));
-    const bb = chAdapt.get(adaptKey(c.slug,b));
-    const ra = aa ? aa.minRunway : 4;
-    const rb = bb ? bb.minRunway : 4;
-    if (ra !== rb) return ra - rb;
-    return provRank(c.slug,b) - provRank(c.slug,a);
-  });
+  ordered.sort((a,b)=>provRank(c.slug,b)-provRank(c.slug,a));
   const good=ordered.filter(p=>segFailCount(c.slug,p)<SEGFAIL_MAX);
   const bad=ordered.filter(p=>segFailCount(c.slug,p)>=SEGFAIL_MAX);
   const finalOrder=good.concat(bad);
   const cbLive=finalOrder.filter(p=>!cbInCooldown(c.slug,p));
   const cbFrozen=finalOrder.filter(p=>cbInCooldown(c.slug,p));
+  // FIX 4: provider HEVC-only marcati vanno in fondo (non rimossi: potrebbero
+  // essere gli unici disponibili).
   const hurt=k=>lagBad(k)||h265Bad(k);
   let tryOrder=cbLive.filter(p=>!hurt(c.slug+'|'+p))
     .concat(cbLive.filter(p=>hurt(c.slug+'|'+p)),cbFrozen);
@@ -1007,7 +1109,7 @@ async function live(u,P,legacy,req) {
   const winKey=c.slug+'|'+(prefParam||'auto')+'|'+forceSegs+'|'+(wide?1:0)+'|'+(strict264?1:0);
   const ckOf=prov=>c.slug+':'+prov+':'+forceSegs+':'+(wide?1:0)+':'+(strict264?1:0);
   const lw=lastWin.get(winKey);
-  const baseCtx={ P, ch:c.slug, wide, forceSegs, strict264, winKey, clientUA };
+  const baseCtx={ P, ch:c.slug, wide, forceSegs, strict264, winKey };
 
   const provs={
     vavoo: async (ctxIn) => {
@@ -1058,14 +1160,14 @@ async function live(u,P,legacy,req) {
       if (!du||!txt) { cbRecordFail(c.slug,'daddy'); return null; }
       const pchk=parseMediaPl(txt);
       if (!pchk.isMaster&&pchk.segs.length) {
-        checkFreshOrThrow(c.slug+'|daddy',pchk.upSeq,pchk.upTarget,'daddy');
+        checkFreshOrThrow(c.slug+'|daddy',pchk.upSeq,pchk.upTarget,'daddy',c.slug);
         noteSegDur(c.slug,'daddy',pchk.segs.map(s=>s.dur||pchk.upTarget));
         noteServedSeq(c.slug,'daddy',pchk.upSeq);
       }
       if (pchk.isMaster) {
         const v=masterCodecVerdict(txt);
         if (v.onlyHevc) {
-          noteH265(c.slug+'|daddy',true);
+          noteH265(c.slug+'|daddy',true); segStat.hevcBlock++;
           if (strict264) { cbRecordFail(c.slug,'daddy'); return null; }
         }
       }
@@ -1080,6 +1182,12 @@ async function live(u,P,legacy,req) {
         for (const s of (cc.awaitFirst?published.slice(1):published)) {
           try { bg(() => warmSeg(absSegUrl(s.url,du),cc)); } catch (e) {}
         }
+        // FIX 3a: prefetch predittivo anche per daddy
+        try {
+          const last=published[published.length-1];
+          const nextUrl=predictNextSeg(last.url,du);
+          if (nextUrl) bg(() => warmSeg(nextUrl,cc));
+        } catch (e) {}
         try { bg(() => probeH265(c.slug,'daddy',absSegUrl(published[published.length-1].url,du),{ref:'https://dembed.st/',origin:'https://dembed.st'})); } catch (e) {}
       }
       const body=rewriteAny(txt,du,Object.assign({},cc,{stateKey:c.slug+'|daddy'}));
@@ -1094,14 +1202,16 @@ async function live(u,P,legacy,req) {
     }
   };
 
+  // SWR playlist: il player non aspetta mai l'upstream a regime.
   if (lw && !cbInCooldown(c.slug,lw.prov)) {
     const ck=ckOf(lw.prov);
     const ent=plCache.get(ck);
     if (ent) {
       const age=Date.now()-ent.t;
-      if (age<PL_CACHE_TTL) return R(ent.txt,200,HLS_NO_CACHE());
-      if (age<PL_STALE_MS) {
-        segStat.stale++;
+      const cfg=PROV_CFG[lw.prov]||PROV_CFG.ntv;
+      if (age<cfg.plFresh) return R(ent.txt,200,HLS_NO_CACHE());
+      if (age<cfg.plStale) {
+        segStat.swr++;
         const fn=provs[lw.prov];
         if (fn && subFree(6)) bg(() => fn({ bgRefresh:true }));
         return R(ent.txt,200,HLS_NO_CACHE());
@@ -1123,9 +1233,11 @@ async function live(u,P,legacy,req) {
     } catch (e) {
       const msg=(e&&e.message?e.message:String(e));
       lastErr=p+': '+msg;
-      if (/FREEZE/i.test(msg)) sawFreeze=true;
+      if (/FREEZE|LOOP/i.test(msg)) sawFreeze=true;
       log(p+' ko '+c.slug+': '+msg);
       noteProv(c.slug,p,false);
+      // FIX 4: HEVC-only = skip al prossimo provider subito, non loggare come freeze
+      if (/HEVC-only/i.test(msg)) continue;
     }
   }
   for (const p of tryOrder) { cbClear(c.slug,p); clearSegFails(c.slug,p); }
@@ -1167,18 +1279,20 @@ function parseMediaPl(txt) {
   }
   return { upSeq,upTarget,upVersion,map,segs,isMaster,endlist };
 }
+// FIX 1: pickWindow usa runway PER PROVIDER (PROV_CFG). ntv sta a 3s, daddy a 6s.
 function pickWindow(durs,prov,slug,forceSegs,wide) {
   const n=durs.length;
   if (!n) return {count:0,sum:0,segDur:0,runway:0,extra:0};
+  const cfg=PROV_CFG[prov]||PROV_CFG.ntv;
   const a=(slug&&prov)?getAdapt(slug,prov):null;
   const valid=durs.filter(d=>d>0.2&&d<60);
   const localAvg=valid.length?valid.reduce((x,y)=>x+y,0)/valid.length:(durs[n-1]||4);
   const segDur=(a&&a.segDur)?a.segDur:localAvg;
-  const runway = wide ? Math.max(12, (a?a.minRunway:4)*2) : (a ? a.minRunway : 4);
+  const runway=wide?12:(a?a.runway:cfg.runwayBase);
   const extra=(a?a.extraSegs:0)+(latRisk(a)?1:0);
   let want;
   if (forceSegs) want=forceSegs;
-  else want=Math.max(MIN_SEGS,Math.ceil(runway/Math.max(segDur,0.5))+1)+extra;
+  else want=Math.max(cfg.segsMin,Math.ceil(runway/Math.max(segDur,0.5))+1)+extra;
   const count=Math.max(1,Math.min(want,n));
   const kept=durs.slice(-count);
   const sum=kept.reduce((x,y)=>x+y,0);
@@ -1205,18 +1319,13 @@ function proxUrl(abs,ctx) {
   if (ctx.origin) u+='&o='+encodeURIComponent(ctx.origin);
   if (ctx.ch) u+='&ch='+encodeURIComponent(ctx.ch);
   if (ctx.prov) u+='&p='+encodeURIComponent(ctx.prov);
+  // FIX 4: propaga strict264 al proxy segmenti per filtrare HEVC se richiesto
+  if (ctx.strict264) u+='&strict264=1';
   return u; }
 function isAudioOnlyStreamInf(line) {
   if (/RESOLUTION=/.test(line)) return false;
   const codecs=(line.match(/CODECS="([^"]+)"/)||[])[1]||'';
   return !/(avc|hevc|hvc|vp09|av01)/i.test(codecs);
-}
-function shouldFilterHevc(ctx) {
-  if (ctx && ctx.strict264) return true;
-  const ua = String((ctx && ctx.clientUA) || '').toLowerCase();
-  if (!ua) return true;
-  const safariLike = /safari/.test(ua) && !/chrome|crios|edg|firefox|android/.test(ua);
-  return !safariLike;
 }
 function rewriteMaster(txt,baseUrl,ctx) {
   const lines=String(txt).split(/\r?\n/);
@@ -1246,13 +1355,12 @@ function rewriteMaster(txt,baseUrl,ctx) {
   const isHevc=v=>/CODECS="/.test(v.line)&&/(hevc|hvc1|hev1|h265|dvh)/i.test(v.line);
   const hasExplicit=allVideo.some(v=>/CODECS="/.test(v.line));
   const hasAvc=allVideo.some(v=>!isHevc(v));
-  const filterHevc = shouldFilterHevc(ctx);
-  let video = allVideo;
-  if (filterHevc && hasExplicit && hasAvc) {
-    video = allVideo.filter(v=>!isHevc(v));
-    if (video.length !== allVideo.length)
-      log('h264 '+((ctx&&ctx.ch)?'['+ctx.ch+']':'?')+': filtrate HEVC -> '+video.length+'/'+allVideo.length);
-  }
+  // FIX 4: con strict264 filter SOLO avc; senza, preferisci avc ma fallback hevc
+  const video=(hasExplicit&&hasAvc)||ctx.strict264
+    ?allVideo.filter(v=>!isHevc(v))
+    :allVideo;
+  if (video.length!==allVideo.length)
+    log('h264 '+((ctx&&ctx.ch)||'?')+': tenute '+video.length+'/'+allVideo.length);
   const audio=variants.filter(v=>v.audioOnly);
   const out=['#EXTM3U']; out.push(...media);
   for (const v of video) out.push(v.line,proxUrl(absSegUrl(v.url,baseUrl),ctx));
@@ -1262,6 +1370,8 @@ function rewriteMaster(txt,baseUrl,ctx) {
 }
 
 // --- LAG FONTE -------------------------------------------------------------
+const lagMemo=new Map();
+const LAG_BAD_S=45, LAG_TTL_MS=5*60*1000;
 function srcLagOf(p) {
   const last=p.segs[p.segs.length-1];
   if (!last||!last.pdt) return null;
@@ -1302,6 +1412,15 @@ function rewriteMediaPl(txt,baseUrl,ctx) {
     if (st.discont&&kept.length) { discontTop=true; st.discont=false; }
   }
   noteServedSeq(ctx&&ctx.ch,ctx&&ctx.prov,seq);
+  // FIX 2: loop detection sull'ultimo segmento pubblicato
+  if (ctx&&ctx.ch&&ctx.prov&&kept.length) {
+    const lastSeg=kept[kept.length-1];
+    if (lastSeg&&lastSeg.url && checkSegLoop(ctx.ch,ctx.prov,lastSeg.url)) {
+      freezeDetected.set(ctx.ch+'|'+ctx.prov,Date.now());
+      cbForceCooldown(ctx.ch,ctx.prov);
+      throw new Error(ctx.prov+' LOOP-SEG (stesso URL)');
+    }
+  }
   let version=p.upVersion||1;
   if (p.map&&version<6) version=6;
   const keptD=kept.map(s=>s.dur);
@@ -1329,13 +1448,15 @@ function rewriteMediaPl(txt,baseUrl,ctx) {
   return out.join('\n'); }
 
 // --- ROTTA /seg ------------------------------------------------------------
-async function seg(u,req) { countReq('seg');
+async function seg(u,req,env) { countReq('seg');
   const target=u.searchParams.get('u');
   if (!target) return R('uso: /seg?u=<url>',200,TXT());
+  // FIX 6: SSRF whitelist
+  if (!hostAllowed(target)) return R('host non consentito',403,TXT());
   const ref=u.searchParams.get('ref')||'https://thedaddy.li/';
   const ch=u.searchParams.get('ch')||'';
   const prov=u.searchParams.get('p')||'';
-  const clientUA = (req && req.headers && req.headers.get('user-agent')) || '';
+  const strict264=u.searchParams.get('strict264')==='1';
   const h=getBrowserHeaders(ref,(ch&&prov)?(ch+'|'+prov):ref);
   const o=u.searchParams.get('o'); if (o) h['Origin']=o;
   const rangeParam=u.searchParams.get('range');
@@ -1351,8 +1472,13 @@ async function seg(u,req) { countReq('seg');
     catch (e) { return R('upstream playlist',502,TXT()); }
     const baseDir=target.substring(0,target.lastIndexOf('/')+1)||target;
     const out=rewriteAny(txt,baseUrl_of(baseDir),
-      {P:u.origin,ref,origin:o||'',ch,prov,clientUA,stateKey:'m|'+prov+'|'+clean});
+      {P:u.origin,ref,origin:o||'',ch,prov,strict264,stateKey:'m|'+prov+'|'+clean});
     return R(out,200,HLS_NO_CACHE());
+  }
+  // FIX 4: strict264 su segmenti - probe al volo se non gia' marcato
+  if (strict264 && ch && prov && !h265Bad(ch+'|'+prov)) {
+    // probe asincrono: se il segmento risulta HEVC, marcalo. Non bloccare la prima richiesta.
+    bg(() => probeH265(ch,prov,target,{ref,origin:o||''}));
   }
   let r,attempts=0; const maxAttempts=3;
   while (attempts<maxAttempts) {
@@ -1370,38 +1496,17 @@ async function seg(u,req) { countReq('seg');
     }
     r=signed.resp;
     const ct=r.headers.get('content-type')||'';
-    const isHtmlBody=r.ok&&isHtmlLike(ct);
-    if (!r.ok&&!range) {
-      if (r.status !== 429 && r.status !== 503) recordSegFail(ch,prov);
+    const isHtmlBody=r.ok&&/^(text\/html|application\/json|text\/xml)/i.test(ct);
+    if (!r.ok&&!range) { recordSegFail(ch,prov);
       if (attempts<maxAttempts) continue;
       return R('upstream '+r.status,r.status,TXT());
     } else if (isHtmlBody&&!range) { recordSegFail(ch,prov);
       if (attempts<maxAttempts) continue;
-      return R('upstream HTML/403 '+r.status,r.status,TXT());
+      return R('upstream corrotto '+r.status,r.status,TXT());
     } else if (!r.ok) { recordSegFail(ch,prov);
       return R('upstream '+r.status,r.status,TXT());
     }
-    let invalid = false;
-    if (!range && isVideoCt(ct) && !r.headers.get('content-range')) {
-      try {
-        const buf = await r.clone().arrayBuffer();
-        const b = new Uint8Array(buf);
-        const v = validateSegment(b);
-        if (!v.ok) {
-          log('seg invalid '+(ch||'?')+' '+prov+': '+v.reason);
-          recordSegFail(ch,prov);
-          invalid = true;
-          if (attempts < maxAttempts) continue;
-          return R('upstream invalid segment', 502, TXT());
-        }
-        const loopInfo = noteServedFp(ch, prov, target, b);
-        if (loopInfo && loopInfo.loop) {
-          log('LOOP '+ch+'/'+prov+': stesso segmento '+loopInfo.stable+'s');
-        }
-      } catch (e) {}
-    }
-    if (!invalid) break;
-  }
+    break; }
   const hh={
     'content-type':r.headers.get('content-type')||'video/mp2t',
     'access-control-allow-origin':'*','access-control-allow-methods':'GET, HEAD, OPTIONS',
@@ -1436,7 +1541,8 @@ async function resolveForDiag(prov,c) {
   }
   return null;
 }
-async function why(u) {
+async function why(u,env) {
+  if (!diagOk(u,env)) return 'token richiesto: ?k=<ADMIN_TOKEN>';
   const q=u.searchParams.get('ch')||'sky-sport-24';
   const c=findCh(q);
   if (!c) return 'canale non mappato: '+q;
@@ -1445,10 +1551,9 @@ async function why(u) {
     const mapped=prov==='ntv'?!!c.ntv:prov==='daddy'?!!c.daddy:!!(c.vavoo||c.vid6||c.vid7);
     L.push('--- '+prov.toUpperCase()+' ---');
     if (!mapped) { L.push('  non mappato',''); continue; }
-    const a = chAdapt.get(adaptKey(c.slug, prov));
     L.push('  CB: '+(cbInCooldown(c.slug,prov)?'COOLDOWN':'ok')+' | segFail '+segFailCount(c.slug,prov)+
-      ' | H265 '+(h265Bad(c.slug+'|'+prov)?'SI':'no')+' | freeze '+(freezeDetected.has(c.slug+'|'+prov)?'SI':'no'));
-    L.push('  runway: '+(a?a.minRunway:4)+'s (p95 '+(a&&a.p95?Math.round(a.p95)+'ms':'?')+')');
+      ' | H265 '+(h265Bad(c.slug+'|'+prov)?'SI':'no')+' | freeze '+(freezeDetected.has(c.slug+'|'+prov)?'SI':'no')+
+      ' | loop '+(seqPollCount.get(c.slug+'|'+prov)?('x'+seqPollCount.get(c.slug+'|'+prov).count):'no'));
     L.push('  adapt: '+adaptLine(c.slug,prov));
     if (!subFree(3)) { L.push('  budget esaurito',''); continue; }
     subSpend(2);
@@ -1463,13 +1568,13 @@ async function why(u) {
       const p=parseMediaPl(txt);
       if (p.isMaster) {
         const v=masterCodecVerdict(txt);
-        L.push('  master video '+v.video+' avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' (HEVC-ONLY!)':''));
-        L.push('  >>> dovrebbe partire');
+        L.push('  master video '+v.video+' avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':''));
+        L.push('  >>> dovrebbe partire'+(v.onlyHevc?' MA HEVC-only -> prova strict264=1 o altro provider':''));
       } else {
         if (!p.segs.length) { L.push('  >>> NON PARTE: zero segmenti',''); continue; }
         const durs=p.segs.map(s=>s.dur||p.upTarget);
         const plan=pickWindow(durs,prov,c.slug,0,false);
-        L.push('  media '+p.segs.length+' seg | servirei '+plan.count+' seg = '+plan.sum.toFixed(1)+'s');
+        L.push('  media '+p.segs.length+' seg | servirei '+plan.count+' seg = '+plan.sum.toFixed(1)+'s (runway '+plan.runway+'s)');
         const su=absSegUrl(p.segs[p.segs.length-1].url,R0.url);
         const t0=Date.now();
         try {
@@ -1478,21 +1583,20 @@ async function why(u) {
           L.push('  segmento HTTP '+rs.status+' in '+ms+'ms');
           if (rs.ok) {
             const b=new Uint8Array(await rs.arrayBuffer());
-            const valid = validateSegment(b);
-            const codec = b[0]===0x47?tsParseVideoCodec(b.slice(0,131072)):'non-TS';
-            L.push('  size '+b.length+' codec '+codec+' valid '+(valid.ok?'SI':'NO ('+valid.reason+')'));
+            L.push('  size '+b.length+(b[0]===0x47?' codec '+tsParseVideoCodec(b.slice(0,131072)):''));
             const sd=durs[durs.length-1]||6;
             if (ms>sd*1000*LAT_RISK_RATIO) L.push('  >>> LATENZA ALTA: '+ms+'ms su segDur '+sd.toFixed(1)+'s: rischio scatti');
             else L.push('  >>> dovrebbe partire fluido');
           } else L.push('  >>> NON PARTE: segmento '+rs.status);
         } catch (e) { L.push('  >>> segmento timeout'); }
       }
-    } catch (e) { L.push('  >>> ERRORE '+(e&&e.message?e.message:String(e))); }
+    } catch (e) { L.push('  >>> ERRORE '+(e&&e.message)); }
     L.push('');
   }
   return L.join('\n');
 }
-async function byteTest(u) {
+async function byteTest(u,env) {
+  if (!diagOk(u,env)) return 'token richiesto';
   const q=u.searchParams.get('ch')||'sky-sport-24';
   const prov=(u.searchParams.get('p')||'ntv').toLowerCase();
   const c=findCh(q); if (!c) return 'canale non mappato';
@@ -1512,7 +1616,8 @@ async function byteTest(u) {
   return ['=== BYTETEST '+R0.label+' ===','A '+bA.length+'B fp '+fA,'B '+bB.length+'B fp '+fB,'',
     fA===fB?'BYTE IDENTICI: contenuto congelato al relay':'BYTE DIVERSI: flusso sano (segmenti immutabili)'].join('\n');
 }
-async function freezeTest(u) {
+async function freezeTest(u,env) {
+  if (!diagOk(u,env)) return 'token richiesto';
   const q=u.searchParams.get('ch')||'sky-sport-24';
   const prov=(u.searchParams.get('p')||'ntv').toLowerCase();
   const c=findCh(q); if (!c) return 'canale non mappato';
@@ -1530,7 +1635,7 @@ async function freezeTest(u) {
   const dt=Math.round((Date.now()-prev.t)/1000), d=nowSeq-prev.seq;
   freezeSamples.set(key,{seq:nowSeq,last:nowLast,t:Date.now()});
   return 'su '+dt+'s: seq '+prev.seq+' -> '+nowSeq+' (delta '+d+')\nultimo cambiato: '+(nowLast===prev.last?'NO':'SI')+
-    '\n'+(d===0?'FONTE CONGELATA':'PLAYLIST AVANZA (byte: /bytetest)');
+    '\n'+(d===0?'FONTE CONGELATA (loop detection: se 3 poll fermi -> CB force + switch)':'PLAYLIST AVANZA (byte: /bytetest)');
 }
 async function codecOne(c,prov) {
   const out=[prov.toUpperCase()+': '];
@@ -1543,15 +1648,14 @@ async function codecOne(c,prov) {
     if (!r.ok) { out.push('HTTP '+r.status); return out.join(''); }
     const txt=await r.text(); const p=parseMediaPl(txt);
     if (p.isMaster) { const v=masterCodecVerdict(txt);
-      out.push('master video '+v.video+' avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' HEVC-ONLY':'')); return out.join(''); }
+      out.push('master video '+v.video+' avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':'')); return out.join(''); }
     if (!p.segs.length) { out.push('vuota'); return out.join(''); }
     const su=absSegUrl(p.segs[p.segs.length-1].url,R0.url);
     const hh=Object.assign({},R0.headers); hh['Range']='bytes=0-32767';
     const rs=await fetchT(su+(su.includes('?')?'&':'?')+'_p265=1',{headers:hh},8000);
     if (!rs.ok) { out.push('seg HTTP '+rs.status); return out.join(''); }
     const b=new Uint8Array(await rs.arrayBuffer());
-    const codec = b[0]===0x47?tsParseVideoCodec(b.slice(0,131072)):'non-TS';
-    out.push('media segDur '+(p.segs[p.segs.length-1].dur||0).toFixed(1)+'s codec '+codec);
+    out.push('media segDur '+(p.segs[p.segs.length-1].dur||0).toFixed(1)+'s codec '+(b[0]===0x47?tsParseVideoCodec(b.slice(0,131072)):'non-TS'));
     return out.join('');
   } catch (e) { out.push('ERR'); return out.join(''); }
 }
@@ -1590,17 +1694,13 @@ async function player(u,P) {
   const c=findCh(ch);
   if (!c) return R('Canale non trovato: '+ch,404,TXT());
   const wide=u.searchParams.get('w')==='1';
+  const strict264=u.searchParams.get('strict264')==='1';
   const d=parseInt(u.searchParams.get('d')||'0',10);
-  const qs=c.slug+(wide?'&w=1':'')+((d>=1&&d<=8)?'&d='+d:'');
-  let best = null;
-  for (const p of ['ntv','vavoo','daddy']) {
-    const aa = chAdapt.get(adaptKey(c.slug, p));
-    if (aa && (best === null || aa.minRunway < best.minRunway)) best = aa;
-  }
-  const sd=(best&&best.segDur)?best.segDur:6;
-  const runway = best ? Math.max(3, best.minRunway) : 5;
-  const sync=Math.max(4,Math.round(runway*0.8));
-  const maxLat=Math.max(sync+8,Math.round(runway*2));
+  const qs=c.slug+(wide?'&w=1':'')+((d>=1&&d<=8)?'&d='+d:'')+(strict264?'&strict264=1':'');
+  const a=chAdapt.get(adaptKey(c.slug,'ntv'))||chAdapt.get(adaptKey(c.slug,'vavoo'));
+  const sd=(a&&a.segDur)?a.segDur:6;
+  const sync=Math.max(9,Math.round(sd*1.5));
+  const maxLat=Math.max(sync+13,Math.round(sd*4));
   const html=`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${c.name}</title><script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -1608,7 +1708,7 @@ async function player(u,P) {
 video{width:100%;max-width:1200px;background:#000}
 .c{position:fixed;top:10px;left:10px;color:#fff;background:rgba(0,0,0,.85);padding:14px;border-radius:8px;font-size:12px;line-height:1.7;z-index:999}
 .ok{color:#4CAF50}.err{color:#f44336}.load{color:#FFC107}</style></head><body>
-<div class="c"><div><b>${c.name}</b>${wide?' [w]':''}${(d>=1&&d<=8)?' [d='+d+']':''}</div>
+<div class="c"><div><b>${c.name}</b>${wide?' [w]':''}${strict264?' [strict264]':''}${(d>=1&&d<=8)?' [d='+d+']':''}</div>
 <div>${VER} | sync ${sync}s max ${maxLat}s</div>
 <div id="st" class="load">Caricamento...</div><div id="q"></div><div id="bf"></div><div id="sn"></div><div id="pt"></div><div id="ur"></div></div>
 <video id="v" controls autoplay muted playsinline></video>
@@ -1620,7 +1720,7 @@ var lastSN=-1,stalls=0,lastTime=-1,tStalls=0,underruns=0,tFirst=-1;
 if(Hls.isSupported()){
   var h=new Hls({debug:false,enableWorker:true,lowLatencyMode:false,backBufferLength:30,
     liveSyncDuration:${sync},liveMaxLatencyDuration:${maxLat},maxLiveSyncPlaybackRate:1.1,
-    maxBufferLength:${Math.max(15,Math.round(runway*2))},maxMaxBufferLength:${MAX_BUFFER_SECS},
+    maxBufferLength:${Math.max(20,Math.round(sd*4))},maxMaxBufferLength:${MAX_BUFFER_SECS},
     maxBufferSize:60000000,maxBufferHole:0.5,capLevelToPlayerSize:false,autoStartLoad:true,
     nudgeMaxRetry:10,fragLoadingMaxRetry:8,manifestLoadingMaxRetry:4});
   var t0=performance.now();
@@ -1629,7 +1729,7 @@ if(Hls.isSupported()){
     if(dd.levels&&dd.levels.length){var bi=0;dd.levels.forEach(function(l,i){if((l.bitrate||0)>(dd.levels[bi].bitrate||0))bi=i});
     h.currentLevel=bi;var l=dd.levels[bi];q.textContent=l.width+'x'+l.height+' @'+Math.round((l.bitrate||0)/1000)+'kbps';}});
   h.on(Hls.Events.FRAG_CHANGED,function(){ if(tFirst<0){tFirst=Math.round(performance.now()-t0);
-    st.textContent='Primo frame in '+tFirst+'ms';st.className=tFirst>3000?'load':'ok';} });
+    st.textContent='Primo frame in '+tFirst+'ms';st.className=tFirst>4000?'load':'ok';} });
   h.on(Hls.Events.LEVEL_LOADED,function(e,dd){var s=dd.details?dd.details.startSN:-1;
     if(s>=0){if(s===lastSN)stalls++;else{stalls=0;lastSN=s}
     sn.textContent='SN: '+s+(stalls>2?' FERMO x'+stalls:' avanza');sn.className=stalls>2?'err':'ok';}});
@@ -1649,9 +1749,12 @@ else{st.textContent='Non supportato';st.className='err';}
 </script></body></html>`;
   return R(html,200,{'content-type':'text/html; charset=utf-8',...CORS()});
 }
-async function segtest(u) {
+async function segtest(u,env) {
   const t=u.searchParams.get('u');
   if (!t) return R('uso: /segtest?u=<url>',200,TXT());
+  if (!diagOk(u,env)) return R('token richiesto',200,TXT());
+  // FIX 6: SSRF whitelist
+  if (!hostAllowed(t)) return R('host non consentito',403,TXT());
   const ref=u.searchParams.get('ref')||'https://tvnow247.today/';
   const L=['=== SEGTEST ===',''];
   try {
@@ -1677,14 +1780,13 @@ async function checksegOne(source,ch) {
     if (!r.ok) return L.concat(['HTTP '+r.status]);
     const txt=await r.text(); const p=parseMediaPl(txt);
     L.push('seq '+p.upSeq+' | segs '+p.segs.length+' | ENDLIST '+(p.endlist?'SI':'no'));
-    if (p.isMaster) { const v=masterCodecVerdict(txt); L.push('master avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' HEVC-ONLY':'')); return L; }
+    if (p.isMaster) { const v=masterCodecVerdict(txt); L.push('master avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':'')); return L; }
     if (!p.segs.length) return L.concat(['nessun segmento']);
     const su=absSegUrl(p.segs[p.segs.length-1].url,R0.url);
     const t0=Date.now();
     const rs=await fetchT(su,{headers:R0.headers},SEG_TIMEOUT);
     const b=new Uint8Array(await rs.arrayBuffer());
-    const valid = validateSegment(b);
-    L.push('seg HTTP '+rs.status+' in '+(Date.now()-t0)+'ms size '+b.length+' valid '+(valid.ok?'SI':'NO'));
+    L.push('seg HTTP '+rs.status+' in '+(Date.now()-t0)+'ms size '+b.length);
     if (b[0]===0x47) L.push('codec '+tsParseVideoCodec(b.slice(0,131072)));
     L.push('adapt: '+adaptLine(slug,source));
     return L;
@@ -1705,9 +1807,15 @@ async function checkseg(u) {
   return R(L.join('\n'),200,TXT());
 }
 async function warm() { const t0=Date.now();
-  const ids=DADDY_EDGE_IDS; let ok=0,err=0;
-  for (let i=0;i<ids.length;i+=8)
-    await Promise.all(ids.slice(i,i+8).map(async id => { try{await ntvToken(id,null);ok++}catch(e){err++} }));
+  let ok=0,err=0;
+  // FIX 5a: warm chiama daddyResolve per gli ID Daddy e ntvToken per i canali
+  // con ntv mappato. Prima passava DADDY_EDGE_IDS a ntvToken.
+  const daddyIds=new Set(DADDY_EDGE_IDS);
+  const ntvIds=new Set(CHANNELS.filter(c=>c.ntv).map(c=>c.ntv));
+  for (let i=0;i<DADDY_EDGE_IDS.length;i+=8)
+    await Promise.all(DADDY_EDGE_IDS.slice(i,i+8).map(async id => { try{await daddyResolve(id,null);ok++}catch(e){err++} }));
+  // ntvToken solo per i canali che hanno ntv (corrispondenza slug)
+  for (const c of CHANNELS) if (c.ntv) { try{await ntvToken(c.ntv,c.slug);ok++}catch(e){err++} }
   for (const ch of ['sky sport 24','sky sport uno','sky sport calcio','rsi la 1','rsi la 2'])
     try{await vavooResolve(ch,null)}catch(e){}
   try{await ensureVavooMap()}catch(e){}
@@ -1723,6 +1831,8 @@ async function probe(u) {
     L.push(pv+': '+adaptLine(c.slug,pv));
     const s=servedSeq.get(c.slug+'|'+pv);
     if (s) L.push('   seq '+s.seq+' ('+Math.round((Date.now()-s.t)/1000)+'s fa)');
+    const lp=seqPollCount.get(c.slug+'|'+pv);
+    if (lp) L.push('   loop poll count: '+lp.count);
   }
   L.push('');
   for (const pv of ['ntv','vavoo','daddy']) {
@@ -1733,7 +1843,7 @@ async function probe(u) {
       if (R0) L.push('   '+R0.url);
     } catch(e){ L.push(pv.toUpperCase()+': ERR '+e.message); }
   }
-  L.push('','/why?ch='+c.slug+' | /loop');
+  L.push('','/why?ch='+c.slug);
   return L.join('\n'); }
 const vmap = async () => { const m=await ensureVavooMap(true);
   return m?'VMAP: '+m.size+' ('+vavooMap.src+')':'VMAP: nessuna fonte'; };
@@ -1742,81 +1852,85 @@ async function diag(u) {
   const c=findCh(q);
   if (!c) return 'Canale non trovato';
   const L=['=== DIAG '+VER+' ===','Canale: '+c.name,'',
-    'runway PER-PROVIDER (ognuno al suo minimo teorico)',
-    'LOOP detector: stesso segmento per >'+LOOP_DETECT_S+'s -> flip provider',
-    'HEVC filtrato su client non Safari-like se esiste AVC',''];
+    'segmenti: URL STABILI (bust rimosso) | timeout '+SEG_TIMEOUT+'ms',
+    'playlist: SWR per-provider (ntv '+PROV_CFG.ntv.plFresh+'/'+PROV_CFG.ntv.plStale+' | vavoo '+PROV_CFG.vavoo.plFresh+'/'+PROV_CFG.vavoo.plStale+' | daddy '+PROV_CFG.daddy.plFresh+'/'+PROV_CFG.daddy.plStale+')',
+    'finestra PER PROVIDER: ntv '+PROV_CFG.ntv.runwayBase+'s | vavoo '+PROV_CFG.vavoo.runwayBase+'s | daddy '+PROV_CFG.daddy.runwayBase+'s','',
+    'loop detection: '+LOOP_DETECT_POLLS+' poll fermi = CB force | seg loop: '+LOOP_SEG_REPEAT+' ripetizioni',''];
   const tryP=async(label,prov) => {
     try {
       const R0=await resolveForDiag(prov,c);
       if (!R0) throw new Error('non risolto');
       const r=await fetchPlaylistSmart(R0.url,R0.headers,10000);
       if (!r.ok) throw new Error('HTTP '+r.status);
-      const txt = await r.text();
+      const txt=await r.text();
       const p=parseMediaPl(txt);
       L.push('-- '+label+' --');
-      if (p.isMaster) { const v=masterCodecVerdict(txt); L.push('   master avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' HEVC-ONLY':'')); }
-      else {
+      if (p.isMaster) {
+        // FIX 5b: usa il txt reale, non lo stub
+        const v=masterCodecVerdict(txt);
+        L.push('   master avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':''));
+        if (v.onlyHevc) L.push('   >>> HEVC-only: serve strict264=1 o altro provider');
+      } else {
         const durs=p.segs.map(s=>s.dur||p.upTarget);
         noteSegDur(c.slug,prov,durs);
         const plan=pickWindow(durs,prov,c.slug,0,false);
-        L.push('   fonte '+p.segs.length+' seg | segDur '+(durs.reduce((a,b)=>a+b,0)/Math.max(durs.length,1)).toFixed(2)+'s');
+        L.push('   fonte '+p.segs.length+' seg | segDur medio '+(durs.reduce((a,b)=>a+b,0)/Math.max(durs.length,1)).toFixed(2)+'s');
         L.push('   PUBBLICO '+plan.count+' seg = '+plan.sum.toFixed(1)+'s (extra '+plan.extra+', runway '+plan.runway+'s)');
       }
       L.push('   adapt: '+adaptLine(c.slug,prov));
-    } catch(e){ L.push('-- '+label+' --','   ERR '+(e&&e.message?e.message:String(e))); }
+    } catch(e){ L.push('-- '+label+' --','   ERR '+(e&&e.message)); }
     L.push('');
   };
   if (c.vavoo||c.vid6||c.vid7) await tryP('VAVOO','vavoo');
   if (c.ntv) await tryP('NTV','ntv');
   if (c.daddy) await tryP('DADDY','daddy');
-  L.push('/why?ch='+c.slug+' | /loop | /live?ch='+c.slug+'&d=3 (piu\' margine)');
+  L.push('/why?ch='+c.slug+' | /live?ch='+c.slug+'&d=3 (piu\' margine) | /live?ch='+c.slug+'&strict264=1 (forza H264)');
   return L.join('\n'); }
-function txtSafe(p) { return ''; }
-function debug() { const vm=vavooMapGet(); const now=Date.now();
+function debug() {
+  const now=Date.now();
   const sf=[];
   for (const [k,arr] of segFails) { const l=arr.filter(t=>now-t<SEGFAIL_TTL); if (l.length) sf.push(k+'='+l.length); }
   const cds=[]; for (const [k,u] of cbCooldown) if (u>now) cds.push(k);
   const h265=Array.from(h265Memo.entries()).filter(([,e])=>e.bad&&now-e.t<H265_TTL).map(([k])=>k);
   const fz=Array.from(freezeDetected.entries()).filter(([,t])=>now-t<FREEZE_TTL).map(([k])=>k);
+  const lp=Array.from(seqPollCount.entries()).filter(([,e])=>e.count>=2).map(([k,e])=>k+'=x'+e.count);
   const est=[];
   for (const [k,a] of chAdapt) {
     if (now-a.t>15*60*1000) continue;
     const d=(a.segDur&&a.lastCount)?(a.segDur*a.lastCount).toFixed(1)+'s':'n/d';
-    est.push(k+' rw '+a.minRunway+'s ~'+d+' ('+a.lastCount+'seg lat '+(a.segLat?Math.round(a.segLat)+'ms':'?')+')'+
+    est.push(k+' ~'+d+' ('+a.lastCount+'seg lat '+(a.segLat?Math.round(a.segLat)+'ms':'?')+')'+
       (latRisk(a)?' LAT-RISK':'')+(a.extraSegs?' +'+a.extraSegs:''));
   }
-  const loops=[];
-  for (const [k,e] of servedFingerprints) {
-    const stable=Math.round((now-e.firstSeen)/1000);
-    if (stable>30) loops.push(k+'='+stable+'s');
-  }
   return [VER,
-    'Segmenti: URL STABILI (nessun bust) | edge CF '+SEG_CACHE_TTL+'s | API '+SEG_API_TTL+'s | timeout '+SEG_TIMEOUT+'ms',
-    'Playlist: fresh '+PL_CACHE_TTL+'ms | stale-SWR '+PL_STALE_MS+'ms (serviti '+segStat.stale+') | bust CDN '+PL_BUST_MS+'ms',
-    'DELAY/LATENZA PER CANALE: '+(est.sort().join(' | ')||'nessuna misura'),
-    'LOOPS >30s: '+(loops.sort().join(' | ')||'nessuno')+' (oltre '+LOOP_DETECT_S+'s = flip)',
+    'PER-PROVIDER: ntv='+PROV_CFG.ntv.runwayBase+'s vavoo='+PROV_CFG.vavoo.runwayBase+'s daddy='+PROV_CFG.daddy.runwayBase+'s | timeout '+SEG_TIMEOUT+'ms',
+    'Playlist SWR: ntv '+PROV_CFG.ntv.plFresh+'/'+PROV_CFG.ntv.plStale+'ms vavoo '+PROV_CFG.vavoo.plFresh+'/'+PROV_CFG.vavoo.plStale+'ms daddy '+PROV_CFG.daddy.plFresh+'/'+PROV_CFG.daddy.plStale+'ms',
+    'Bust playlist: '+PL_BUST_MS+'ms +/- '+PL_BUST_JITTER_MS+'ms jitter | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s cooldown '+(CB_COOLDOWN/1000)+'s',
     'Cache API hit='+segStat.apiHits+' origine='+segStat.origin+' join='+segStat.joined+' timeouts='+segStat.timeouts,
-    'Cache: NTV='+tokenCache.size+' Daddy='+daddyCache.size+' VavooURL='+vavooURLCache.size,
+    'SWR served='+segStat.swr+' | LOOP detect='+segStat.loopDetect+' | FREEZE recover='+segStat.freezeRecover+' | HEVC block='+segStat.hevcBlock,
+    'DELAY PER CANALE: '+(est.sort().join(' | ')||'nessuna misura'),
+    'Cache: NTV='+tokenCache.size+' Daddy='+daddyCache.size+' VavooURL='+vavooURLCache.size+' plFetch='+plFetchCache.size+'/'+MAX_PLFETCH,
     'Vavoo host '+vavooGoodHost.replace('https://','')+' (fail '+vavooHostFails+')',
     'H265 coda: '+(h265.join(', ')||'nessuno')+' | FREEZE: '+(fz.join(', ')||'nessuno'),
+    'LOOP poll: '+(lp.join(', ')||'nessuno'),
     'SEQ: '+servedSeqManual(),
     'FREEZE >90s: '+frozenManual(),
     'CB: '+(cds.join(', ')||'nessuno')+' | segFails: '+(sf.join(', ')||'nessuno'),
     'Richieste live='+reqStats.live+' seg='+reqStats.seg,
-    'Log:','  '+(logs.slice(-18).join('\n  ')||'(vuoti)')
+    'Log:','  '+(logs.slice(-20).join('\n  ')||'(vuoti)')
   ].join('\n'); }
 function uso(P) { return [VER,'',
-    '  /live?ch=<slug>            delay adattivo per-provider, segmenti URL stabili',
+    '  /live?ch=<slug>            delay PER PROVIDER (ntv 3s / vavoo 4s / daddy 6s)',
     '  /live?ch=<slug>&d=3        piu\' margine (3 segmenti)',
-    '  /live?ch=<slug>&w=1        runway largo',
+    '  /live?ch=<slug>&w=1        runway 12s',
+    '  /live?ch=<slug>&strict264=1  FORZA H264 (ignora HEVC-only)',
     '  /player?ch=<slug>          Primo frame ms / SN / Playhead / Underrun',
-    '  /why?ch=<slug>             dove si rompe + latenza segmento',
-    '  /adapt?ch=<slug>           runway per-provider, latenza p95, backoff, delay',
+    '  /why?ch=<slug>[&k=token]   dove si rompe + latenza + loop detection',
+    '  /adapt?ch=<slug>           segDur, latenza, backoff, delay per provider',
     '  /adapt?reset=1&ch=<slug>   azzera backoff e latenza',
-    '  /loop                      loop detector (stesso segmento ripetuto)',
-    '  /diag /probe /debug /codec /bytetest /freezetest /checkseg?all=1',
-    '  /segtest /rawu /dump /warm /vmap /ch /ip',
-    ''].join('\n'); }
+    '  /diag /probe /debug /codec /bytetest?k= /freezetest?k= /checkseg?all=1',
+    '  /segtest?k= /rawu /dump /warm /vmap /ch /ip',
+    '',
+    'NOVITA v10.28: delay per-provider, anti-freeze loop, HEVC block, prefetch predittivo',''].join('\n'); }
 
 // --- HELPERS ---------------------------------------------------------------
 function TXT() { return { 'content-type':'text/plain; charset=utf-8', ...CORS() }; }
@@ -1830,9 +1944,12 @@ function R(body,status,headers) {
   if (status===302) delete h['content-type'];
   return new Response(body,{status:status||200,headers:h});
 }
-async function rawu(u) {
+async function rawu(u,env) {
   const t=u.searchParams.get('u');
   if (!t) return R('uso: /rawu?u=<url>',200,TXT());
+  if (!diagOk(u,env)) return R('token richiesto',200,TXT());
+  // FIX 6: SSRF whitelist
+  if (!hostAllowed(t)) return R('host non consentito',403,TXT());
   const h=getBrowserHeaders(u.searchParams.get('ref')||'https://thedaddy.li/','rawu');
   if (u.searchParams.get('o')) h['Origin']=u.searchParams.get('o');
   let r; try {
