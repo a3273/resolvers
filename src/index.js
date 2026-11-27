@@ -1,5 +1,5 @@
 // ============================================================================
-// TVNOW-CF v10.38 - FIX CRITICO: HEVC filter OFF di default
+// TVNOW-CF v11.0 - Per-provider min delay, anti-freeze/loop, HEVC fix, full compat
 // ============================================================================
 let MODULE_CTX = null; let SUB_BUDGET = 40;
 const subFree = n => SUB_BUDGET >= n;
@@ -67,42 +67,54 @@ export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(warm()); }
 };
 
+// ──────────────────────── CONFIG (FIX v11: per-provider runway, aggressive anti-freeze) ────────────────────────
 const MIN_SEGS = 2;
 const EXTRA_SEGS_MAX = 2;
 const BACKOFF_FAIL_MIN = 1;
-const CLEAN_DECAY_MS = 4 * 60 * 1000;
+const CLEAN_DECAY_MS = 2 * 60 * 1000;        // FIX: era 4*60*1000
 const LAT_RISK_RATIO = 0.28;
-const SEG_TIMEOUT = 12000;
-const WARM_RESERVE = 14;
+const SEG_TIMEOUT = 9000;                    // FIX: era 12000
+const WARM_RESERVE = 10;                     // FIX: era 14
 const PREFETCH_SEGS = 3;
 const STALE_FACTOR = 5;
 const MAX_BUFFER_SECS = 36;
-const SEG_CACHE_TTL = 75;
+const SEG_CACHE_TTL = 60;                    // FIX: era 75
 const SEG_API_TTL = 100;
-const SEGFAIL_TTL = 75*1000, SEGFAIL_MAX = 3, SEGFAIL_EARLY = 1;
-const PL_CACHE_TTL = 600;
+const SEGFAIL_TTL = 45 * 1000;               // FIX: era 75*1000
+const SEGFAIL_MAX = 2;                       // FIX: era 3
+const SEGFAIL_EARLY = 1;
+const PL_CACHE_TTL = 8;                      // FIX: era 600
 const PL_STALE_MS = 2000;
 const PLAYLIST_FRESH_MS = 900;
 const PL_BUST_MS = 1000;
 const PL_BUST_JITTER_MS = 120;
-const RESOLVE_BUDGET = 7500, STATE_STALE_TTL = 12*60*1000;
-const CB_FAIL_WIN = 75*1000, CB_FAIL_TH = 3, CB_COOLDOWN = 25*1000;
-const NTV_REFRESH_MARGIN = 800, VAVOO_URL_TTL = 100*1000;
-const DADDY_TTL = 8*60*1000, VAVOO_HEALTH_TTL = 12*60*1000, VAVOO_MAP_TTL = 6*3600*1000;
-const MAX_TOKEN_CACHE = 80, MAX_DADDY_CACHE = 150;
-const MAX_PLFETCH = 180;
-const VER = 'TVNOW-CF v10.38';
+const RESOLVE_BUDGET = 7500;
+const STATE_STALE_TTL = 10 * 60 * 1000;      // FIX: era 12*60*1000
+const CB_FAIL_WIN = 45 * 1000;               // FIX: era 75*1000
+const CB_FAIL_TH = 2;                        // FIX: era 3
+const CB_COOLDOWN = 15 * 1000;               // FIX: era 25*1000
+const NTV_REFRESH_MARGIN = 800;
+const VAVOO_URL_TTL = 100 * 1000;
+const DADDY_TTL = 8 * 60 * 1000;
+const VAVOO_HEALTH_TTL = 12 * 60 * 1000;
+const VAVOO_MAP_TTL = 6 * 3600 * 1000;
+const MAX_TOKEN_CACHE = 80;
+const MAX_DADDY_CACHE = 150;
+const MAX_PLFETCH = 120;                     // FIX: era 180
+const VER = 'TVNOW-CF v11.0';
 const DADDY_EDGE_BASE = 'https://edge.wedd48c.top';
 const DADDY_EDGE_IDS = ['869','461','870','576','462','875','460','577','575','574','877','878','879','871','872','873','860','861','862','859','864','865','867','868','863','880'];
-const DADDY_EDGE_FAIL_TTL = 50 * 1000;
-const FREEZE_TTL = 45 * 1000;
-const LOOP_DETECT_POLLS = 2;
+const DADDY_EDGE_FAIL_TTL = 30 * 1000;       // FIX: era 50*1000
+const FREEZE_TTL = 15 * 1000;                // FIX: era 45*1000 (logica 75s) → 15s hard
+const LOOP_DETECT_POLLS = 1;                 // FIX: era 2
 const LOOP_SEG_REPEAT = 2;
+const HEVC_FILTER_DEFAULT = true;            // FIX: NEW - HEVC filtered by default
+const HEVC_TTL = 20 * 60 * 1000;             // FIX: NEW
 
 const PROV_CFG = {
-  ntv:   { runwayBase: 2.2, runwayMin: 1.6, segsMin: 2, plFresh: 480,  plStale: 1700 },
-  vavoo: { runwayBase: 3.0, runwayMin: 2.0, segsMin: 2, plFresh: 580,  plStale: 1900 },
-  daddy: { runwayBase: 4.5, runwayMin: 3.2, segsMin: 2, plFresh: 680,  plStale: 2300 }
+  ntv:   { runwayBase: 1.8, runwayMin: 1.2, segsMin: 2, plFresh: 400,  plStale: 1500 },  // FIX: era 2.2/1.6/480/1700
+  vavoo: { runwayBase: 2.2, runwayMin: 1.5, segsMin: 2, plFresh: 500,  plStale: 1800 },  // FIX: era 3.0/2.0/580/1900
+  daddy: { runwayBase: 3.0, runwayMin: 2.0, segsMin: 2, plFresh: 600,  plStale: 2200 }   // FIX: era 4.5/3.2/680/2300
 };
 
 const HOST_WHITELIST = [
@@ -581,7 +593,7 @@ function noteServedFp(slug, prov, url, b) {
     }
     e.lastSeen = now; e.count++;
     const stable = Math.round((now - e.firstSeen) / 1000);
-    return { loop: stable > 90, stable, fp };
+    return { loop: stable > 60, stable, fp };  // FIX: 60s threshold
   } catch (err) {
     return { loop: false, stable: 0, skipped: true };
   }
@@ -589,14 +601,14 @@ function noteServedFp(slug, prov, url, b) {
 
 function loopReport() {
   const now = Date.now();
-  const L = ['=== LOOP DETECTOR ===','(stesso segmento ripetuto per >90s = LOOP)',''];
+  const L = ['=== LOOP DETECTOR ===','(stesso segmento ripetuto per >60s = LOOP)',''];
   const entries = Array.from(servedFingerprints.entries())
     .filter(([,e]) => (now - e.lastSeen) < 10*60*1000);
   if (!entries.length) return L.concat(['nessuna misura recente']).join('\n');
   const sorted = entries.sort((a,b) => (now - a[1].firstSeen) - (now - b[1].firstSeen)).reverse();
   for (const [k, e] of sorted) {
     const stable = Math.round((now - e.firstSeen) / 1000);
-    const status = stable > 90 ? '>>> LOOP!' : stable > 30 ? 'stabile' : 'fresh';
+    const status = stable > 60 ? '>>> LOOP!' : stable > 20 ? 'stabile' : 'fresh';
     L.push(k + ': ' + status + ' | ' + stable + 's | fp ' + e.fp + ' | x' + e.count + ' | ' + e.url);
   }
   return L.join('\n');
@@ -634,6 +646,7 @@ function recordVavooFail(slug,idNum) {
 
 const plCacheSet = (ck,txt) => { if (ck) plCache.set(ck,{txt,t:Date.now()}); };
 
+// ──────────────────────── FIX v11: checkFreshOrThrow with 15s freeze + 1-poll loop ────────────────────────
 function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
   const now=Date.now(); const st=upFresh.get(key);
   if (!st || upSeq!==st.seq) {
@@ -650,7 +663,7 @@ function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
     cbForceCooldown(slug,prov);
     throw new Error(prov+' LOOP (seq '+upSeq+' ferma)');
   }
-  const maxAge = Math.max(18,(upTarget||4)*STALE_FACTOR)*1000;
+  const maxAge = Math.max(FREEZE_TTL, (upTarget||4)*5*1000);  // FIX: FREEZE_TTL=15s, 5x targetDuration
   if (now-st.t>maxAge) {
     freezeDetected.set(key,now);
     cbForceCooldown(slug,prov);
@@ -659,7 +672,7 @@ function checkFreshOrThrow(key,upSeq,upTarget,prov,slug) {
   }
 }
 
-const h265Bad = key => { const e=h265Memo.get(key); return !!(e&&Date.now()-e.t<H265_TTL&&e.bad); };
+function h265Bad(key) { const e=h265Memo.get(key); return !!(e&&Date.now()-e.t<HEVC_TTL&&e.bad); }
 const noteH265 = (key,bad) => { if (key) h265Memo.set(key,{bad:!!bad,t:Date.now()}); };
 
 function tsParseVideoCodec(b) {
@@ -692,7 +705,7 @@ function tsParseVideoCodec(b) {
     }
     for (const sec of sections) {
       if (!pmtPids.has(sec.pid)) continue;
-      let c=sec.o+3+2+1+1+1+2;
+      let c=sec.o+3+2+1+1+2;
       if (c+2>sec.end) continue;
       const pil=((b[c]&0x0f)<<8)|b[c+1];
       c+=2+pil;
@@ -735,7 +748,7 @@ async function probeH265(slug,prov,absUrl,ctx) {
   if (!slug||!prov||!absUrl) return;
   const key=slug+'|'+prov;
   const e=h265Memo.get(key);
-  if (e&&Date.now()-e.t<H265_TTL) return;
+  if (e&&Date.now()-e.t<HEVC_TTL) return;
   noteH265(key,false);
   try {
     const ref=(ctx&&ctx.ref)||'https://thedaddy.li/';
@@ -895,7 +908,7 @@ async function emitPlaylist(ck, slug, prov,txt, baseUrl, ctx) {
   const p=parseMediaPl(txt);
   if (p.isMaster) {
     const v=masterCodecVerdict(txt);
-    if (v.onlyHevc) {
+    if (v.onlyHevc && !ctx.allowHevc) {
       noteH265(slug+'|'+prov,true); segStat.hevcBlock++;
       log('h264 '+slug+' '+prov+': master HEVC-only -> coda');
       if (ctx&&ctx.strict264) throw new Error(prov+' HEVC-only (strict264)');
@@ -1223,6 +1236,7 @@ async function vavooResolve(query,vid) {
   return await vavooResolveDual(null, query, vid, null);
 }
 
+// ──────────────────────── LIVE HANDLER (FIX v11: per-provider delay + immediate switch) ────────────────────────
 async function live(u, P, env, legacy, req) {
   countReq('live'); cleanupStaleState();
   const q=u.searchParams.get('ch')||u.searchParams.get('c')||'';
@@ -1231,6 +1245,7 @@ async function live(u, P, env, legacy, req) {
   if (!c) return R('canale non mappato: "'+q+'"\n\n'+elencoCanali(),200,TXT());
   const wide=u.searchParams.get('w')==='1';
   const strict264=u.searchParams.get('strict264')==='1';
+  const allowHevc=u.searchParams.get('allowHevc')==='1';          // FIX: NEW param
   const dParam=parseInt(u.searchParams.get('d')||'0',10);
   const forceSegs=(dParam>=1&&dParam<=8)?dParam:0;
   const prefParam=legacy||u.searchParams.get('p')||'';
@@ -1267,7 +1282,7 @@ async function live(u, P, env, legacy, req) {
   const winKey=c.slug+'|'+(prefParam||'auto')+'|'+forceSegs+'|'+(wide?1:0)+'|'+(strict264?1:0);
   const ckOf=prov=>c.slug+':'+prov+':'+forceSegs+':'+(wide?1:0)+':'+(strict264?1:0);
   const lw=lastWin.get(winKey);
-  const baseCtx={ P, ch:c.slug, wide, forceSegs, strict264, winKey, clientUA };
+  const baseCtx={ P, ch:c.slug, wide, forceSegs, strict264, allowHevc, winKey, clientUA };
   const provs={
     vavoo: async (ctxIn) => {
       if (!c.vavoo&&!c.vid6&&!c.vid7) return null;
@@ -1323,7 +1338,7 @@ async function live(u, P, env, legacy, req) {
       }
       if (pchk.isMaster) {
         const v=masterCodecVerdict(txt);
-        if (v.onlyHevc) {
+        if (v.onlyHevc && !allowHevc) {
           noteH265(c.slug+'|daddy', true); segStat.hevcBlock++;
           if (strict264) { cbRecordFail(c.slug, 'daddy'); return null; }
         }
@@ -1387,7 +1402,7 @@ async function live(u, P, env, legacy, req) {
     } catch (e) {
       const msg=(e&&e.message?e.message:String(e));
       lastErr=p+': '+msg;
-      if (/FREEZE|LOOP/i.test(msg)) sawFreeze=true;
+      if (/FREEZE|LOOP/i.test(msg)) { sawFreeze=true; log('FREEZE/LOOP su '+p+' per '+c.slug+' -> switch immediato'); }
       log(p+' ko '+c.slug+': '+msg);
       noteProv(c.slug,p,false);
       if (/HEVC-only/i.test(msg)) continue;
@@ -1478,6 +1493,7 @@ function proxUrl(abs, ctx) {
   if (ctx.ch) u+='&ch='+encodeURIComponent(ctx.ch);
   if (ctx.prov) u+='&p='+encodeURIComponent(ctx.prov);
   if (ctx.strict264) u+='&strict264=1';
+  if (ctx.allowHevc) u+='&allowHevc=1';
   return u;
 }
 
@@ -1487,10 +1503,11 @@ function isAudioOnlyStreamInf(line) {
   return !/(avc|hevc|hvc|vp09|av01)/i.test(codecs);
 }
 
-// v10.38 FIX: shouldFilterHevc è OFF di default. Solo strict264=1 forza il filtro.
+// ──────────────────────── FIX v11: shouldFilterHevc DEFAULT ON ────────────────────────
 function shouldFilterHevc(ctx) {
+  if (ctx && ctx.allowHevc) return false;
   if (ctx && ctx.strict264) return true;
-  return false;
+  return HEVC_FILTER_DEFAULT;
 }
 
 function rewriteMaster(txt, baseUrl, ctx) {
@@ -1529,7 +1546,6 @@ function rewriteMaster(txt, baseUrl, ctx) {
   let video = allVideo;
   if (filterHevc && hasExplicit && hasAvc) {
     const filtered = allVideo.filter(v=>!isHevc(v));
-    // v10.38: se il filtro lascia 0 varianti, NON filtrare (fallback)
     if (filtered.length > 0) {
       video = filtered;
       log('h264 '+((ctx&&ctx.ch)||'?')+': filtrate HEVC -> '+video.length+'/'+allVideo.length);
@@ -1628,6 +1644,7 @@ function rewriteMediaPl(txt, baseUrl, ctx) {
   return out.join('\n');
 }
 
+// ──────────────────────── SEGMENT PROXY ────────────────────────
 async function seg(u,req, env) {
   countReq('seg');
   const target=u.searchParams.get('u');
@@ -1637,7 +1654,8 @@ async function seg(u,req, env) {
   const ch=u.searchParams.get('ch')||'';
   const prov=u.searchParams.get('p')||'';
   const strict264=u.searchParams.get('strict264')==='1';
-  const effTarget = strict264 ? stripHevc(target) : target;
+  const allowHevc=u.searchParams.get('allowHevc')==='1';
+  const effTarget = (strict264 && !allowHevc) ? stripHevc(target) : target;
   const h=getBrowserHeaders(ref, (ch&&prov)?(ch+'|'+prov):ref);
   const o=u.searchParams.get('o'); if (o) h['Origin']=o;
   const rangeParam=u.searchParams.get('range');
@@ -1655,11 +1673,11 @@ async function seg(u,req, env) {
     const baseDir=effTarget.substring(0, effTarget.lastIndexOf('/')+1)||effTarget;
     const clientUA = (req && req.headers && req.headers.get('user-agent')) || '';
     const out=rewriteAny(txt,baseUrl_of(baseDir),
-      {P:u.origin, ref, origin:o||'',ch,prov, strict264, clientUA, stateKey:'m|'+prov+'|'+clean});
+      {P:u.origin, ref, origin:o||'',ch,prov, strict264, allowHevc, clientUA, stateKey:'m|'+prov+'|'+clean});
     return R(out, 200, HLS_NO_CACHE());
   }
 
-  if (strict264 && ch && prov && !h265Bad(ch+'|'+prov)) {
+  if (strict264 && !allowHevc && ch && prov && !h265Bad(ch+'|'+prov)) {
     bg(() => probeH265(ch, prov, effTarget, {ref, origin:o||''}));
   }
 
@@ -1765,6 +1783,7 @@ async function seg(u,req, env) {
   return new Response(r.body, {status:r.status, headers:hh});
 }
 
+// ──────────────────────── DIAGNOSTICS ────────────────────────
 async function resolveForDiag(prov,c) {
   if (prov==='ntv') {
     if (!c.ntv) return null;
@@ -1815,7 +1834,7 @@ async function why(u,env) {
       if (p.isMaster) {
         const v=masterCodecVerdict(txt);
         L.push('  master video '+v.video+' avc '+v.avc+' hevc '+v.hevc+(v.onlyHevc?' [HEVC-ONLY]':''));
-        L.push('  >>> dovrebbe partire'+(v.onlyHevc?' MA HEVC-only -> prova strict264=1 o altro provider':''));
+        L.push('  >>> dovrebbe partire'+(v.onlyHevc?' MA HEVC-only -> prova allowHevc=1 o altro provider':''));
       } else {
         if (!p.segs.length) { L.push('  >>> NON PARTE: zero segmenti',''); continue; }
         const durs=p.segs.map(s=>s.dur||p.upTarget);
@@ -1849,7 +1868,7 @@ async function byteTest(u,env) {
   const prov=(u.searchParams.get('p')||'ntv').toLowerCase();
   const c=findCh(q); if (!c) return 'canale non mappato';
   const R0=await resolveForDiag(prov,c); if (!R0) return prov+' non risolto';
-  const r=await fetchT(plBust(R0.url), {headers:R0.headers, cf:{cacheTtl:0,cacheEverything:false}}, 11000);
+  const r=await fetchT(plBust(R0.url), {headers:R0.headers, cf:{cacheTtl:0, cacheEverything:false}}, 11000);
   if (!r.ok) return R0.label+' HTTP '+r.status;
   const p=parseMediaPl(await r.text());
   if (p.isMaster||p.segs.length<2) return R0.label+': master o <2 segmenti';
@@ -1887,7 +1906,7 @@ async function freezeTest(u,env) {
   const dt=Math.round((Date.now()-prev.t)/1000), d=nowSeq-prev.seq;
   freezeSamples.set(key, {seq:nowSeq, last:nowLast,t:Date.now()});
   return 'su '+dt+'s: seq '+prev.seq+' -> '+nowSeq+' (delta '+d+')\nultimo cambiato: '+(nowLast===prev.last?'NO':'SI')+
-    '\n'+(d===0?'FONTE CONGELATA (loop detection: se 2 poll fermi -> CB force + switch)':'PLAYLIST AVANZA (byte: /bytetest)');
+    '\n'+(d===0?'FONTE CONGELATA (loop detection: se 1 poll fermo -> CB force + switch)':'PLAYLIST AVANZA (byte: /bytetest)');
 }
 
 async function codecOne(c,prov) {
@@ -1953,8 +1972,9 @@ async function player(u,P) {
   if (!c) return R('Canale non trovato: '+ch,404,TXT());
   const wide=u.searchParams.get('w')==='1';
   const strict264=u.searchParams.get('strict264')==='1';
+  const allowHevc=u.searchParams.get('allowHevc')==='1';
   const d=parseInt(u.searchParams.get('d')||'0',10);
-  const qs=c.slug+(wide?'&w=1':'')+((d>=1&&d<=8)?'&d='+d:'')+(strict264?'&strict264=1':'');
+  const qs=c.slug+(wide?'&w=1':'')+((d>=1&&d<=8)?'&d='+d:'')+(strict264?'&strict264=1':'')+(allowHevc?'&allowHevc=1':'');
   let best = null;
   for (const p of ['ntv','vavoo','daddy']) {
     const aa = chAdapt.get(adaptKey(c.slug, p));
@@ -1971,7 +1991,7 @@ async function player(u,P) {
 video{width:100%;max-width:1200px;background:#000}
 .c{position:fixed;top:10px;left:10px;color:#fff;background:rgba(0,0,0,.85);padding:14px;border-radius:8px;font-size:12px;line-height:1.7;z-index:999}
 .ok{color:#4CAF50}.err{color:#f44336}.load{color:#FFC107}</style></head><body>
-<div class="c"><div><b>${c.name}</b>${wide?' [w]':''}${strict264?' [H264]':''}${(d>=1&&d<=8)?' [d='+d+']':''}</div>
+<div class="c"><div><b>${c.name}</b>${wide?' [w]':''}${strict264?' [H264]':''}${allowHevc?' [HEVC]':''}${(d>=1&&d<=8)?' [d='+d+']':''}</div>
 <div>${VER} | sync ${sync}s max ${maxLat}s | runway ${runway.toFixed(1)}s</div>
 <div id="st" class="load">Caricamento...</div><div id="q"></div><div id="bf"></div><div id="sn"></div><div id="pt"></div><div id="ur"></div></div>
 <video id="v" controls autoplay muted playsinline></video>
@@ -2128,8 +2148,9 @@ async function diag(u) {
   const L=['=== DIAG '+VER+' ===','Canale: '+c.name,'',
     'runway PER PROVIDER (base): ntv '+PROV_CFG.ntv.runwayBase+'s | vavoo '+PROV_CFG.vavoo.runwayBase+'s | daddy '+PROV_CFG.daddy.runwayBase+'s',
     'runway si adatta in base alla latenza misurata',
-    'strict264 OPT-IN (default OFF, usa ?strict264=1 per forzare H264)',
+    'HEVC filter: DEFAULT ON (usa allowHevc=1 per disabilitare)',
     'loop detection: '+LOOP_DETECT_POLLS+' poll | seg loop: '+LOOP_SEG_REPEAT+' ripetizioni',
+    'freeze detect: '+(FREEZE_TTL/1000)+'s | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s',
     ''];
   const tryP=async(label, prov) => {
     try {
@@ -2158,7 +2179,7 @@ async function diag(u) {
   if (c.vavoo||c.vid6||c.vid7) await tryP('VAVOO','vavoo');
   if (c.ntv) await tryP('NTV','ntv');
   if (c.daddy) await tryP('DADDY','daddy');
-  L.push('/why?ch='+c.slug+' | /live?ch='+c.slug+'&d=3 | /live?ch='+c.slug+'&strict264=1');
+  L.push('/why?ch='+c.slug+' | /live?ch='+c.slug+'&d=3 | /live?ch='+c.slug+'&strict264=1 | /live?ch='+c.slug+'&allowHevc=1');
   return L.join('\n');
 }
 
@@ -2167,9 +2188,9 @@ function debug() {
   const sf=[];
   for (const [k,arr] of segFails) { const l=arr.filter(t=>now-t<SEGFAIL_TTL); if (l.length) sf.push(k+'='+l.length); }
   const cds=[]; for (const [k,u] of cbCooldown) if (u>now) cds.push(k);
-  const h265=Array.from(h265Memo.entries()).filter(([,e])=>e.bad&&now-e.t<H265_TTL).map(([k])=>k);
+  const h265=Array.from(h265Memo.entries()).filter(([,e])=>e.bad&&now-e.t<HEVC_TTL).map(([k])=>k);
   const fz=Array.from(freezeDetected.entries()).filter(([,t])=>now-t<FREEZE_TTL).map(([k])=>k);
-  const lp=Array.from(seqPollCount.entries()).filter(([,e])=>e.count>=2).map(([k,e])=>k+'=x'+e.count);
+  const lp=Array.from(seqPollCount.entries()).filter(([,e])=>e.count>=1).map(([k,e])=>k+'=x'+e.count);
   const est=[];
   for (const [k,a] of chAdapt) {
     if (now-a.t>12*60*1000) continue;
@@ -2180,22 +2201,22 @@ function debug() {
   const loops=[];
   for (const [k,e] of servedFingerprints) {
     const stable=Math.round((now-e.firstSeen)/1000);
-    if (stable>30) loops.push(k+'='+stable+'s');
+    if (stable>20) loops.push(k+'='+stable+'s');
   }
   return [VER,
     'PER-PROVIDER base: ntv='+PROV_CFG.ntv.runwayBase+'s vavoo='+PROV_CFG.vavoo.runwayBase+'s daddy='+PROV_CFG.daddy.runwayBase+'s | timeout '+SEG_TIMEOUT+'ms',
-    'runway ADATTIVO | strict264 OPT-IN (default OFF) | Bust ±'+PL_BUST_JITTER_MS+'ms | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s',
-    'Cache API hit='+segStat.apiHits+' origine='+segStat.origin+' join='+segStat.joined+' timeouts='+segStat.timeouts,
+    'runway ADATTIVO per provider | HEVC filter DEFAULT ON | freeze '+(FREEZE_TTL/1000)+'s | CB '+CB_FAIL_TH+'/'+(CB_FAIL_WIN/1000)+'s',
+    'Cache: API hit='+segStat.apiHits+' origine='+segStat.origin+' join='+segStat.joined+' timeouts='+segStat.timeouts,
     'SWR='+segStat.swr+' | LOOP='+segStat.loopDetect+' (inv '+segStat.loopInvalidate+') | FREEZE recover='+segStat.freezeRecover+' | HEVC='+segStat.hevcBlock,
     'SEG corrupt='+segStat.segCorrupt+' | CDN blip='+segStat.cdnBlip,
     'DELAY: '+(est.sort().join(' | ')||'nessuna misura'),
-    'LOOPS >30s: '+(loops.sort().join(' | ')||'nessuno'),
+    'LOOPS >20s: '+(loops.sort().join(' | ')||'nessuno'),
     'Cache: NTV='+tokenCache.size+' Daddy='+daddyCache.size+' VavooURL='+vavooURLCache.size+' plFetch='+plFetchCache.size+'/'+MAX_PLFETCH,
     'Vavoo host '+vavooGoodHost.replace('https://','')+' (fail '+vavooHostFails+')',
     'H265: '+(h265.join(', ')||'nessuno')+' | FREEZE: '+(fz.join(', ')||'nessuno'),
     'LOOP poll: '+(lp.join(', ')||'nessuno'),
     'SEQ: '+servedSeqManual(),
-    'FREEZE >75s: '+frozenManual(),
+    'FREEZE >'+(FREEZE_TTL/1000)+'s: '+frozenManual(),
     'CB: '+(cds.join(', ')||'nessuno')+' | segFails: '+(sf.join(', ')||'nessuno'),
     'Richieste live='+reqStats.live+' seg='+reqStats.seg,
     'Log:','  '+(logs.slice(-20).join('\n  ')||'(vuoti)')
@@ -2204,18 +2225,19 @@ function debug() {
 
 function uso(P) {
   return [VER,'',
-    '/live?ch=<slug>                 delay ADATTIVO per-provider',
+    '/live?ch=<slug>                 delay ADATTIVO per-provider (ciascuno al suo minimo)',
     '/live?ch=<slug>&d=3             piu\' margine',
     '/live?ch=<slug>&w=1             runway 11s',
-    '/live?ch=<slug>&strict264=1     FORZA H264 (opt-in, default OFF)',
+    '/live?ch=<slug>&strict264=1     FORZA H264 (legacy)',
+    '/live?ch=<slug>&allowHevc=1     PERMETTI HEVC (default OFF)',
     '/player?ch=<slug>               Player diagnostico',
     '/why?ch=<slug>[&k=token]        dove si rompe',
     '/adapt?ch=<slug>                misure + runway adattivo',
-    '/loop                           loop detector',
+    '/loop                           loop detector (>60s stesso segmento)',
     '/diag /probe /debug /codec /bytetest /freezetest /checkseg',
     '/segtest /rawu /dump /warm /vmap /ch /ip',
     '',
-    'v10.38: FIX CRITICO HEVC filter OFF di default + protezione playlist vuota'].join('\n');
+    'v11: per-provider min delay | freeze 15s | loop 1 poll | HEVC default OFF'].join('\n');
 }
 
 function TXT() { return { 'content-type':'text/plain; charset=utf-8', ...CORS() }; }
